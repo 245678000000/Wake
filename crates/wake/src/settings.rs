@@ -15,7 +15,7 @@ use crate::format::tilde_path;
 use crate::ui::{
     action_button, axis_inset, overlay_layers, rails_factor, show_in_fm, sidebar_title, zpx, Zpx,
     BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP,
-    NAV_ICON, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
+    LEAD_BOX, NAV_ICON, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
 use crate::workbench::{
@@ -31,9 +31,10 @@ const SETTINGS_SIDEBAR_W: Zpx = Zpx(180.);
 const SETTINGS_TITLEBAR_H: Zpx = Zpx(34.);
 /// 导航列的容器内边距(上下两组共用)
 const NAV_EDGE: Zpx = SPACE_SM;
-/// 导航项左内边距:图标中心压在侧栏中轴(红灯中心线)上,26.75 − 7.5(图标半宽) − 8(NAV_EDGE)。
-/// 原先是 12,图标中心落在 27.5
-const NAV_ITEM_INSET: Zpx = axis_inset(NAV_ICON, NAV_EDGE);
+/// 导航项左内边距:行首槽位(与主窗侧栏同一个 LEAD_BOX,图标在里面居中)的中心压在侧栏中轴
+/// (红灯中心线)上,26.75 − 9(槽位半宽) − 8(NAV_EDGE)。槽位加 ICON_TEXT_GAP 让文字起点与
+/// 主窗导航行一致——原先图标不进槽位、间距补成 8 凑近;只把间距改成 6 的话文字反而左移 1.5
+const NAV_ITEM_INSET: Zpx = axis_inset(LEAD_BOX, NAV_EDGE);
 const SETTINGS_PAGE_TOP: Zpx = Zpx(38.);
 /// Connect 页两条 Setup guide 的去处:MCP 面与命令行面各自的完整文档
 const CONNECT_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/mcp.md";
@@ -393,7 +394,7 @@ impl SettingsView {
             .w_full()
             .pl(NAV_ITEM_INSET)
             .pr(SPACE_MD)
-            .gap(SPACE_SM)
+            .gap(ICON_TEXT_GAP)
             .items_center()
             .rounded(theme.radius)
             .cursor_pointer()
@@ -408,7 +409,13 @@ impl SettingsView {
             .on_click(move |_, _, cx| {
                 workbench.update(cx, |this, cx| this.select_settings_page(page, cx));
             })
-            .child(icon(icon_path).with_size(NAV_ICON).flex_shrink_0())
+            .child(
+                h_flex()
+                    .w(LEAD_BOX)
+                    .flex_shrink_0()
+                    .justify_center()
+                    .child(icon(icon_path).with_size(NAV_ICON)),
+            )
             // 放大档位下侧栏可能比标签窄:单行截断,行高是定的,换成两行会压到下一项
             .child(
                 div()

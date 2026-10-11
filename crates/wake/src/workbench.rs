@@ -5652,13 +5652,13 @@ impl Workbench {
                     .flex_shrink_0()
                     .child(
                         Spinner::new()
-                            .with_size(zpx(12.))
+                            .with_size(STATUS_LEAD)
                             .color(theme.muted_foreground),
                     )
                     .into_any_element()
             } else {
                 icon("icons/refresh-cw.svg")
-                    .with_size(zpx(12.))
+                    .with_size(STATUS_LEAD)
                     .flex_shrink_0()
                     .into_any_element()
             };
@@ -5678,11 +5678,11 @@ impl Workbench {
                     .gap(ICON_TEXT_GAP)
                     .text_color(theme.muted_foreground)
                     .child(
-                        div()
-                            .size(zpx(7.))
-                            .rounded_full()
+                        h_flex()
+                            .w(STATUS_LEAD)
                             .flex_shrink_0()
-                            .bg(theme.warning),
+                            .justify_center()
+                            .child(div().size(zpx(7.)).rounded_full().bg(theme.warning)),
                     )
                     .child(div().min_w_0().truncate().child(t("Live updates off")))
                     .into_any_element(),
@@ -5740,7 +5740,8 @@ impl Workbench {
                     .when_some(status, |this, status| {
                         this.child(
                             v_flex()
-                                .px(SPACE_XL)
+                                .pl(STATUS_LEAD_INSET)
+                                .pr(SPACE_XL)
                                 .pt(SPACE_MD)
                                 .gap(SPACE_SM)
                                 .text_size(FONT_LABEL)
@@ -9602,6 +9603,10 @@ fn sidebar_footer_width() -> Pixels {
 /// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽),工具条贴着侧栏左缘、
 /// 没有容器边距:最左那颗图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
 const FOOTER_LEAD_INSET: Zpx = axis_inset(FOOTER_BTN, Zpx(0.));
+/// 侧栏底部状态行的行首框:转圈、出错图标都是这么宽,"Live updates off" 的圆点在框里居中
+const STATUS_LEAD: Zpx = Zpx(12.);
+/// 状态行左内边距:行首框中心压在侧栏中轴上,与上面的导航行、下面的工具条同一条线
+const STATUS_LEAD_INSET: Zpx = axis_inset(STATUS_LEAD, Zpx(0.));
 
 /// 底部工具条的图标按钮(Zed 状态栏 / Xcode 导航条同款图标条,不带盒子):透明底、
 /// hover 才出色;`active`(当前页 / 清理模式)用侧栏行的选中色做圆角底 + 选中前景,
