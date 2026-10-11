@@ -15,7 +15,8 @@ pnpm build      # static site in dist/
 - **Download links** are resolved at build time from the GitHub API: the newest release that has all six packages. If the API can't be reached, the links are built from the version in the root `Cargo.toml`. Set `GITHUB_TOKEN` in Vercel to avoid the anonymous rate limit.
 - **The docs and changelog** read `../docs/mcp.md`, `../docs/cli.md` and `../CHANGELOG.md` directly. Links between the docs are rewritten to the site's pages; other repo links go to GitHub. `[Unreleased]` is left out of the changelog page. Each also exists under `/zh/` with Chinese navigation and labels; the body stays in English, with a note saying so, and links between the pages stay in the visitor's language.
 - **Copy** for the home page, in both languages, is `src/lib/copy.ts`. The search demo's sessions are made up, in `src/lib/demo-data.ts`.
-- **`public/og.png`** is the social card, a screenshot of the hero at 1200×630.
+- **`public/og.png`** and **`public/og-zh.png`** are the social cards (English and Chinese), screenshots of the hero at 1200×630.
+- **SEO**: titles, descriptions and keywords per language are in `src/lib/copy.ts`; `src/layouts/Base.astro` writes canonical and hreflang links (with x-default), Open Graph and Twitter tags, and any JSON-LD a page passes in (the home page describes the app as a `SoftwareApplication` with its FAQ, doc pages as `TechArticle`, with the doc's first paragraph as the description). Every URL ends in a slash; Vercel redirects the bare form. `public/robots.txt` points at the sitemap.
 
 ## Deploying
 

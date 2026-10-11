@@ -9,15 +9,59 @@ import More from './More.astro';
 import Principles from './Principles.astro';
 import Faq from './Faq.astro';
 import Download from './Download.astro';
-import type { Lang } from '../lib/copy';
+import { COPY, localePath, type Lang } from '../lib/copy';
+import { getRelease, REPO_URL } from '../lib/release';
 
 interface Props {
   lang: Lang;
 }
 const { lang } = Astro.props;
+const t = COPY[lang];
+const release = await getRelease();
+const site = Astro.site!;
+const home = new URL(localePath(lang, '/'), site).href;
+
+// What search engines read about the app: free, open source, which systems, which version.
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'SoftwareApplication',
+    name: 'Wake',
+    url: home,
+    description: t.description,
+    image: new URL(lang === 'zh' ? '/og-zh.png' : '/og.png', site).href,
+    applicationCategory: 'DeveloperApplication',
+    operatingSystem: 'macOS 14+, Linux, Windows',
+    softwareVersion: release.version,
+    ...(release.date ? { datePublished: release.date.slice(0, 10) } : {}),
+    downloadUrl: release.url,
+    license: 'https://opensource.org/licenses/MIT',
+    isAccessibleForFree: true,
+    offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+    author: { '@type': 'Person', name: 'Corey Chiu', url: 'https://coreychiu.com' },
+    sameAs: [REPO_URL],
+    inLanguage: t.htmlLang,
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'WebSite',
+    name: 'Wake',
+    url: home,
+    inLanguage: t.htmlLang,
+  },
+  {
+    '@context': 'https://schema.org',
+    '@type': 'FAQPage',
+    mainEntity: t.faq.items.map((item) => ({
+      '@type': 'Question',
+      name: item.q,
+      acceptedAnswer: { '@type': 'Answer', text: item.a },
+    })),
+  },
+];
 ---
 
-<Base lang={lang} alternate={lang === 'en' ? '/zh/' : '/'}>
+<Base lang={lang} alternate={lang === 'en' ? '/zh/' : '/'} jsonLd={jsonLd}>
   <main>
     <Hero lang={lang} />
     <Agents lang={lang} />

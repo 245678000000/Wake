@@ -12,14 +12,29 @@ interface Props {
   description?: string;
   /** Path of this page in the other language, when there is one. */
   alternate?: string;
+  /** Open Graph type: the home page is a website, a doc page an article. */
+  ogType?: 'website' | 'article';
+  /** Keep the page out of search results (the 404 page). */
+  noindex?: boolean;
+  /** schema.org objects, written out as JSON-LD. */
+  jsonLd?: Record<string, unknown>[];
 }
 
-const { lang, title, description, alternate } = Astro.props;
+const { lang, title, description, alternate, ogType = 'website', noindex = false, jsonLd = [] } = Astro.props;
 const t = COPY[lang];
 const pageTitle = title ?? t.title;
 const pageDescription = description ?? t.description;
 const canonical = new URL(Astro.url.pathname, Astro.site);
-const ogImage = new URL('/og.png', Astro.site);
+
+// Both language versions of this page, for hreflang; English is the fallback for everyone else.
+const other = alternate ? new URL(alternate, Astro.site) : null;
+const enUrl = lang === 'en' ? canonical : other;
+const zhUrl = lang === 'zh' ? canonical : other;
+
+const ogImage = new URL(lang === 'zh' ? '/og-zh.png' : '/og.png', Astro.site);
+const ogLocale = lang === 'zh' ? 'zh_CN' : 'en_US';
+const ogLocaleAlt = lang === 'zh' ? 'en_US' : 'zh_CN';
+const ld = (o: Record<string, unknown>) => JSON.stringify(o).replace(/</g, '\\u003c');
 ---
 
 <!doctype html>
@@ -29,25 +44,47 @@ const ogImage = new URL('/og.png', Astro.site);
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>{pageTitle}</title>
     <meta name="description" content={pageDescription} />
+    <meta name="keywords" content={t.keywords} />
+    <meta name="author" content="Corey Chiu" />
+    {noindex && <meta name="robots" content="noindex" />}
     <meta name="theme-color" content="#0b1730" />
+    <meta name="color-scheme" content="dark" />
     <link rel="canonical" href={canonical} />
     {
-      alternate && (
+      enUrl && zhUrl && (
         <>
-          <link rel="alternate" hreflang={lang === 'en' ? 'zh-Hans' : 'en'} href={new URL(alternate, Astro.site)} />
-          <link rel="alternate" hreflang={t.htmlLang} href={canonical} />
+          <link rel="alternate" hreflang="en" href={enUrl} />
+          <link rel="alternate" hreflang="zh-Hans" href={zhUrl} />
+          <link rel="alternate" hreflang="x-default" href={enUrl} />
         </>
       )
     }
+    <link rel="sitemap" href="/sitemap-index.xml" />
+
     <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/icon-32.png" type="image/png" sizes="32x32" />
     <link rel="apple-touch-icon" href="/icon-180.png" />
-    <meta property="og:type" content="website" />
+    <link rel="manifest" href="/site.webmanifest" />
+
+    <meta property="og:type" content={ogType} />
     <meta property="og:site_name" content="Wake" />
     <meta property="og:title" content={pageTitle} />
     <meta property="og:description" content={pageDescription} />
     <meta property="og:url" content={canonical} />
+    <meta property="og:locale" content={ogLocale} />
+    {enUrl && zhUrl && <meta property="og:locale:alternate" content={ogLocaleAlt} />}
     <meta property="og:image" content={ogImage} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={t.ogAlt} />
     <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={pageTitle} />
+    <meta name="twitter:description" content={pageDescription} />
+    <meta name="twitter:image" content={ogImage} />
+    <meta name="twitter:image:alt" content={t.ogAlt} />
+
+    {jsonLd.map((o) => <script type="application/ld+json" set:html={ld(o)} />)}
   </head>
   <body>
     <Nav lang={lang} alternate={alternate} />

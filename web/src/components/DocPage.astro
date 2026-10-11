@@ -19,13 +19,41 @@ const nav = [
 ];
 const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
 const path = `/docs/${entry.id}`;
+
+// The doc's own opening paragraph, as plain text, is its description in search results.
+const firstParagraph = (entry.body ?? '')
+  .split(/\n\s*\n/)
+  .map((block) => block.trim())
+  .find((block) => block && !/^(#|\||```|>|-\s|\*\s|<)/.test(block));
+const plain = (firstParagraph ?? '')
+  .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+  .replace(/[`*_]/g, '')
+  .replace(/\s+/g, ' ')
+  .trim();
+const description =
+  plain.length > 158 ? `${plain.slice(0, 155).replace(/\s+\S*$/, '').replace(/[\s,;:—–-]+$/, '')}…` : plain;
+const pageTitle = /\bWake\b/.test(title) ? title : `${title} — Wake`;
+const jsonLd = [
+  {
+    '@context': 'https://schema.org',
+    '@type': 'TechArticle',
+    headline: title,
+    description,
+    url: new URL(localePath(lang, path), Astro.site).href,
+    inLanguage: 'en',
+    author: { '@type': 'Person', name: 'Corey Chiu', url: 'https://coreychiu.com' },
+    isPartOf: { '@type': 'WebSite', name: 'Wake', url: new URL(localePath(lang, '/'), Astro.site).href },
+  },
+];
 ---
 
 <Base
   lang={lang}
-  title={`${title} — Wake`}
-  description={`Wake documentation: ${title}.`}
+  title={pageTitle}
+  description={description}
   alternate={localePath(lang === 'en' ? 'zh' : 'en', path)}
+  ogType="article"
+  jsonLd={jsonLd}
 >
   <main class="doc-page">
     <div class="wrap doc-layout">

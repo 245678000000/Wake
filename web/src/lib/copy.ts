@@ -6,14 +6,18 @@ export type Lang = 'en' | 'zh';
 
 const en = {
   htmlLang: 'en',
-  title: 'Wake — every coding-agent conversation, one search away',
+  title: 'Wake — Search and resume Claude Code, Codex & Cursor sessions',
   description:
-    'Wake gathers the conversations you have with Claude Code, Codex, Cursor and many other coding agents into one window. Search all of them and pick sessions back up in your terminal. Local and read-only.',
+    'Free, open-source app that puts your Claude Code, Codex, Cursor and Gemini CLI sessions in one window. Search them all, resume any in your terminal. Local only.',
+  keywords:
+    'Claude Code, Codex, Cursor, Gemini CLI, coding agent, AI coding, session history, chat history, resume session, full-text search, MCP server, Wake',
+  ogAlt: 'Wake: find any coding-agent conversation in seconds',
+  changelogDescription: 'Every Wake release and what changed in it.',
   nav: { home: 'Home', download: 'Free download', docs: 'Docs', changelog: 'Changelog', github: 'GitHub', star: 'Star Wake on GitHub', language: 'Language' },
   hero: {
     title: 'Find any coding‑agent conversation in seconds.',
     lede:
-      'Wake reads the history that Claude Code, Codex, Cursor and many other agents keep on your computer. Search all of it at once and pick sessions back up in your terminal. Read-only, and nothing leaves your machine.',
+      'Wake reads the history that Claude Code, Codex, Cursor and many other agents keep on your computer. Search all of it at once and pick sessions back up in your terminal. Read‑only, and nothing leaves your machine.',
     cta: 'Free download',
     docs: 'Read the docs',
     free: 'Open source, MIT licensed',
@@ -174,9 +178,13 @@ export type Copy = typeof en;
 
 const zh: Copy = {
   htmlLang: 'zh-Hans',
-  title: 'Wake：和 coding agent 聊过的每一句，几秒就能翻出来',
+  title: 'Wake — 搜索、恢复 Claude Code、Codex、Cursor 的会话记录',
   description:
-    'Claude Code、Codex、Cursor 这些 coding agent 的对话记录，Wake 都收进一个窗口：全文搜索，能恢复的会话点一下就回到终端接着聊。只读，数据不出本机。',
+    '免费开源的桌面应用：把 Claude Code、Codex、Cursor、Gemini CLI 等 coding agent 的会话记录收进一个窗口，全文搜索，一键回到终端接着聊。只读，数据不出本机。',
+  keywords:
+    'Claude Code, Codex, Cursor, Gemini CLI, coding agent, AI 编程, 会话记录, 聊天记录, 历史记录搜索, 恢复会话, 全文搜索, MCP, Wake',
+  ogAlt: 'Wake：和 coding agent 聊过的每一句，几秒就能翻出来',
+  changelogDescription: 'Wake 每个版本的更新内容。',
   nav: { home: '首页', download: '免费下载', docs: '文档', changelog: '更新日志', github: 'GitHub', star: '在 GitHub 上给 Wake 点 Star', language: '语言' },
   hero: {
     title: '和 coding agent 聊过的每一句，\n几秒就能翻出来。',
@@ -336,4 +344,10 @@ const zh: Copy = {
 export const COPY: Record<Lang, Copy> = { en, zh };
 
 /** The same page in a given language: Chinese pages live under /zh. */
-export const localePath = (lang: Lang, path: string) => (lang === 'zh' ? `/zh${path === '/' ? '/' : path}` : path);
+export function localePath(lang: Lang, path: string): string {
+  // Every page URL ends in a slash (astro.config trailingSlash: 'always'); a #hash stays after it.
+  const [p, hash] = path.split('#');
+  const withSlash = p.endsWith('/') ? p : `${p}/`;
+  const localized = lang === 'zh' ? `/zh${withSlash === '/' ? '/' : withSlash}` : withSlash;
+  return hash === undefined ? localized : `${localized}#${hash}`;
+}

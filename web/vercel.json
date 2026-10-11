@@ -4,6 +4,7 @@
   "installCommand": "pnpm install --frozen-lockfile",
   "buildCommand": "pnpm run build",
   "outputDirectory": "dist",
+  "trailingSlash": true,
   "headers": [
     {
       "source": "/_astro/(.*)",

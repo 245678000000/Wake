@@ -23,7 +23,8 @@ await Promise.all(
 
 const svg = path.join(assets, 'icon.svg');
 await copyFile(svg, path.join(pub, 'favicon.svg'));
-for (const size of [180, 512]) {
+// 32: PNG favicon fallback; 180: apple-touch-icon; 192 / 512: web manifest.
+for (const size of [32, 180, 192, 512]) {
   await sharp(svg, { density: 300 }).resize(size, size).png().toFile(path.join(pub, `icon-${size}.png`));
 }
 

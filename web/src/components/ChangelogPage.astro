@@ -55,7 +55,7 @@ const released = versions.filter((v) => !/unreleased/i.test(v.version));
 <Base
   lang={lang}
   title={`${t.changelog} — Wake`}
-  description="Every Wake release and what changed in it."
+  description={COPY[lang].changelogDescription}
   alternate={localePath(lang === 'en' ? 'zh' : 'en', '/changelog')}
 >
   <main class="doc-page">

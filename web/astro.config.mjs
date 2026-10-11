@@ -6,7 +6,8 @@ import { rewriteRepoLinks } from './src/lib/rehype-repo-links.mjs';
 
 export default defineConfig({
   site: 'https://wake.cool',
-  trailingSlash: 'ignore',
+  // One URL per page: /docs/mcp/ (Vercel redirects /docs/mcp there, see vercel.json)
+  trailingSlash: 'always',
   devToolbar: { enabled: false },
   build: { format: 'directory' },
   i18n: {

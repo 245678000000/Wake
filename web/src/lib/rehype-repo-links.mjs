@@ -3,7 +3,7 @@
 // them for the site: the two docs that have pages here point at those pages, anything
 // else in the repo points at GitHub.
 const REPO = 'https://github.com/iAmCorey/Wake';
-const PAGES = { 'mcp.md': '/docs/mcp', 'cli.md': '/docs/cli', 'CHANGELOG.md': '/changelog' };
+const PAGES = { 'mcp.md': '/docs/mcp/', 'cli.md': '/docs/cli/', 'CHANGELOG.md': '/changelog/' };
 
 function rewrite(href, file) {
   if (/^(?:[a-z]+:|#|\/)/i.test(href)) return href;
