@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 
 /// 变体声明序即侧栏固定展示序(derive Ord 直接按此序比较)——
-/// 顺序为用户指定(2026-08-20),新增 agent 问过用户再定位置,勿擅动老条目
+/// 顺序为用户指定(2026-08-20;Grok Bot 2026-10-11 用户定排在 Grok Build 之后),新增 agent
+/// 问过用户再定位置,勿擅动老条目
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AgentId {
     ClaudeCode,
     Codex,
     Grok,
+    GrokBot,
     Dsh,
     Cursor,
     Opencode,
@@ -30,13 +32,14 @@ pub enum AgentId {
 }
 
 impl AgentId {
-    /// 全部二十二家,**枚举声明序**(= Ord = 用户钉的侧栏展示序;面板成组、
+    /// 全部 agent,**枚举声明序**(= Ord = 用户钉的侧栏展示序;面板成组、
     /// 表单下拉共用同一顺序)。曾误抄 create_adapters 的构造序,下拉与侧栏
     /// 排序当场对不上——契约测试现在卡它与 Ord 一致
-    pub const ALL: [AgentId; 22] = [
+    pub const ALL: [AgentId; 23] = [
         AgentId::ClaudeCode,
         AgentId::Codex,
         AgentId::Grok,
+        AgentId::GrokBot,
         AgentId::Dsh,
         AgentId::Cursor,
         AgentId::Opencode,
@@ -82,6 +85,7 @@ impl AgentId {
             AgentId::CraftAgents => "craft-agents",
             AgentId::Devin => "devin",
             AgentId::Kilo => "kilo",
+            AgentId::GrokBot => "grok-bot",
         }
     }
 
@@ -109,6 +113,7 @@ impl AgentId {
             "craft-agents" => Some(AgentId::CraftAgents),
             "devin" => Some(AgentId::Devin),
             "kilo" => Some(AgentId::Kilo),
+            "grok-bot" => Some(AgentId::GrokBot),
             _ => None,
         }
     }
@@ -137,6 +142,7 @@ impl AgentId {
             AgentId::CraftAgents => "Craft Agents",
             AgentId::Devin => "Devin",
             AgentId::Kilo => "Kilo Code",
+            AgentId::GrokBot => "Grok Bot",
         }
     }
 
@@ -239,6 +245,9 @@ impl AgentId {
                     "brands/kilo-light.png"
                 }
             }
+            // 官方 app 图标(黑底圆角方块里一张带两只眼睛的白脸),两模式通用,ZCode 同款。图标里只有
+            // 256px 的位图,侧栏尺寸下够用
+            AgentId::GrokBot => "brands/grok-bot.png",
         }
     }
 }
@@ -984,7 +993,7 @@ pub const UNTITLED: &str = "Untitled";
 /// 会话 key 的唯一构造点:本地 `{agent}:{native_id}`,远程
 /// `{agent}:{host}:{native_id}`。scanner 的墓碑查询、watcher 的幸存者反查、
 /// 远程装饰器的 key 改写都走这里——"远程 key 长什么样"只此一处知识。
-/// (二十二家 adapter 的本地两段构造保留各自 `format!`,它们从不涉及 host。)
+/// (各家 adapter 的本地两段构造保留各自 `format!`,它们从不涉及 host。)
 pub fn session_key(agent: AgentId, host: &str, native_id: &str) -> String {
     if host.is_empty() {
         format!("{}:{native_id}", agent.as_str())

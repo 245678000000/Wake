@@ -9,8 +9,9 @@ use std::collections::HashSet;
 use std::ops::{Add, Mul, Neg, Sub};
 
 use gpui::{
-    div, px, AbsoluteLength, AnyElement, App, DefiniteLength, Div, Global, Hsla,
-    InteractiveElement as _, IntoElement, Length, MouseButton, Pixels, Styled, Window, WindowId,
+    div, px, AbsoluteLength, AnyElement, App, DefiniteLength, Div, FontWeight, Global, Hsla,
+    InteractiveElement as _, IntoElement, Length, MouseButton, ParentElement as _, Pixels, Styled,
+    Window, WindowId,
 };
 use gpui_component::{
     button::Button,
@@ -267,7 +268,9 @@ pub const SIDEBAR_EDGE: Zpx = Zpx(10.);
 // (导航图标、品牌图、文件夹图标、组头的折叠 chevron)的**中心**都压在这条竖线上。
 // 注意:中心对齐与左缘对齐是同一个自由度,只能满足一个——选了中心,
 // 图标左缘就会落在 17.75,比红灯左缘还靠左 2.25,这是预期而非错位。
-// 两个内边距(LEAD_INSET / TITLE_INSET)是同一条轴推出来的,改一个必须重算另一个。
+// 压轴的内边距一律经 `axis_inset(行首元素宽, 容器边距)` 从这条轴推出(侧栏行、组头、底部工具条、
+// 设置窗导航),标题的首字宽是现量的(`sidebar_title`)。容易漏的是容器边距那一项:容器的
+// 内边距改了,传给 axis_inset 的必须是同一个常量,不然行首元素整列离轴。
 
 /// 侧栏中轴(100% 档)。界面缩放时 traffic light 跟着它挪(`ui_zoom::traffic_lights`)
 pub const LEAD_AXIS: Zpx = Zpx(26.75);
@@ -278,17 +281,38 @@ pub const LEAD_BOX: Zpx = Zpx(18.);
 /// 侧栏导航行的线条图标边长(品牌图占满 18px 槽位,线条图标比实心品牌图视觉轻,小一档
 /// 才平衡);组头的折叠 chevron 同一档,描边粗细才一致
 pub const NAV_ICON: Zpx = Zpx(15.);
+/// 宽 `lead` 的行首元素中心压轴所需的左内边距:轴 − 半宽 − 容器自己的内边距 `edge`
+pub const fn axis_inset(lead: Zpx, edge: Zpx) -> Zpx {
+    Zpx(LEAD_AXIS.0 - lead.0 / 2. - edge.0)
+}
 /// 行左内边距 = 26.75(轴) − 9(槽位半宽) − 10(SIDEBAR_EDGE,容器那一半)
-pub const LEAD_INSET: Zpx = Zpx(LEAD_AXIS.0 - LEAD_BOX.0 / 2. - SIDEBAR_EDGE.0);
+pub const LEAD_INSET: Zpx = axis_inset(LEAD_BOX, SIDEBAR_EDGE);
 /// 分组项(agent/项目)相对轴的右缩进,表达从属。
 /// 压轴的只有主导航行与组头;分组项一律偏这么多。
 pub const SUB_INDENT: Zpx = Zpx(12.);
 // 组头(Agents / Projects)没有自己的内边距常量:NAV_ICON 的 chevron 按自己的框居中压轴
 //(见 workbench.rs group_header);靠首字母字形宽度反推的 GROUP_HEAD_INSET 已删(2026-09-22)。
-/// 侧栏标题 "Wake" 的左内边距:同样让首字母 W 的字形中心落在轴上。
-/// 实测 16px semibold 的 W 宽 14.25、左承距 0.5,文字左缘需 19.65;
-/// 减去容器的 SIDEBAR_EDGE 得 9.15,取 9.0(2x 屏下 0.5px 以下的差会被光栅化吃掉)。
-pub const TITLE_INSET: Zpx = Zpx(9.);
+/// 侧栏标题(主窗的 "Wake" / "Memory",设置窗的 "Settings"):Heading semibold,首字的字形中心
+/// 压在中轴上。首字按标题实际继承的字体现量(`layout_width` 走 gpui 的逐帧排版缓存,字号与字重
+/// 就是这个 div 自己的),标题换页、换语言照样对得上——原先的 TITLE_INSET = 9 按 "Wake" 的 W 写死,
+/// Memory 页与设置窗标题都偏(2026-10-11 用户报设置窗的 S 没压在红灯中心线上)。量的是字宽一半:
+/// SF Pro 首字的左承距比右承距略大,字形实际中心再偏右约 0.15,在光栅化步长以内。div 从侧栏左缘
+/// 起排,调用方只补纵向与右侧的内边距和颜色
+pub fn sidebar_title(title: &'static str, window: &Window) -> Div {
+    const WEIGHT: FontWeight = FontWeight::SEMIBOLD;
+    let inset = title.chars().next().map_or(Pixels::ZERO, |first| {
+        let mut font = window.text_style().font();
+        font.weight = WEIGHT;
+        let text = window.text_system();
+        let width = text.layout_width(text.resolve_font(&font), FONT_HEADING.get(), first);
+        (LEAD_AXIS.get() - width / 2.).max(Pixels::ZERO)
+    });
+    div()
+        .pl(inset)
+        .text_size(FONT_HEADING)
+        .font_weight(WEIGHT)
+        .child(title)
+}
 /// 侧栏主导航行高(固定区:All Sessions/Starred;搜索框同高)
 pub const ROW_HEIGHT: Zpx = Zpx(32.);
 /// 侧栏子级行高(分组展开项:agent/项目)——比主导航低一级,

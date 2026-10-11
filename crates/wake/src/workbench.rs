@@ -2397,7 +2397,7 @@ impl UsageBoard {
         }
     }
 
-    /// Agents 全量列出(总共二十二家);项目/模型长尾长,取前 6
+    /// Agents 全量列出(家数有限);项目/模型长尾长,取前 6
     fn limit(self) -> usize {
         match self {
             Self::Agents => usize::MAX,
@@ -5596,6 +5596,12 @@ impl Workbench {
 
     fn render_sidebar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        // Memory 页标题换成 Memory:侧栏顶上就说明现在管的是什么,不另加模式标题行(用户 2026-09-21)
+        let title = if self.page == Page::Memory {
+            t("Memory")
+        } else {
+            "Wake"
+        };
         let all_active = self.selected_agent.is_none()
             && self.selected_project.is_none()
             && !self.favorite_only
@@ -5709,27 +5715,13 @@ impl Workbench {
                 ))
             })
             .child(
-                div()
+                sidebar_title(title, window)
                     .flex_shrink_0()
                     .h(WINDOW_TITLEBAR_HEIGHT)
-                    .px(SIDEBAR_EDGE)
                     .pt(SPACE_XS)
                     .pb(SPACE_LG)
-                    .child(
-                        div()
-                            .pl(TITLE_INSET)
-                            .pr(SIDEBAR_EDGE)
-                            .text_size(FONT_HEADING)
-                            .font_semibold()
-                            .text_color(theme.foreground)
-                            // Memory 页标题换成 Memory:侧栏顶上就说明现在管的是什么,
-                            // 不另加模式标题行(用户 2026-09-21)
-                            .child(if self.page == Page::Memory {
-                                t("Memory")
-                            } else {
-                                "Wake"
-                            }),
-                    ),
+                    .pr(SIDEBAR_EDGE * 2.)
+                    .text_color(theme.foreground),
             )
             // 导航按页切换:Memory 页是记忆的导航(All Memory / Agents / Projects,按记忆
             // 计数),其余是会话的(搜索框 + All Sessions / Starred + Agents / Projects)
@@ -7673,7 +7665,7 @@ fn group_header(
         // chevron 不占 18px 槽位、只按自己的框居中压轴:槽位居中再接统一间距,墨迹到
         // 文字会比导航行空出一截(chevron 墨迹只有约 5px 宽,用户 2026-09-22 "间隔太大");
         // 按框压轴后文字起点比导航行标签左 1.5px,墨迹到文字视觉约 10.9px、与导航行相当
-        .pl(LEAD_INSET + (LEAD_BOX - NAV_ICON) / 2.)
+        .pl(axis_inset(NAV_ICON, SIDEBAR_EDGE))
         .pr(SIDEBAR_EDGE)
         .pt(SPACE_MD)
         .pb(SPACE_XS)
@@ -9607,9 +9599,9 @@ const FOOTER_BTN: Zpx = Zpx(28.);
 fn sidebar_footer_width() -> Pixels {
     FOOTER_LEAD_INSET + FOOTER_BTN * 5. + zpx(2.) * 3. + SPACE_SM + SIDEBAR_EDGE
 }
-/// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽):最左那颗
-/// 图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
-const FOOTER_LEAD_INSET: Zpx = Zpx(LEAD_AXIS.0 - FOOTER_BTN.0 / 2.);
+/// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽),工具条贴着侧栏左缘、
+/// 没有容器边距:最左那颗图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
+const FOOTER_LEAD_INSET: Zpx = axis_inset(FOOTER_BTN, Zpx(0.));
 
 /// 底部工具条的图标按钮(Zed 状态栏 / Xcode 导航条同款图标条,不带盒子):透明底、
 /// hover 才出色;`active`(当前页 / 清理模式)用侧栏行的选中色做圆角底 + 选中前景,

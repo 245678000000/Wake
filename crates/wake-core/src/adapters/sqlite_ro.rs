@@ -77,13 +77,25 @@ pub fn virtual_path(db: &Path, id: &str) -> String {
     format!("{}#{id}", db.display())
 }
 
-/// virtual_path 的逆:磁盘上不存在的路径剥掉 `#<id>` 还原库文件本体,
-/// 真实存在的路径原样返回(文件管理器 reveal 用)。格式知识只在本文件。
+/// 挂在 `db` 名下的全部虚拟路径都落在这个半开区间里:按字节序比,`$` 紧跟在 `#` 后面
+/// (`Store::file_paths_in` 拿它走 file_path 的唯一索引,不整表扫)
+pub fn virtual_path_bounds(db: &Path) -> (String, String) {
+    (virtual_path(db, ""), format!("{}$", db.display()))
+}
+
+/// virtual_path 的逆:`<文件>#<id>` → (文件, id);没有 `#` 给 None。不看磁盘——真实路径里也可能
+/// 有 `#`,是不是虚拟路径由调用方认(strip_virtual_path 看存在性,Grok Bot 看后缀)
+pub fn split_virtual_path(path: &str) -> Option<(&str, &str)> {
+    path.rsplit_once('#')
+}
+
+/// 磁盘上不存在的路径剥掉 `#<id>` 还原库文件本体,真实存在的路径原样返回(文件管理器 reveal 用)。
+/// 格式知识只在本文件。
 pub fn strip_virtual_path(path: &str) -> &str {
     if Path::new(path).exists() {
         path
     } else {
-        path.rsplit_once('#').map(|(db, _)| db).unwrap_or(path)
+        split_virtual_path(path).map_or(path, |(db, _)| db)
     }
 }
 

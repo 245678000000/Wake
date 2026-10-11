@@ -1622,6 +1622,81 @@ fn antigravity_transcript_takes_over_its_index_card() {
     assert_eq!(rows(), 1);
 }
 
+/// Grok Bot:副本是 app 的滚动缓存——对话被清出缓存时卡片接替(同一个 key,库里始终一行),
+/// 缓存回来时副本接回;侧栏里改名时副本文件没动,全量扫描靠引用里并进的指纹认出来;删除只是
+/// 隐藏:缓存文件原样留在原处,下一轮扫描也不会把它当成"从废纸篓放回来了"而撤掉墓碑
+#[test]
+fn grok_bot_card_stands_in_when_the_cache_drops_a_conversation() {
+    use wake_core::adapters::grok_bot::GrokBotAdapter;
+    const ID: &str = "b0000001-aaaa-bbbb-cccc-000000000001";
+    let key = format!("grok-bot:{ID}");
+    let home = tempfile::tempdir().unwrap();
+    let cache = common::stage_grok_bot(home.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![GrokBotAdapter::new().with_custom_root(cache.clone())];
+    let replica = common::grok_bot_replica_path(&cache, ID);
+    let roster = common::grok_bot_roster_path(&cache);
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let rows = || {
+        store
+            .list_sessions(&SessionFilter {
+                include_archived: true,
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap()
+            .1
+    };
+
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store.get_session(&key).unwrap().expect("副本入库");
+    assert_eq!(s.file_path, replica.to_string_lossy());
+    assert_eq!(s.title, "Ada");
+    // 四个有副本的对话 + 只剩卡片的 Scout
+    assert_eq!(rows(), 5);
+
+    // app 把这个对话清出了缓存:卡片接替
+    let kept = std::fs::read(&replica).unwrap();
+    std::fs::remove_file(&replica).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let s = store.get_session(&key).unwrap().expect("卡片接替");
+    assert!(s.file_path.ends_with(&format!("#{ID}")), "{}", s.file_path);
+    assert_eq!(s.title, "Ada");
+    assert_eq!(rows(), 5);
+
+    // 用户又打开了这个对话,缓存回来:增量写入由副本接回
+    std::fs::write(&replica, &kept).unwrap();
+    let incoming = adapters[0].file_ref(&replica).expect("副本是这个对话的");
+    scan_files(&adapters, &store, &Recorder::new(), vec![incoming]);
+    let s = store.get_session(&key).unwrap().unwrap();
+    assert_eq!(s.file_path, replica.to_string_lossy());
+
+    // 侧栏里改了名:副本没动,全量扫描照样认出来
+    let renamed = std::fs::read_to_string(&roster)
+        .unwrap()
+        .replace(r#""name":"Ada""#, r#""name":"Ada Lovelace""#);
+    std::fs::write(&roster, renamed).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        store.get_session(&key).unwrap().unwrap().title,
+        "Ada Lovelace"
+    );
+
+    // 删除 = 隐藏:不动缓存文件,也不被"放回即恢复"撤掉
+    let targets = adapters[0].session_paths(&s);
+    assert!(targets.is_empty());
+    let hidden = wake_core::cleanup::trash_sessions(&store, &[s], &targets).unwrap();
+    assert!(hidden, "一个文件都没移");
+    assert!(replica.exists());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert!(
+        store.get_session(&key).unwrap().is_none(),
+        "缓存文件还在原处,隐藏照样生效(副本与卡片同一个 key)"
+    );
+    assert_eq!(rows(), 4);
+}
+
 /// Cursor 两源端到端:转录带正文的会话固定由 CLI 源胜出(它有 slug 可反推
 /// 项目),哪怕 IDE 库里那份 lastUpdatedAt 更新、roster 里 IDE 实例排在前面;
 /// 转录只剩 turn_ended 空壳的会话由 IDE 库副本胜出。按 mtime 裁决的话胜负随

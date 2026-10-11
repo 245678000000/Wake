@@ -48,10 +48,10 @@ pub struct CursorIdeAdapter {
 }
 
 /// `globalStorage/state.vscdb` 的默认路径(用户数据目录三平台各异,见
-/// `vscode_user_data`)。只做路径推导、不探测存在性——缺根由 list_session_files
+/// `electron_user_data`)。只做路径推导、不探测存在性——缺根由 list_session_files
 /// 降级为空(roster 契约)
 pub(super) fn default_db_path() -> PathBuf {
-    super::vscode_user_data("Cursor")
+    super::electron_user_data("Cursor")
         .join("User")
         .join("globalStorage")
         .join(DB_NAME)

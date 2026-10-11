@@ -1,7 +1,7 @@
 use crate::adapters::AgentAdapter;
 use crate::db::Store;
 use crate::models::*;
-use crate::scanner::{refresh_claims, refresh_parent_links, scan_files, ScanEvents};
+use crate::scanner::{rank_of, refresh_claims, refresh_parent_links, scan_files, ScanEvents};
 use notify::{RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -161,19 +161,21 @@ pub(crate) fn process_batch(
         }
     }
 
-    // 新出现(还没入库)与消失的会话文件可能改变同实例别的文件的引用(`ref_dependents`:
-    // Claude 的分支数着同目录更早的同根文件)。那些文件没动、没有事件,这里按引用与索引
+    // 不是已入库会话文件的路径(新出现的会话文件,或者从不入库的共享边车——Grok Bot 的侧栏列表)
+    // 与消失的路径,可能改变同实例别的文件的引用(`ref_dependents`:Claude 的分支数着同目录更早的
+    // 同根文件,Grok Bot 的副本并进了列表行的指纹)。那些文件没动、没有事件,这里按引用与索引
     // 重比,变了的跟本批一起收编——Wake 里删原件、从废纸篓放回、Claude 自己清理旧会话,
     // 留下的分支都当场展开 / 折叠,不用等下一次全量扫描
+    let vanished: Vec<(&PathBuf, usize)> = gone
+        .iter()
+        .filter_map(|path| resolve_watch_agent(roots, path).map(|ix| (path, ix)))
+        .collect();
     let appeared = present
         .iter()
         .filter(|(path, _)| matches!(store.file_stamp(&path.to_string_lossy()), Ok(None)))
         .map(|(path, ix)| (path, *ix));
-    let vanished = gone
-        .iter()
-        .filter_map(|path| resolve_watch_agent(roots, path).map(|ix| (path, ix)));
-    let dependents: Vec<SessionFileRef> = appeared
-        .chain(vanished)
+    let mut dependents: Vec<SessionFileRef> = appeared
+        .chain(vanished.iter().copied())
         .flat_map(|(path, ix)| {
             let adapter = &adapters[ix];
             adapter
@@ -188,9 +190,52 @@ pub(crate) fn process_batch(
         })
         .collect();
 
+    // 装着好几个会话的文件(`sessions_in`,Grok Bot 的侧栏列表):库里挂在它名下的虚拟路径按它
+    // 此刻的内容对账——新出现的收编,没了的出库,引用变了的重解析
+    let mut dropped: Vec<String> = Vec::new();
+    let every_path = present.iter().map(|(path, ix)| (path, *ix));
+    for (path, ix) in every_path.chain(vanished.iter().copied()) {
+        let adapter = &adapters[ix];
+        let Some(listed) = adapter.sessions_in(path) else {
+            continue;
+        };
+        let rank = rank_of(adapters, adapter.agent());
+        let (from, to) = crate::adapters::sqlite_ro::virtual_path_bounds(path);
+        let Ok(indexed) = store.file_paths_in(&from, &to) else {
+            continue;
+        };
+        let still_there: HashSet<&str> = listed.iter().map(|r| r.file_path.as_str()).collect();
+        dropped.extend(
+            indexed
+                .into_iter()
+                .filter(|indexed| !still_there.contains(indexed.as_str())),
+        );
+        dependents.extend(
+            listed
+                .into_iter()
+                .filter(|r| match store.file_stamp(&r.file_path) {
+                    Ok(Some(stamp)) => stamp != (r.mtime_ms, r.size),
+                    // 没入库的:同一会话已由别的文件代表着、那一份的副本位次又严格更优(Grok Bot
+                    // 有副本的对话),交给 scan_files 也必败;同级的(两个 location 各一张卡片)
+                    // 交给写事务里的副本裁决按 mtime 定(2026-10-11 Codex review)
+                    Ok(None) => {
+                        let key = session_key(r.agent, adapter.host(), &r.native_id);
+                        match store.file_path_of(&key) {
+                            Ok(None) => true,
+                            Ok(Some(indexed)) => rank(&indexed) >= rank(&r.file_path),
+                            Err(_) => false,
+                        }
+                    }
+                    Err(_) => false,
+                }),
+        );
+    }
+
     let removed_keys: Vec<String> = gone
         .iter()
-        .filter_map(|path| store.remove_by_path(&path.to_string_lossy()).ok().flatten())
+        .map(|path| path.to_string_lossy().into_owned())
+        .chain(dropped)
+        .filter_map(|path| store.remove_by_path(&path).ok().flatten())
         .collect();
     if !removed_keys.is_empty() {
         events.on_sessions_changed();
@@ -511,5 +556,233 @@ mod tests {
         dropper.join().unwrap();
         assert_eq!(Arc::strong_count(&adapters), 1);
         assert_eq!(Arc::strong_count(&fx.store), 1);
+    }
+
+    /// 只装着 Grok Bot 一家的存储目录(一个或几个 location)与索引;文件都在账号 github|1 名下,
+    /// 不点名 location 的都写在第一个里
+    struct GrokBotFixture {
+        _tmp: tempfile::TempDir,
+        locations: Vec<PathBuf>,
+        store: Arc<Store>,
+        adapters: Vec<Box<dyn AgentAdapter>>,
+        roots: Vec<(PathBuf, usize)>,
+    }
+
+    impl GrokBotFixture {
+        fn new() -> Self {
+            Self::with_locations(1)
+        }
+
+        fn with_locations(count: usize) -> Self {
+            use crate::adapters::grok_bot::GrokBotAdapter;
+            let tmp = tempfile::tempdir().unwrap();
+            let locations: Vec<PathBuf> = (0..count)
+                .map(|ix| {
+                    let root = tmp.path().join(format!("location-{ix}"));
+                    let root = root.join("sand-client-persistence");
+                    std::fs::create_dir_all(&root).unwrap();
+                    root
+                })
+                .collect();
+            Self {
+                store: Arc::new(Store::open(&tmp.path().join("wake.db")).unwrap()),
+                adapters: locations
+                    .iter()
+                    .map(|root| GrokBotAdapter::new().with_custom_root(root.clone()))
+                    .collect(),
+                roots: locations.iter().cloned().zip(0..).collect(),
+                locations,
+                _tmp: tmp,
+            }
+        }
+
+        fn file_in(&self, location: usize, slice: &str) -> PathBuf {
+            let key = format!("sand.client.slice.account.github%7C1.{slice}");
+            self.locations[location].join(crate::adapters::grok_bot::store_file_name(&key).unwrap())
+        }
+
+        fn file(&self, slice: &str) -> PathBuf {
+            self.file_in(0, slice)
+        }
+
+        fn roster_in(&self, location: usize) -> PathBuf {
+            self.file_in(location, "roster.last-roster")
+        }
+
+        fn roster(&self) -> PathBuf {
+            self.roster_in(0)
+        }
+
+        fn write_roster_in(&self, location: usize, rows: &[String]) {
+            std::fs::write(self.roster_in(location), roster_json(rows)).unwrap();
+        }
+
+        fn write_roster(&self, rows: &[String]) {
+            self.write_roster_in(0, rows);
+        }
+
+        /// 一条副本,条目原样给
+        fn write_replica(&self, id: &str, entries: &str) -> PathBuf {
+            let path = self.file(&format!("transcript.replicas.{id}"));
+            let json = format!(
+                r#"{{"schemaVersion":1,"value":{{"entries":[{entries}],"persistedAt":1786000000000}}}}"#
+            );
+            std::fs::write(&path, json).unwrap();
+            path
+        }
+
+        fn event(&self, paths: &[&Path]) {
+            let event = paths.iter().fold(
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)),
+                |event, path| event.add_path(path.to_path_buf()),
+            );
+            process_batch(
+                &self.adapters,
+                &self.store,
+                &NullEvents,
+                &self.roots,
+                vec![Ok(event)],
+            );
+        }
+
+        fn session(&self, id: &str) -> Option<SessionMeta> {
+            self.store.get_session(&format!("grok-bot:{id}")).unwrap()
+        }
+
+        fn title(&self, id: &str) -> Option<String> {
+            self.session(id).map(|session| session.title)
+        }
+
+        fn finds(&self, word: &str) -> bool {
+            let (hits, _) = self.store.search(word, &[], None, 10).unwrap();
+            !hits.is_empty()
+        }
+    }
+
+    fn roster_json(rows: &[String]) -> String {
+        let rows = rows.join(",");
+        format!(r#"{{"schemaVersion":4,"value":{{"rows":[{rows}]}}}}"#)
+    }
+
+    fn grok_bot_row_at(id: &str, name: &str, description: &str, activity_ms: i64) -> String {
+        format!(
+            r#"{{"id":"{id}","name":"{name}","description":"{description}","createdAt":1786000000000,"lastActivityAt":{activity_ms}}}"#
+        )
+    }
+
+    fn grok_bot_row(id: &str, name: &str, description: &str) -> String {
+        grok_bot_row_at(id, name, description, 1786000060000)
+    }
+
+    const HELLO: &str = r#"{"kind":"message","id":"m1","seq":1,"timestampMs":1786000000000,"role":"user","content":"hello"}"#;
+
+    /// Grok Bot 在侧栏里改名:只有列表文件有事件,副本文件没动。列表文件的事件经 `ref_dependents`
+    /// 把同账号的副本带进同一批重比,标题当场跟上,不用等下一次全量扫描
+    #[test]
+    fn grok_bot_roster_changes_reach_untouched_replicas() {
+        let fx = GrokBotFixture::new();
+        fx.write_roster(&[grok_bot_row("c1", "Ada", "")]);
+        let replica = fx.write_replica("c1", HELLO);
+        fx.event(&[&replica]);
+        assert_eq!(fx.title("c1").as_deref(), Some("Ada"));
+        fx.write_roster(&[grok_bot_row("c1", "Ada Lovelace", "")]);
+        fx.event(&[&fx.roster()]);
+        assert_eq!(fx.title("c1").as_deref(), Some("Ada Lovelace"));
+    }
+
+    /// 列表里新建的 bot、删掉的 bot,卡片当场跟上(`sessions_in`);列表文件整个没了,卡片一张不剩,
+    /// 有副本的对话照列、标题退回第一句话
+    #[test]
+    fn grok_bot_cards_follow_the_roster() {
+        let fx = GrokBotFixture::new();
+        let replica = fx.write_replica("c1", HELLO);
+        fx.write_roster(&[
+            grok_bot_row("c1", "Ada", ""),
+            grok_bot_row("c2", "Scout", ""),
+        ]);
+        fx.event(&[&fx.roster(), &replica]);
+        let replica_path = replica.to_string_lossy().into_owned();
+        assert_eq!(fx.session("c1").unwrap().file_path, replica_path);
+        assert_eq!(fx.title("c2").as_deref(), Some("Scout"));
+
+        fx.write_roster(&[
+            grok_bot_row("c1", "Ada", ""),
+            grok_bot_row("c3", "Scribe", ""),
+        ]);
+        fx.event(&[&fx.roster()]);
+        assert!(fx.session("c2").is_none(), "列表里删掉的 bot 不该还挂着");
+        assert_eq!(fx.title("c3").as_deref(), Some("Scribe"));
+        assert_eq!(fx.session("c1").unwrap().file_path, replica_path);
+
+        std::fs::remove_file(fx.roster()).unwrap();
+        fx.event(&[&fx.roster()]);
+        assert!(fx.session("c3").is_none());
+        assert_eq!(fx.title("c1").as_deref(), Some("hello"));
+    }
+
+    /// 副本只剩事件、退成卡片挂在副本自己的路径上:卡片才用的描述变了,副本没动也要重解析
+    #[test]
+    fn grok_bot_fallback_card_follows_the_roster_row() {
+        let fx = GrokBotFixture::new();
+        let replica = fx.write_replica(
+            "c1",
+            r#"{"kind":"event","id":"e1","seq":1,"timestampMs":1786000000000,"event":{"type":"name-changed","from":"a","to":"b"}}"#,
+        );
+        fx.write_roster(&[grok_bot_row("c1", "Ada", "Writes limericks")]);
+        fx.event(&[&fx.roster(), &replica]);
+        assert_eq!(
+            fx.session("c1").unwrap().file_path,
+            replica.to_string_lossy()
+        );
+        assert!(fx.finds("limericks"));
+        fx.write_roster(&[grok_bot_row("c1", "Ada", "Writes sonnets")]);
+        fx.event(&[&fx.roster()]);
+        assert!(fx.finds("sonnets"));
+        assert!(!fx.finds("limericks"));
+    }
+
+    /// 账号太长、键编码后超过 240 字符的列表存成摘要名的 `.kblob`,键在首行:文件被删之后读不到
+    /// 首行,也得认出它是哪个账号的列表、把卡片撤掉
+    #[test]
+    fn grok_bot_framed_roster_deletion_drops_its_cards() {
+        let fx = GrokBotFixture::new();
+        let account = "x".repeat(150);
+        let key = format!("sand.client.slice.account.{account}.roster.last-roster");
+        assert!(crate::adapters::grok_bot::store_file_name(&key).is_none());
+        let roster = fx.locations[0].join("0123456789abcdef.kblob");
+        let framed = format!(
+            "{}\n{}",
+            serde_json::to_string(&key).unwrap(),
+            roster_json(&[grok_bot_row("c9", "Scout", "")])
+        );
+        std::fs::write(&roster, framed).unwrap();
+        fx.event(&[&roster]);
+        assert_eq!(fx.title("c9").as_deref(), Some("Scout"));
+        std::fs::remove_file(&roster).unwrap();
+        fx.event(&[&roster]);
+        assert!(fx.session("c9").is_none(), "列表没了,卡片不该还挂着");
+    }
+
+    /// 同一对话在两个 location 里都只有卡片:位次相同,按 mtime(最后活动时间)定胜负。落选那份
+    /// 后来更新了,要当场接替,不用等全量扫描
+    #[test]
+    fn grok_bot_newer_card_from_another_location_takes_over() {
+        let fx = GrokBotFixture::with_locations(2);
+        fx.write_roster_in(0, &[grok_bot_row_at("c1", "Ada", "", 1786000060000)]);
+        fx.write_roster_in(1, &[grok_bot_row_at("c1", "Ada", "", 1786000090000)]);
+        fx.event(&[&fx.roster_in(0), &fx.roster_in(1)]);
+        let winner = fx.session("c1").unwrap().file_path;
+        assert!(winner.starts_with(&*fx.locations[1].to_string_lossy()));
+
+        fx.write_roster_in(
+            0,
+            &[grok_bot_row_at("c1", "Ada Lovelace", "", 1786000120000)],
+        );
+        fx.event(&[&fx.roster_in(0)]);
+        let session = fx.session("c1").unwrap();
+        assert_eq!(session.title, "Ada Lovelace");
+        assert!(session
+            .file_path
+            .starts_with(&*fx.locations[0].to_string_lossy()));
     }
 }

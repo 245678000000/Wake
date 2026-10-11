@@ -445,10 +445,9 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     }
 }
 
-/// `<home>/…/<编辑器>/User/globalStorage`:VS Code 系编辑器的 globalStorage,与
-/// adapters::vscode_user_data 的平台分支逐条对应(改一处必须改另一处,契约测试会因路径
-/// 不符而空列)
-pub fn vscode_global_storage(home: &Path, editor: &str) -> PathBuf {
+/// `<home>/…/<app 名>`:Electron app 的 userData,与 adapters::electron_user_data 的平台分支
+/// 逐条对应(改一处必须改另一处,契约测试会因路径不符而空列)
+pub fn electron_user_data(home: &Path, app: &str) -> PathBuf {
     let base = if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support")
     } else if cfg!(target_os = "windows") {
@@ -456,7 +455,71 @@ pub fn vscode_global_storage(home: &Path, editor: &str) -> PathBuf {
     } else {
         home.join(".config")
     };
-    base.join(editor).join("User").join("globalStorage")
+    base.join(app)
+}
+
+/// `<home>/…/<编辑器>/User/globalStorage`:VS Code 系编辑器的 globalStorage
+pub fn vscode_global_storage(home: &Path, editor: &str) -> PathBuf {
+    electron_user_data(home, editor)
+        .join("User")
+        .join("globalStorage")
+}
+
+/// Grok Bot fixture 的账号段(app 存的是 URI 编码过的账号)
+pub const GROK_BOT_ACCOUNT: &str = "google-oauth2%7Cuser_fixture01";
+
+/// Grok Bot 的一份存储文件:键直接编码进文件名。用 adapter 自己的编码器——它对不对由 adapter 的
+/// 单测拿本机真实文件名卡着
+pub fn grok_bot_store_file(store: &Path, key: &str) -> PathBuf {
+    store.join(wake_core::adapters::grok_bot::store_file_name(key).expect("短键直接编码进文件名"))
+}
+
+/// fixture 账号的侧栏列表
+pub fn grok_bot_roster_path(store: &Path) -> PathBuf {
+    grok_bot_store_file(store, &grok_bot_roster_key(GROK_BOT_ACCOUNT))
+}
+
+/// fixture 账号的一个对话副本
+pub fn grok_bot_replica_path(store: &Path, conversation: &str) -> PathBuf {
+    grok_bot_store_file(store, &grok_bot_replica_key(GROK_BOT_ACCOUNT, conversation))
+}
+
+pub fn grok_bot_replica_key(account: &str, conversation: &str) -> String {
+    format!("sand.client.slice.account.{account}.transcript.replicas.{conversation}")
+}
+
+pub fn grok_bot_roster_key(account: &str) -> String {
+    format!("sand.client.slice.account.{account}.roster.last-roster")
+}
+
+/// Grok Bot 的缓存目录(`<userData>/sand-client-persistence`):检入的明文 fixture——侧栏列表与
+/// 各对话的副本——按 app 的写法落成 base32 文件名;另放一个不相干的切片与一份写到一半的 `.tmp`,
+/// 都不是会话。返回缓存目录
+pub fn stage_grok_bot(home: &Path) -> PathBuf {
+    let store = electron_user_data(home, "Grok Bot").join("sand-client-persistence");
+    fs::create_dir_all(&store).expect("mkdir grok bot store");
+    fs::copy(
+        fixture("grok-bot/roster.json"),
+        grok_bot_roster_path(&store),
+    )
+    .expect("stage grok bot roster");
+    for entry in fs::read_dir(fixture("grok-bot/replicas")).expect("grok bot replicas") {
+        let path = entry.unwrap().path();
+        let id = path.file_stem().unwrap().to_string_lossy().to_string();
+        fs::copy(&path, grok_bot_replica_path(&store, &id)).expect("stage grok bot replica");
+    }
+    fs::write(
+        grok_bot_store_file(&store, "sand.client.slice.ui-layout"),
+        r#"{"schemaVersion":1,"value":{"sidebarWidth":210}}"#,
+    )
+    .unwrap();
+    let in_flight = grok_bot_replica_path(&store, "b0000001-aaaa-bbbb-cccc-000000000001");
+    fs::write(
+        in_flight.with_extension("blob.tmp"),
+        "{\"schemaVersion\":1,",
+    )
+    .unwrap();
+    store
 }
 
 /// `<home>/…/Cursor/User/globalStorage`

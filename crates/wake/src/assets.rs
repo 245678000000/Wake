@@ -67,6 +67,7 @@ brands!(
     "devin-light",
     "kilo",
     "kilo-light",
+    "grok-bot",
 );
 
 fn lookup_product(path: &str) -> Option<&'static [u8]> {

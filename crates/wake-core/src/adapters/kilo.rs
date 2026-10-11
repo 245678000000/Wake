@@ -42,7 +42,7 @@ const ITEM_FILE: &str = "history_item.json";
 const INDEX_FILE: &str = "_index.json";
 
 /// 可能装过旧版扩展的 VS Code 系编辑器:(用户数据目录名, 显示名)。用户数据根三平台
-/// 各异(`vscode_user_data`),目录名相同。显示名作 via 徽章
+/// 各异(`electron_user_data`),目录名相同。显示名作 via 徽章
 const EDITORS: &[(&str, &str)] = &[
     ("Code", "VS Code"),
     ("Code - Insiders", "VS Code Insiders"),
@@ -338,7 +338,9 @@ impl KiloLegacyAdapter {
     /// 在 Wake 启动后才冒出来
     pub fn new() -> Self {
         let home = super::home_dir().unwrap_or_default();
-        let editors = EDITORS.iter().map(|(dir, _)| super::vscode_user_data(dir));
+        let editors = EDITORS
+            .iter()
+            .map(|(dir, _)| super::electron_user_data(dir));
         let servers = SERVERS.iter().map(|(dir, _)| home.join(dir).join("data"));
         let roots = editors
             .chain(servers)

@@ -50,7 +50,7 @@ impl RemoteAdapter {
     }
 }
 
-/// 对一个 host 构造整组远程实例:二十二家模板 × `with_custom_root`(缓存内
+/// 对一个 host 构造整组远程实例:同步的各家模板 × `with_custom_root`(缓存内
 /// 挂载点,见 remote::REMOTE_LAYOUTS)× 装饰器。追加进 roster 的 active 尾部
 /// (不进 Session locations 面板)。`templates` 由 roster 唯一构造点传入
 /// (不变量 8:本模块不得自行二次 create_adapters());产物的数据根 100%
@@ -95,6 +95,10 @@ impl AgentAdapter for RemoteAdapter {
 
     fn ref_dependents(&self, path: &Path) -> Vec<std::path::PathBuf> {
         self.inner.ref_dependents(path)
+    }
+
+    fn sessions_in(&self, path: &Path) -> Option<Vec<SessionFileRef>> {
+        self.inner.sessions_in(path)
     }
 
     fn quick_meta(

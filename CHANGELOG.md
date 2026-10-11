@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- New: Grok Bot conversations show up in Wake, read from what the Grok Bot desktop app keeps on this computer — the latest messages of your recent conversations; in group chats each message shows which bot sent it. A conversation the app no longer keeps stays listed with its last message, and deleting one in Wake only hides it, since the conversation itself lives in Grok Bot's cloud
+- Fix: The Settings title lines up with the window buttons and the icons below it, as the main window's title already did
+
 ## [0.9.1] — 2026-10-10
 
 - New: Codex gets the Wake plugin too: one command adds it to the Codex CLI and the Codex app, and every new Codex session then starts knowing where your agents left off in the project, with Wake's MCP tools to read earlier sessions. Settings → Connect shows it in place of the Codex hooks setup; if you added that hook to ~/.codex/config.toml, remove it so new sessions don't get the context twice

@@ -823,8 +823,7 @@ fn memory_section_label(d: &MemoryDoc, today: NaiveDate, pin_user: bool) -> Shar
 /// 虚拟路径 `<db>#<id>` 只剥后缀、不 stat(render 每帧调);文件型就是它自己
 fn memory_display_path(d: &MemoryDoc) -> String {
     if d.scope == MemoryScope::Thread {
-        d.path
-            .rsplit_once('#')
+        wake_core::adapters::split_virtual_path(&d.path)
             .map_or_else(|| d.path.clone(), |(db, _)| db.to_string())
     } else {
         d.path.clone()

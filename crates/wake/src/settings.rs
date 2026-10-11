@@ -13,9 +13,9 @@ use wake_core::models::AgentId;
 
 use crate::format::tilde_path;
 use crate::ui::{
-    action_button, overlay_layers, rails_factor, show_in_fm, zpx, Zpx, BUTTON_SM_H, FONT_BODY,
-    FONT_CAPTION, FONT_DISPLAY, FONT_HEADING, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP, RADIUS_BUTTON,
-    SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
+    action_button, axis_inset, overlay_layers, rails_factor, show_in_fm, sidebar_title, zpx, Zpx,
+    BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP,
+    NAV_ICON, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
 use crate::workbench::{
@@ -29,6 +29,11 @@ const SETTINGS_SIDEBAR_W: Zpx = Zpx(180.);
 /// 侧栏顶上的标题栏条(gpui-component TitleBar 默认的 34px)。显式给成随缩放的同值:
 /// traffic light 随缩放挪位,这条不跟着变高的话灯就落到它的下沿上
 const SETTINGS_TITLEBAR_H: Zpx = Zpx(34.);
+/// 导航列的容器内边距(上下两组共用)
+const NAV_EDGE: Zpx = SPACE_SM;
+/// 导航项左内边距:图标中心压在侧栏中轴(红灯中心线)上,26.75 − 7.5(图标半宽) − 8(NAV_EDGE)。
+/// 原先是 12,图标中心落在 27.5
+const NAV_ITEM_INSET: Zpx = axis_inset(NAV_ICON, NAV_EDGE);
 const SETTINGS_PAGE_TOP: Zpx = Zpx(38.);
 /// Connect 页两条 Setup guide 的去处:MCP 面与命令行面各自的完整文档
 const CONNECT_GUIDE_URL: &str = "https://github.com/iAmCorey/Wake/blob/main/docs/mcp.md";
@@ -386,7 +391,8 @@ impl SettingsView {
             .id(id)
             .h(zpx(34.))
             .w_full()
-            .px(SPACE_MD)
+            .pl(NAV_ITEM_INSET)
+            .pr(SPACE_MD)
             .gap(SPACE_SM)
             .items_center()
             .rounded(theme.radius)
@@ -402,7 +408,7 @@ impl SettingsView {
             .on_click(move |_, _, cx| {
                 workbench.update(cx, |this, cx| this.select_settings_page(page, cx));
             })
-            .child(icon(icon_path).with_size(zpx(15.)).flex_shrink_0())
+            .child(icon(icon_path).with_size(NAV_ICON).flex_shrink_0())
             // 放大档位下侧栏可能比标签窄:单行截断,行高是定的,换成两行会压到下一项
             .child(
                 div()
@@ -437,14 +443,12 @@ impl SettingsView {
                 this.child(TitleBar::new().h(SETTINGS_TITLEBAR_H))
             })
             .child(
-                div()
-                    .px(SPACE_LG)
+                // 首字的字形中心压在红灯中心线上,与下面导航图标的中心同一条竖线
+                sidebar_title(t("Settings"), window)
+                    .pr(SPACE_LG)
                     .pt(SPACE_SM)
                     .pb(SPACE_XL)
-                    .text_size(FONT_HEADING)
-                    .font_semibold()
-                    .text_color(theme.sidebar_foreground)
-                    .child(t("Settings")),
+                    .text_color(theme.sidebar_foreground),
             )
             // 放大档位下两组导航可能比窗口高:包进滚动容器。上面那组 flex_1 把下面那组
             // 顶到底;放不下时它不会被压到内容以下,于是溢出、可滚
@@ -457,7 +461,7 @@ impl SettingsView {
                     .child(
                         v_flex()
                             .flex_1()
-                            .px(SPACE_SM)
+                            .px(NAV_EDGE)
                             .gap(zpx(2.))
                             .child(self.render_nav_item(
                                 "settings-general-nav",
@@ -511,7 +515,7 @@ impl SettingsView {
                     )
                     .child(
                         v_flex()
-                            .px(SPACE_SM)
+                            .px(NAV_EDGE)
                             .pb(SPACE_SM)
                             .gap(zpx(2.))
                             .child(self.render_nav_item(

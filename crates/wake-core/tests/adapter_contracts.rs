@@ -25,6 +25,7 @@ use wake_core::adapters::devin::DevinAdapter;
 use wake_core::adapters::dsh::DshAdapter;
 use wake_core::adapters::gemini::GeminiAdapter;
 use wake_core::adapters::grok::GrokAdapter;
+use wake_core::adapters::grok_bot::GrokBotAdapter;
 use wake_core::adapters::hermes::HermesAdapter;
 use wake_core::adapters::kilo::{legacy_task_key, migrated_session_id, KiloLegacyAdapter};
 use wake_core::adapters::kimi::KimiAdapter;
@@ -56,6 +57,8 @@ struct TestEnv {
     kilo_db: PathBuf,
     kilo_tasks: PathBuf,
     kilo_cursor_tasks: PathBuf,
+    /// Grok Bot 的缓存目录(`<userData>/sand-client-persistence`)
+    grok_bot_store: PathBuf,
     /// 假 HOME 目录本体,持有 TempDir 保证整个测试进程期间不被清理
     _home: tempfile::TempDir,
 }
@@ -90,6 +93,8 @@ fn setup() -> &'static TestEnv {
         // 侧档与 SQLite fixture 库的搭建在 tests/common(remote_sync 的假远端
         // home 复用同一份,两边不会各自漂移)
         let sc = common::stage_sidecars(home.path());
+        // Grok Bot 单独摆:cli / mcp / remote_sync 也用 stage_sidecars,不往它们的索引里塞会话
+        let grok_bot_store = common::stage_grok_bot(home.path());
 
         common::isolate_home(home.path());
         TestEnv {
@@ -106,6 +111,7 @@ fn setup() -> &'static TestEnv {
             kilo_db: sc.kilo_db,
             kilo_tasks: sc.kilo_tasks,
             kilo_cursor_tasks: sc.kilo_cursor_tasks,
+            grok_bot_store,
             _home: home,
         }
     })
@@ -3050,6 +3056,11 @@ fn seq_contract_holds_for_all_agents() {
             Box::new(KiloLegacyAdapter::new()),
             kilo_task_ref(&env.kilo_tasks, KILO_T3),
         ),
+        (Box::new(GrokBotAdapter::new()), grok_bot_ref(GB_ADA, false)),
+        (
+            Box::new(GrokBotAdapter::new()),
+            grok_bot_ref(GB_SCOUT, true),
+        ),
     ];
     for (adapter, r) in &checks {
         assert_seq_contract(adapter.as_ref(), r);
@@ -5084,7 +5095,11 @@ fn remote_adapters_stay_inside_cache_and_rewrite_keys() {
     let empty = tempfile::tempdir().unwrap();
     let adapters =
         wake_core::adapters::remote::create_remote_adapters(&templates, "devbox", empty.path());
-    assert_eq!(adapters.len(), AgentId::ALL.len(), "每家一个远程实例");
+    assert_eq!(
+        adapters.len(),
+        wake_core::remote::REMOTE_LAYOUTS.len(),
+        "同步的每一家一个远程实例"
+    );
     let cache_prefix = empty.path().to_string_lossy().to_string();
     for adapter in &adapters {
         assert_eq!(adapter.host(), "devbox");
@@ -5260,10 +5275,11 @@ fn roster_appends_remote_instances_for_enabled_hosts() {
 
     store.add_remote_host("devbox").unwrap();
     let roster = wake_core::adapters::create_adapter_roster_for(&store);
+    let synced = wake_core::remote::REMOTE_LAYOUTS.len();
     assert_eq!(
         roster.active.len(),
-        local_n + AgentId::ALL.len(),
-        "每家一个远程实例"
+        local_n + synced,
+        "同步的每一家一个远程实例"
     );
     assert_eq!(
         roster.locations.len(),
@@ -5275,7 +5291,7 @@ fn roster_appends_remote_instances_for_enabled_hosts() {
         .iter()
         .filter(|a| a.host() == "devbox")
         .count();
-    assert_eq!(remote_count, AgentId::ALL.len());
+    assert_eq!(remote_count, synced);
     // 顺序契约:默认实例在前,"按 agent 找第一个"的兜底不受远程影响
     assert!(roster.active[..local_n].iter().all(|a| a.host().is_empty()));
 
@@ -6030,4 +6046,274 @@ fn missing_parent_link_stores_mean_no_links_not_unknown() {
     assert_eq!(hermes.parent_links(), Some(Vec::new()));
     let cursor = CursorIdeAdapter::new().with_custom_root(dir.path().join("cursor-nope"));
     assert_eq!(cursor.parent_links(), Some(Vec::new()));
+}
+
+// ---------------------------------------------------------------- Grok Bot
+
+const GB_ADA: &str = "b0000001-aaaa-bbbb-cccc-000000000001";
+const GB_CREW: &str = "b0000002-aaaa-bbbb-cccc-000000000002";
+const GB_SCOUT: &str = "b0000003-aaaa-bbbb-cccc-000000000003";
+const GB_OLD: &str = "b0000004-aaaa-bbbb-cccc-000000000004";
+const GB_ORPHAN: &str = "b0000009-aaaa-bbbb-cccc-000000000009";
+
+/// 列表里的副本(`card = false`)或卡片(`card = true`)引用
+fn grok_bot_ref(id: &str, card: bool) -> SessionFileRef {
+    GrokBotAdapter::new()
+        .list_session_files()
+        .expect("grok bot list")
+        .into_iter()
+        .find(|r| r.native_id == id && r.file_path.contains('#') == card)
+        .unwrap_or_else(|| panic!("grok bot {id} (card: {card}) not listed"))
+}
+
+fn texts(mainline: &[TranscriptMessage]) -> Vec<(Role, MessageKind, &str)> {
+    mainline
+        .iter()
+        .map(|m| (m.role, m.kind, m.text.as_str()))
+        .collect()
+}
+
+#[test]
+fn grok_bot_parse_contract() {
+    let env = setup();
+    let adapter = GrokBotAdapter::new();
+    assert_eq!(adapter.data_roots(), vec![env.grok_bot_store.clone()]);
+
+    // 有副本的四个对话(一个已不在侧栏)+ 侧栏四行各一张卡片;不相干的切片、写到一半的 .tmp
+    // 都不算。同一对话副本恒胜
+    let refs = adapter.list_session_files().expect("grok bot list");
+    let mut listed: Vec<(&str, bool)> = refs
+        .iter()
+        .map(|r| (r.native_id.as_str(), r.file_path.contains('#')))
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec![
+            (GB_ADA, false),
+            (GB_ADA, true),
+            (GB_CREW, false),
+            (GB_CREW, true),
+            (GB_SCOUT, true),
+            (GB_OLD, false),
+            (GB_OLD, true),
+            (GB_ORPHAN, false),
+        ]
+    );
+    for r in &refs {
+        assert_eq!(
+            adapter.dedup_rank(&r.file_path),
+            u8::from(r.file_path.contains('#'))
+        );
+    }
+
+    // 截过头的副本:前面补一句说明,时间与标题取侧栏那一行
+    let ada = adapter
+        .parse_transcript(&grok_bot_ref(GB_ADA, false))
+        .expect("ada");
+    assert_eq!(ada.meta.key, format!("grok-bot:{GB_ADA}"));
+    assert_eq!(ada.meta.title, "Ada");
+    assert_eq!(
+        ada.meta.created_at, 1786000000000,
+        "bot 建出来的时刻,不是副本里第一条"
+    );
+    assert_eq!(ada.meta.updated_at, 1786000190000);
+    assert_eq!(ada.meta.project_name, "Unknown project");
+    assert!(!ada.meta.archived);
+    assert_eq!(ada.unknown_line_count, 0);
+    use MessageKind::{Meta, Text};
+    assert_eq!(
+        texts(&ada.mainline),
+        vec![
+            (
+                Role::System,
+                Text,
+                "── Earlier messages of this conversation are only in Grok Bot ──"
+            ),
+            (
+                Role::User,
+                Text,
+                "[image: launch-plan.png]\n\nTurn this launch plan into a checklist"
+            ),
+            (
+                Role::Assistant,
+                Text,
+                "Here is the checklist:\n\n1. Freeze the release branch\n2. Write the changelog\n\n[image: timeline chart]"
+            ),
+            (
+                Role::Assistant,
+                Text,
+                "Which day should it ship?\n\n- Tuesday\n- Thursday — after the freeze\n\nAnswer: Tuesday"
+            ),
+            (Role::System, Meta, "Automation created: Daily launch digest"),
+            (Role::Assistant, Text, "Asked to connect Gmail"),
+            (
+                Role::Assistant,
+                Text,
+                "Requested a secret: Release token\n\nNeeded to publish the release\n\nProvided"
+            ),
+            (
+                Role::Assistant,
+                Text,
+                "Email draft: Launch checklist\nTo: team@example.invalid\n\nThe checklist is attached.\n\nStatus: sent"
+            ),
+            (
+                Role::Assistant,
+                Text,
+                "**Message to Scout**\n\nWatch for competitor launches on Tuesday"
+            ),
+            (Role::Assistant, Text, "**Message from Scout**\n\nWill do"),
+            (Role::System, Text, "Ada was updated"),
+        ]
+    );
+    // 工具调用挂到它前面那条 bot 消息上;流式中的空占位不成消息
+    let tools = &ada.mainline[2].tool_calls;
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "web_search");
+    assert_eq!(tools[0].input_preview, "wake launch checklist");
+    assert_eq!(ada.meta.message_count, 8, "系统消息与事件不算");
+    // 对话本体在云端,删除只隐藏、不动任何文件
+    assert!(adapter.session_paths(&ada.meta).is_empty());
+
+    // 群聊:每条 bot 消息带上是哪个 bot 发的
+    let crew = adapter
+        .parse_transcript(&grok_bot_ref(GB_CREW, false))
+        .expect("crew");
+    assert_eq!(crew.meta.title, "Launch crew");
+    assert_eq!(
+        texts(&crew.mainline),
+        vec![
+            (Role::User, Text, "What should we post today?"),
+            (
+                Role::Assistant,
+                Text,
+                "**Ada**\n\nA thread about the launch"
+            ),
+            (
+                Role::Assistant,
+                Text,
+                "**Scout**\n\nCompetitors are quiet today"
+            ),
+        ]
+    );
+
+    // 从侧栏藏起来的 bot 归档;侧栏里已没有的旧副本照列,标题退回第一句话
+    let old = adapter
+        .parse_session(&grok_bot_ref(GB_OLD, false))
+        .expect("old");
+    assert!(old.meta.archived);
+    assert_eq!(old.meta.title, "Old helper");
+    let orphan = adapter
+        .parse_session(&grok_bot_ref(GB_ORPHAN, false))
+        .expect("orphan");
+    assert_eq!(orphan.meta.title, "Summarize yesterday's notes");
+    assert_eq!(orphan.meta.created_at, 1785800000000);
+
+    // 副本被清掉的对话:卡片承载描述与最后一条预览
+    let scout = adapter
+        .parse_transcript(&grok_bot_ref(GB_SCOUT, true))
+        .expect("scout card");
+    assert_eq!(scout.meta.title, "Scout");
+    assert_eq!(scout.meta.created_at, 1785500000000);
+    assert_eq!(scout.meta.updated_at, 1785600000000);
+    assert_eq!(scout.meta.message_count, 0);
+    assert_eq!(
+        texts(&scout.mainline),
+        vec![(
+            Role::System,
+            Text,
+            "Watches competitor launches\n\nLast message: Nothing new from the usual suspects\n\nGrok Bot no longer caches this conversation on this computer — only its last message is available in Wake."
+        )]
+    );
+
+    // 列表文件不是会话;它变了,同账号的副本要重比(watcher 经 ref_dependents 拿到),卡片按它
+    // 此刻列着的对账(sessions_in)
+    let roster = common::grok_bot_roster_path(&env.grok_bot_store);
+    assert!(adapter.file_ref(&roster).is_none());
+    let card = grok_bot_ref(GB_SCOUT, true);
+    let back = adapter
+        .file_ref(Path::new(&card.file_path))
+        .expect("卡片的虚拟路径");
+    assert_eq!(
+        (back.native_id.as_str(), back.mtime_ms, back.size),
+        (GB_SCOUT, card.mtime_ms, card.size)
+    );
+    let (cards, replicas): (Vec<&SessionFileRef>, Vec<&SessionFileRef>) =
+        refs.iter().partition(|r| r.file_path.contains('#'));
+    let mut deps = adapter.ref_dependents(&roster);
+    deps.sort();
+    let mut expect: Vec<PathBuf> = replicas
+        .iter()
+        .map(|r| PathBuf::from(&r.file_path))
+        .collect();
+    expect.sort();
+    assert_eq!(deps, expect);
+    let stamps = |refs: Vec<&SessionFileRef>| {
+        let mut out: Vec<(String, i64, i64)> = refs
+            .into_iter()
+            .map(|r| (r.file_path.clone(), r.mtime_ms, r.size))
+            .collect();
+        out.sort();
+        out
+    };
+    let listed = adapter.sessions_in(&roster).expect("列表文件装着卡片");
+    assert_eq!(stamps(listed.iter().collect()), stamps(cards));
+    let replica = grok_bot_ref(GB_ADA, false);
+    assert!(adapter
+        .ref_dependents(Path::new(&replica.file_path))
+        .is_empty());
+    assert!(adapter.sessions_in(Path::new(&replica.file_path)).is_none());
+}
+
+/// 编码后超过 240 字符的键,app 把文件名换成摘要、键写在首行(`.kblob`);自定义 location 选
+/// userData 目录、缓存目录本身或者它的一份拷贝都认
+#[test]
+fn grok_bot_reads_framed_keys_and_custom_roots() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let user_data = tmp.path().join("Grok Bot");
+    let store = user_data.join("sand-client-persistence");
+    fs::create_dir_all(&store).unwrap();
+    let account = format!("auth0%7C{}", "x".repeat(150));
+    let framed = |name: &str, key: &str, value: &str| {
+        let key = serde_json::to_string(key).unwrap();
+        fs::write(store.join(name), format!("{key}\n{value}")).unwrap();
+    };
+    framed(
+        "rosterdigest.kblob",
+        &common::grok_bot_roster_key(&account),
+        r#"{"schemaVersion":4,"value":{"rows":[{"id":"c1","name":"Framed","description":"","createdAt":1786000000000,"lastActivityAt":1786000060000,"isHiddenFromSidebar":false,"lastEntry":{"kind":"text","text":"ok"}}]}}"#,
+    );
+    framed(
+        "replicadigest.kblob",
+        &common::grok_bot_replica_key(&account, "c1"),
+        r#"{"schemaVersion":1,"value":{"entries":[{"kind":"message","id":"m1","seq":1,"timestampMs":1786000000000,"role":"user","content":"hello"},{"kind":"send-message","id":"m2","seq":2,"timestampMs":1786000060000,"message":{"type":"text","content":"hi"}}],"persistedAt":1786000060000}}"#,
+    );
+    for chosen in [user_data.clone(), store.clone()] {
+        let adapter = GrokBotAdapter::new().with_custom_root(chosen);
+        assert_eq!(adapter.data_roots(), vec![store.clone()]);
+        let refs = adapter.list_session_files().expect("list");
+        let replica = refs
+            .iter()
+            .find(|r| !r.file_path.contains('#'))
+            .expect("framed replica");
+        assert_eq!(replica.native_id, "c1");
+        assert_eq!(adapter.parse_session(replica).unwrap().meta.title, "Framed");
+        let back = adapter.file_ref(Path::new(&replica.file_path)).unwrap();
+        assert_eq!((back.mtime_ms, back.size), (replica.mtime_ms, replica.size));
+        let card = refs
+            .iter()
+            .find(|r| r.file_path.contains('#'))
+            .expect("card");
+        assert_eq!(adapter.parse_session(card).unwrap().meta.title, "Framed");
+    }
+    // 直接放着存储文件的拷贝(目录名不是 sand-client-persistence)用它本身
+    let copy = tmp.path().join("grok-bot-backup");
+    common::copy_tree(&store, &copy);
+    assert_eq!(
+        GrokBotAdapter::new()
+            .with_custom_root(copy.clone())
+            .data_roots(),
+        vec![copy]
+    );
 }

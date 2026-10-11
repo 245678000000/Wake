@@ -1214,6 +1214,24 @@ impl Store {
             .optional()?)
     }
 
+    /// file_path 落在 `[from, to)` 里的会话路径。watcher 对账 `sessions_in` 时拿它取挂在一个文件
+    /// 名下的虚拟路径(区间由 `sqlite_ro::virtual_path_bounds` 给)
+    pub fn file_paths_in(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT file_path FROM sessions WHERE file_path >= ?1 AND file_path < ?2",
+        )?;
+        let rows = stmt.query_map(params![from, to], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 这个 key 眼下挂在哪条路径上;没入库给 None
+    pub fn file_path_of(&self, key: &str) -> Result<Option<String>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT file_path FROM sessions WHERE key = ?1")?;
+        Ok(stmt.query_row(params![key], |r| r.get(0)).optional()?)
+    }
+
     /// 一条会话停在哪:主线上最后一句用户提问与最后一条助手回复,各折成一行(单元怎么读回
     /// 一句话在 `adapters::unit_prompt` / `unit_reply`,与写单元的 `units_from_messages` 放在
     /// 一处)。新会话开场的交接用(`tools::session_start_context`)。两个角色各查各的:一次

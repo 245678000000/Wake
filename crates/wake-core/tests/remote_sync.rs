@@ -67,9 +67,12 @@ fn build_remote_home(home: &Path) {
 
 const KILO_TASKS: &str = ".vscode-server/data/User/globalStorage/kilocode.kilo-code/tasks";
 
-/// 假远端上装着的 agent(Copilot 故意缺席,见 build_remote_home)
+/// 假远端上装着的 agent:同步的每一家,Copilot 故意缺席(见 build_remote_home)
 fn remote_agents() -> impl Iterator<Item = AgentId> {
-    AgentId::ALL.into_iter().filter(|a| *a != AgentId::Copilot)
+    wake_core::remote::REMOTE_LAYOUTS
+        .iter()
+        .map(|layout| layout.agent)
+        .filter(|a| *a != AgentId::Copilot)
 }
 
 const CLAUDE_U1: &str =

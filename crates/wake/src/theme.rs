@@ -116,6 +116,9 @@ pub fn agent_series_color(agent: wake_core::models::AgentId) -> u32 {
         // 品牌柠檬黄 #F7F569 在白底上几乎看不见(对比 1.15),压深一档;离 Hermes 的
         // 金色 ΔE00 11.9(色板里最近的一对只有 5.4)
         Kilo => 0xC8C035,
+        // 品牌是黑白的,色板里已有两档灰(Grok Build、ZCode),再加一档分不出来;给离全部现有
+        // 颜色最远的一档深莓红(最近的 Kimi 粉 ΔE00 19.9)
+        GrokBot => 0xAC396D,
     }
 }
 

@@ -823,15 +823,17 @@ pub fn retry_index_updates(store: &Store, batch: &mut CleanupBatch) -> Result<us
 /// 详情页的删除:移动**之前**先给每份会话文件记放回指纹(`put_back_fingerprint`),再把磁盘
 /// 目标移进废纸篓、出库并记墓碑(`Store::remove_trashed_sessions`)——用户从废纸篓放回原处,
 /// 扫描认出同一份文件就撤掉墓碑。返回 true = 一个文件都没移:会话只在别家自己的库里(虚拟
-/// 路径),Wake 只是不再列出它
+/// 路径),或者 adapter 的 `session_paths` 把文件留在原处,Wake 只是不再列出它
 pub fn trash_sessions(store: &Store, sessions: &[SessionMeta], targets: &[String]) -> Result<bool> {
-    let prints: HashMap<String, (i64, i64)> = sessions
+    let mut prints: HashMap<String, (i64, i64)> = sessions
         .iter()
         .filter_map(|s| {
             put_back_fingerprint(Path::new(&s.file_path)).map(|print| (s.file_path.clone(), print))
         })
         .collect();
     let moved = terminal::trash_paths(targets)?;
+    // 指纹只留给真移进废纸篓的文件:留在原处的那份下一轮扫描就会被认成"放回来了",墓碑当场撤掉
+    prints.retain(|path, _| moved.iter().any(|m| crate::adapters::path_owns(m, path)));
     let keys: Vec<String> = sessions.iter().map(|s| s.key.clone()).collect();
     store.remove_trashed_sessions(&keys, &prints)?;
     Ok(moved.is_empty())

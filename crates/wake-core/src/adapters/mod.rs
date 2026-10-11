@@ -10,6 +10,7 @@ pub mod devin;
 pub mod dsh;
 pub mod gemini;
 pub mod grok;
+pub mod grok_bot;
 pub mod hermes;
 pub mod kilo;
 pub mod kimi;
@@ -27,6 +28,8 @@ pub(crate) mod parse_utils;
 pub(crate) mod pi_format;
 pub(crate) mod sqlite_ro;
 
+/// `<文件>#<id>` 虚拟路径拆成两半(不看磁盘)
+pub use sqlite_ro::split_virtual_path;
 /// The local source file for a session, including mirrored remote sessions.
 /// Database-backed sessions resolve to their shared database, without `#<id>`.
 pub use sqlite_ro::strip_virtual_path as session_source_path;
@@ -64,13 +67,23 @@ pub trait AgentAdapter: Send + Sync {
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
         parse_utils::default_file_ref(self.agent(), path)
     }
-    /// 这份会话文件出现或消失时,还有哪些文件的引用(`file_ref` 的 mtime / size)跟着变——那些
-    /// 文件没动,watcher 收不到它们的事件。默认没有;Claude 分支的引用数着同目录更早的同根
-    /// 文件,原件被删、被放回,同目录的分支要重解析(展开 / 折叠复制来的历史)。watcher 对新
-    /// 出现与消失的路径各问一次,只把引用真变了的交给增量收编;全量扫描本来就逐个重比引用,
-    /// 用不着它。远程装饰器必须转发
+    /// 这条路径上的文件出现、变了或消失时,还有哪些会话文件的引用(`file_ref` 的 mtime / size)
+    /// 跟着变——那些文件没动,watcher 收不到它们的事件。watcher 对**每一条不是已入库会话文件的
+    /// 事件路径**(新出现的会话文件,或者从不入库的共享边车)与每一条消失的路径各问一次,只把
+    /// 引用真变了的交给增量收编;全量扫描本来就逐个重比引用,用不着它。默认没有。Claude 分支的
+    /// 引用数着同目录更早的同根文件,原件被删、被放回,同目录的分支要重解析(展开 / 折叠复制来的
+    /// 历史);Grok Bot 副本的引用并进了侧栏列表里那一行的指纹,列表变了,同账号的副本都要重比。
+    /// 远程装饰器必须转发
     fn ref_dependents(&self, _path: &Path) -> Vec<std::path::PathBuf> {
         Vec::new()
+    }
+    /// 一个文件装着好几个会话、各以虚拟路径 `<文件>#<id>`(`sqlite_ro::virtual_path`)入库时,这个
+    /// 文件**此刻**装着的全部会话。watcher 对每条事件路径(出现、变了、消失)问一次、按它对账:库里
+    /// 挂在这个文件名下、这份里没有的出库,新的与引用变了的收编,不用等下一次全量扫描。None = 不是
+    /// 这种文件,或这一刻读不出(库里原样不动)。默认 None:SQLite 型的家至今靠启动与 ⌘R 刷新;
+    /// Grok Bot 的卡片靠它随侧栏列表增删。远程装饰器必须转发
+    fn sessions_in(&self, _path: &Path) -> Option<Vec<SessionFileRef>> {
+        None
     }
     /// 快路径:不解析文件直接给出 meta(Codex 走 state DB)。None = 无快路径
     fn quick_meta(
@@ -181,7 +194,7 @@ pub trait AgentAdapter: Send + Sync {
     /// 拥有本家 session 文件的位置",凭据/配置/索引这类不产生会话的文件不列。
     /// 新增 adapter 必须实现:没有默认值,漏了编译就过不去
     fn data_roots(&self) -> Vec<std::path::PathBuf>;
-    /// 文件监听根目录。默认 = data_roots 中现存的目录,二十二家实测全部吻合:
+    /// 文件监听根目录。默认 = data_roots 中现存的目录,各家实测全部吻合:
     /// 目录型给出自己的 root,SQLite 型的根是库文件、天然筛空(watcher 只认
     /// .jsonl,库变更靠启动/手动刷新),codex 的 sessions + archived 一并覆盖。
     /// 只有当监听范围确实不同于数据根时才覆写——否则一次根路径搬迁
@@ -293,12 +306,13 @@ pub(crate) fn env_dir(key: &str) -> Option<std::path::PathBuf> {
         .map(std::path::PathBuf::from)
 }
 
-/// VS Code 系编辑器的用户数据目录(`<数据根>/<编辑器>`,下面是 `User/globalStorage`):
+/// Electron app 的用户数据目录(`app.getPath('userData')`,`<数据根>/<app 名>`):
 /// macOS 在 `~/Library/Application Support`,Windows 在 `%APPDATA%`,Linux 在
 /// `$XDG_CONFIG_HOME`(缺省 `~/.config`)。只做路径推导、不探存在性。全从 `home_dir()`
 /// 派生——`dirs::config_dir()` 在 Windows 上走 SHGetKnownFolderPath,WAKE_HOME 改道对它
-/// 无效。Cursor IDE 的 state.vscdb 与 Kilo 旧版扩展的任务目录共用
-pub(crate) fn vscode_user_data(editor: &str) -> std::path::PathBuf {
+/// 无效。VS Code 系编辑器(Cursor IDE 的 state.vscdb、Kilo 旧版扩展的任务目录,下面是
+/// `User/globalStorage`)与 Grok Bot 的缓存目录共用
+pub(crate) fn electron_user_data(app: &str) -> std::path::PathBuf {
     let home = home_dir().unwrap_or_default();
     let base = if cfg!(target_os = "macos") {
         home.join("Library").join("Application Support")
@@ -307,7 +321,7 @@ pub(crate) fn vscode_user_data(editor: &str) -> std::path::PathBuf {
     } else {
         env_dir("XDG_CONFIG_HOME").unwrap_or_else(|| home.join(".config"))
     };
-    base.join(editor)
+    base.join(app)
 }
 
 /// 自定义 location / 远程挂载点 `dir` 交给同家哪个实例构造(见 `claims_custom_root`)
@@ -328,7 +342,7 @@ pub(crate) fn custom_root_template<'a>(
 
 /// 各家数据根共用的 HOME。**全部 adapter 必须走这里**,不要直接
 /// `dirs::home_dir()`——`WAKE_HOME` 是整组 adapter 的统一改道开关:
-/// 契约测试靠它把二十二家指向 fixture 目录,而 `dirs::home_dir()` 只在
+/// 契约测试靠它把各家指向 fixture 目录,而 `dirs::home_dir()` 只在
 /// POSIX 上看 `$HOME`,Windows 上走 SHGetKnownFolderPath、无论如何都指向
 /// 真实用户目录(于是 Windows 上的契约测试全部落空,2026-08-25 review)。
 /// 对用户它顺带是便携安装/多档案切换的手动开关。
@@ -336,7 +350,7 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     env_dir("WAKE_HOME").or_else(dirs::home_dir)
 }
 
-/// 全量二十二家 roster,**不按 detect 过滤**。这是全应用唯一的构造点:
+/// 全量 roster(每家都在),**不按 detect 过滤**。这是全应用唯一的构造点:
 /// scanner/watcher/resume/Session locations 面板共享 Workbench 启动时的
 /// 同一份实例。缺根的家由各自 list_session_files 降级为 Ok(空)(Err 会让
 /// scanner 把这一家这一轮当成"读不出"冻结住,缺根不是读不出,contract 测试
@@ -376,6 +390,7 @@ pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(devin::DevinAdapter::new()),
         Box::new(opencode::OpencodeAdapter::kilo()),
         Box::new(kilo::KiloLegacyAdapter::new()),
+        Box::new(grok_bot::GrokBotAdapter::new()),
     ]
 }
 

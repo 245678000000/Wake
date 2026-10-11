@@ -155,6 +155,8 @@ pub fn agent_bin(agent: AgentId) -> Option<&'static str> {
         AgentId::Devin => Some("devin"),
         // npm 包 @kilocode/cli 装出 `kilo` 与 `kilocode` 两个同一份的命令
         AgentId::Kilo => Some("kilo"),
+        // Grok Bot 是桌面 app,bot 跑在云端电脑上,没有命令行
+        AgentId::GrokBot => None,
     }
 }
 
@@ -230,6 +232,8 @@ fn resume_args(meta: &SessionMeta) -> Option<(Vec<String>, bool)> {
         // 新版 CLI 不认(导入 kilo.db 之前它不在库里)——胜出副本是旧任务文件就不画
         AgentId::Kilo if crate::adapters::kilo::is_legacy_task(&meta.file_path) => None,
         AgentId::Kilo => Some((vec!["--session".into(), id.into()], true)),
+        // Grok Bot:对话在云端、只有桌面 app,没有能接着聊的命令——不画 Open In
+        AgentId::GrokBot => None,
         // Kiro / Gemini CLI 没有按会话 id 续会话的形制
         AgentId::Kiro | AgentId::Gemini => None,
     }

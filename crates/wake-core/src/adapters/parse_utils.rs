@@ -126,6 +126,28 @@ fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
         .map(|d| d.as_millis() as i64)
 }
 
+/// 路径末段,`/` 与 `\` 都算分隔符:别的机器写下的路径(Codex 的 state DB 可能是 Windows 机器写的、
+/// Grok Bot 的附件在云端电脑上),不能交给本机的 `Path`
+pub fn path_tail(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// 并进 `SessionFileRef.size` 的边车指纹:展示要用的那几个字段的稳定哈希(FNV-1a,段与段之间隔一个
+/// 0 字节),取高 32 位——FNV 的低位只由各字节的低位决定,原先按 1024 取模,"Oscar" 与 "Ada 4" 就
+/// 撞在一起,改了名也认不出(2026-10-11 Codex review)。size 因此不再是字节数,没有谁拿会话的
+/// size 当字节数用(界面、MCP、导出、Clean Up 都现 stat 文件)。按长度求和的话同长的改名认不
+/// 出来(Antigravity 与 Kilo 旧版任务还在求和,换过来会让它们的会话各重解析一次)
+pub fn sidecar_fingerprint(parts: &[&str]) -> i64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes().chain(std::iter::once(0)) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    (hash >> 32) as i64
+}
+
 /// cwd → 项目显示名(路径末段;空/异常 = "Unknown project")
 pub fn project_name_of(cwd: &str) -> String {
     if cwd.is_empty() {
@@ -311,6 +333,19 @@ pub fn project_tree_has_session(root: &std::path::Path, agent: AgentId) -> bool 
             default_file_ref(agent, &path).is_some()
         }
     })
+}
+
+/// `optional_string` 的借用版:`key` 上修剪过、非空的字符串
+pub fn text_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
+    v.get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// `key` 上是 `true`(缺席、别的类型都算不是)
+pub fn true_at(v: &Value, key: &str) -> bool {
+    v.get(key).and_then(Value::as_bool) == Some(true)
 }
 
 /// JSON 里"有就是非空字符串、否则没有"的字段:标题、模型名、cwd 一类
@@ -1237,6 +1272,24 @@ mod tests {
         assert!(!is_injected_user_content(
             "为什么 <task-notification> 会被当成提问?"
         ));
+    }
+
+    #[test]
+    fn sidecar_fingerprints_tell_renames_apart() {
+        // 按 1024 取模时这两个名字撞在同一个值上(2026-10-11 Codex review)
+        assert_ne!(
+            sidecar_fingerprint(&["Oscar", ""]),
+            sidecar_fingerprint(&["Ada 4", ""])
+        );
+        // 段界算数:字段之间挪一个字不是同一份
+        assert_ne!(
+            sidecar_fingerprint(&["ab", "c"]),
+            sidecar_fingerprint(&["a", "bc"])
+        );
+        assert_eq!(
+            sidecar_fingerprint(&["Ada", "hidden"]),
+            sidecar_fingerprint(&["Ada", "hidden"])
+        );
     }
 
     #[test]

@@ -357,7 +357,8 @@ pub fn run_memory_sync(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -
 /// 写事务内副本裁决(`Store::write_session_guarded`)用的位次查询:按 file_path
 /// 找拥有它的实例、问它这份副本的 `dedup_rank`;无实例认领的路径落到该家首个
 /// 实例——与枚举时的候选排序同一把尺子,全量与增量两条写库路径才给出同一个胜者
-fn rank_of<'a>(
+/// (watcher 预判一份副本值不值得交给 scan_files 也用它)
+pub(crate) fn rank_of<'a>(
     adapters: &'a [Box<dyn AgentAdapter>],
     agent: crate::models::AgentId,
 ) -> impl Fn(&str) -> u8 + 'a {

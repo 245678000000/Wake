@@ -50,11 +50,6 @@ impl CodexAdapter {
     }
 }
 
-/// 路径末段,`/` 与 `\` 都算分隔符(state DB 可能是 Windows 机器写的)
-fn rollout_file_name(path: &str) -> &str {
-    path.rsplit(['/', '\\']).next().unwrap_or(path)
-}
-
 /// Codex 把它启动的**每一条**线程都写进同一棵 rollout 树:用户线程之外还有
 /// guardian auto-review、`/review`、compaction、memory consolidation 与
 /// `spawn_agent` 子代理。它自家的历史只列交互来源(cli/vscode/atlas/chatgpt),
@@ -1074,11 +1069,11 @@ impl AgentAdapter for CodexAdapter {
         // uuid)全局唯一,按文件名匹配即可,与根/host/平台分隔符都无关
         let by_name: HashMap<&str, &ThreadRow> = rows
             .iter()
-            .map(|r| (rollout_file_name(&r.rollout_path), r))
+            .map(|r| (path_tail(&r.rollout_path), r))
             .collect();
         let mut out = HashMap::new();
         for r in refs {
-            let Some(row) = by_name.get(rollout_file_name(&r.file_path)) else {
+            let Some(row) = by_name.get(path_tail(&r.file_path)) else {
                 continue;
             };
             // 结构化 source(对象)= 子代理线程。它的 `title` 是 Codex 按首条
