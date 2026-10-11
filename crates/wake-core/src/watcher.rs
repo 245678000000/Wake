@@ -1,7 +1,7 @@
 use crate::adapters::AgentAdapter;
 use crate::db::Store;
 use crate::models::*;
-use crate::scanner::{rank_of, refresh_claims, refresh_parent_links, scan_files, ScanEvents};
+use crate::scanner::{refresh_claims, refresh_parent_links, scan_files, ScanEvents};
 use notify::{RecursiveMode, Watcher};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -195,39 +195,26 @@ pub(crate) fn process_batch(
     let mut dropped: Vec<String> = Vec::new();
     let every_path = present.iter().map(|(path, ix)| (path, *ix));
     for (path, ix) in every_path.chain(vanished.iter().copied()) {
-        let adapter = &adapters[ix];
-        let Some(listed) = adapter.sessions_in(path) else {
+        let Some(listed) = adapters[ix].sessions_in(path) else {
             continue;
         };
-        let rank = rank_of(adapters, adapter.agent());
         let (from, to) = crate::adapters::sqlite_ro::virtual_path_bounds(path);
-        let Ok(indexed) = store.file_paths_in(&from, &to) else {
+        let Ok(indexed) = store.file_stamps_in(&from, &to) else {
             continue;
         };
         let still_there: HashSet<&str> = listed.iter().map(|r| r.file_path.as_str()).collect();
         dropped.extend(
             indexed
-                .into_iter()
-                .filter(|indexed| !still_there.contains(indexed.as_str())),
+                .keys()
+                .filter(|indexed| !still_there.contains(indexed.as_str()))
+                .cloned(),
         );
+        // 没入库的也交出去:同一会话已由更优的副本代表着(Grok Bot 有副本的对话)时 scan_files
+        // 解析之前就跳过
         dependents.extend(
             listed
                 .into_iter()
-                .filter(|r| match store.file_stamp(&r.file_path) {
-                    Ok(Some(stamp)) => stamp != (r.mtime_ms, r.size),
-                    // 没入库的:同一会话已由别的文件代表着、那一份的副本位次又严格更优(Grok Bot
-                    // 有副本的对话),交给 scan_files 也必败;同级的(两个 location 各一张卡片)
-                    // 交给写事务里的副本裁决按 mtime 定(2026-10-11 Codex review)
-                    Ok(None) => {
-                        let key = session_key(r.agent, adapter.host(), &r.native_id);
-                        match store.file_path_of(&key) {
-                            Ok(None) => true,
-                            Ok(Some(indexed)) => rank(&indexed) >= rank(&r.file_path),
-                            Err(_) => false,
-                        }
-                    }
-                    Err(_) => false,
-                }),
+                .filter(|r| indexed.get(&r.file_path) != Some(&(r.mtime_ms, r.size))),
         );
     }
 
@@ -601,10 +588,6 @@ mod tests {
             self.locations[location].join(crate::adapters::grok_bot::store_file_name(&key).unwrap())
         }
 
-        fn file(&self, slice: &str) -> PathBuf {
-            self.file_in(0, slice)
-        }
-
         fn roster_in(&self, location: usize) -> PathBuf {
             self.file_in(location, "roster.last-roster")
         }
@@ -623,7 +606,7 @@ mod tests {
 
         /// 一条副本,条目原样给
         fn write_replica(&self, id: &str, entries: &str) -> PathBuf {
-            let path = self.file(&format!("transcript.replicas.{id}"));
+            let path = self.file_in(0, &format!("transcript.replicas.{id}"));
             let json = format!(
                 r#"{{"schemaVersion":1,"value":{{"entries":[{entries}],"persistedAt":1786000000000}}}}"#
             );

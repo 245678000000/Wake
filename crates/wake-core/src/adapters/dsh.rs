@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 /// DeepSeek Harness(dsh):`~/.dsh/sessions/--<cwd转义>--/<id转义>/<日志>`,一目录一会话。
 /// 日志文件名带**格式代数**:v0 是 `session.jsonl[.zstd]`,之后每代 `session.vN.jsonl[.zstd]`
@@ -25,10 +25,11 @@ use std::sync::{Arc, Mutex};
 /// 事件 last-wins 给标题,model 在 assistant 消息的 source 里。
 pub struct DshAdapter {
     root: PathBuf,
-    /// 会话目录 → 最近一次读出来的(日志引用, 首行)。列表、file_ref 与每批监听都问的 parent_links
-    /// 都要每个会话的首行:同一份日志((mtime, size) 没变)不再解压;目录或日志一时读不出(权限、
-    /// 锁)交回上次读到的——首行写下就不变,迁移出新一代也是同一个 id / parentSession
-    logs: Mutex<HashMap<PathBuf, (SessionFileRef, Arc<DshHeader>)>>,
+    /// 会话目录 → 最近一次读出来的(日志引用, 父会话 id)。列表、file_ref 与每批监听都问的
+    /// parent_links 都要首行里的 id 与 parentSession:首行写下就不变,迁移出的新一代也是同一个
+    /// id / parentSession,所以每个目录只解压一次,之后只 stat 选代;目录一时列不出(权限、锁)
+    /// 交回上次读到的
+    logs: Mutex<HashMap<PathBuf, (SessionFileRef, Option<String>)>>,
 }
 
 impl DshAdapter {
@@ -67,7 +68,7 @@ impl DshAdapter {
         Some(dirs)
     }
 
-    /// 会话目录 → (被读的那一代日志的引用, 它的首行)。日志取 dsh 自己会读的那一份:编号最大的
+    /// 会话目录 → (被读的那一代日志的引用, 父会话 id)。日志取 dsh 自己会读的那一份:编号最大的
     /// 一代(迁移只新增、不删旧代,旧代的 mtime 可能更新);同一代压缩与明文并存(换过
     /// compression 配置)时 mtime 新者胜、平局 .zstd 胜。list、watcher(经 file_ref)与
     /// parent_links 共用这一处裁决——只做在 list 会让 watcher 把旧代的事件当主文件解析。首行
@@ -75,53 +76,45 @@ impl DshAdapter {
     /// header);目录列不出、日志打不开(权限、锁)交回上次读到的(见 `logs`),没读到过才报错——
     /// parent_links 据此整份交 None。把读不出当成没有,parent_links 会交出缺一截的关系:A 派 B、
     /// B 派 C,B 一时读不出,C 就从 A 下面挪到 B 下面(2026-10-11 Codex review)
-    fn session_log(&self, dir: &Path) -> std::io::Result<Option<(SessionFileRef, Arc<DshHeader>)>> {
+    fn session_log(&self, dir: &Path) -> std::io::Result<Option<(SessionFileRef, Option<String>)>> {
         let last = self.logs.lock().unwrap().get(dir).cloned();
-        let unreadable = |e: std::io::Error| last.clone().map(Some).ok_or(e);
         let entries = match fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
-            Err(e) => return unreadable(e),
+            Err(e) => return last.map(Some).ok_or(e),
         };
         let Some(((_, mtime, _), path, size)) = entries
             .flatten()
             .filter_map(|entry| {
                 let (generation, zstd) = log_generation(&entry.file_name().to_string_lossy())?;
                 let path = entry.path();
-                // fs::metadata 跟随符号链接(DirEntry::metadata 不跟)
-                let meta = fs::metadata(&path)
-                    .ok()
-                    .filter(|m| m.is_file() && m.len() > 0)?;
-                Some(((generation, mtime_ms(&meta), zstd), path, meta.len() as i64))
+                let (mtime, size) = stat_stamp(&path).filter(|(_, size)| *size > 0)?;
+                Some(((generation, mtime, zstd), path, size))
             })
             .max_by_key(|(rank, ..)| *rank)
         else {
             return Ok(None);
         };
-        let file_path = path.to_string_lossy().to_string();
-        if let Some((r, _)) = &last {
-            if r.file_path == file_path && r.mtime_ms == mtime && r.size == size {
-                return Ok(last);
-            }
-        }
-        // 解压不持锁
-        let header = match read_header(&path) {
-            Ok(Some(header)) => Arc::new(header),
-            Ok(None) => return Ok(None),
-            Err(e) => return unreadable(e),
+        let (native_id, parent) = match last {
+            Some((r, parent)) => (r.native_id, parent),
+            // 解压不持锁
+            None => match read_header(&path)? {
+                Some(header) => (header.id, header.parent),
+                None => return Ok(None),
+            },
         };
         let r = SessionFileRef {
             agent: AgentId::Dsh,
-            native_id: header.id.clone(),
-            file_path,
+            native_id,
+            file_path: path.to_string_lossy().into_owned(),
             mtime_ms: mtime,
             size,
         };
         self.logs
             .lock()
             .unwrap()
-            .insert(dir.to_path_buf(), (r.clone(), header.clone()));
-        Ok(Some((r, header)))
+            .insert(dir.to_path_buf(), (r.clone(), parent.clone()));
+        Ok(Some((r, parent)))
     }
 }
 
@@ -147,6 +140,9 @@ struct DshHeader {
     /// v0 / v1 的 fork 截点:首行的 seedLength,seq 小于它的事件是从父会话复制来的(上游 v1→v2
     /// 迁移同一判法,且要带 parentSession);v2 起换成 `session/end-seed {inherited: true}` 标记
     seed_length: Option<i64>,
+    /// 开头带着从父会话复制来的一段:v2 起首行的 isSeeded(上游保证这种会话一定有那个截点标记,
+    /// 继承段是空的也补一个),v0 / v1 有 seedLength
+    seeded: bool,
 }
 
 fn parse_header(v: &serde_json::Value) -> Option<DshHeader> {
@@ -159,10 +155,7 @@ fn parse_header(v: &serde_json::Value) -> Option<DshHeader> {
             .and_then(|d| d.as_i64())
             .unwrap_or(0)
             > 0;
-    let forked_from = v
-        .get("parentSession")
-        .and_then(|p| p.as_str())
-        .filter(|p| !p.is_empty() && *p != id);
+    let forked_from = text_at(v, "parentSession").filter(|p| *p != id);
     let parent = forked_from.filter(|_| subagent).map(String::from);
     let seed_length = forked_from
         .and(v.get("seedLength"))
@@ -175,6 +168,7 @@ fn parse_header(v: &serde_json::Value) -> Option<DshHeader> {
             .unwrap_or_default()
             .to_string(),
         created_at: v.get("createdAt").and_then(|t| t.as_i64()).unwrap_or(0),
+        seeded: true_at(v, "isSeeded") || seed_length.is_some(),
         id,
         parent,
         seed_length,
@@ -323,6 +317,11 @@ impl DshParse {
         self.model = None;
         self.tokens_used = None;
     }
+
+    /// 还在从父会话复制来的那段里(收尾要折掉):里面的图片不必解码,也别占掉会话自己的解码额度
+    fn in_seed(&self) -> bool {
+        self.inherited.is_none() && self.header.as_ref().is_some_and(|h| h.seeded)
+    }
 }
 
 fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
@@ -380,6 +379,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
         if p.inherited.is_none() && seed_length.is_some_and(|n| seq.is_some_and(|seq| seq >= n)) {
             p.cut();
         }
+        let decode = decode_images && !p.in_seed();
         match ty {
             "session" => {
                 if row
@@ -410,7 +410,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
             "user/message" => {
                 let parsed = content_parts(
                     data.get("content").unwrap_or(&serde_json::Value::Null),
-                    decode_images,
+                    decode,
                 );
                 if parsed.text.is_empty() && parsed.images.is_empty() {
                     continue;
@@ -458,7 +458,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                             tools.push(tool_call_view(id.to_string(), name, &input, None, false));
                         }
                         _ if is_image_part(b) => {
-                            let parsed = content_parts(b, decode_images);
+                            let parsed = content_parts(b, decode);
                             parsed_message.append(parsed);
                         }
                         _ => {}
@@ -536,7 +536,7 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                 if let Some(&(mi, ti)) = tool_index.get(call_id) {
                     let parsed = content_parts(
                         block.get("content").unwrap_or(&serde_json::Value::Null),
-                        decode_images,
+                        decode,
                     );
                     let message = &mut p.messages[mi];
                     let tc = &mut message.tool_calls[ti];
@@ -554,27 +554,19 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
             // v2 起的 fork 截点(dsh-session fork.ts 的 buildForkSeed;最后一个带 inherited 的
             // 才是本会话的——嵌套 fork 里祖先的标记也在复制来的那段里)
             "session/end-seed" => {
-                if data.get("inherited").and_then(|v| v.as_bool()) == Some(true) {
+                if true_at(data, "inherited") {
                     p.cut();
                 }
             }
             // 子代理在第一个回合里记下的身份;上游按截点之后的第一个算
             "subagent/descriptor" => {
                 if p.label.is_none() {
-                    p.label = data
-                        .get("label")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|label| !label.is_empty())
-                        .map(clean_title_candidate);
+                    p.label = text_at(data, "label").map(clean_title_candidate);
                 }
             }
             "session/title" => {
-                if let Some(t) = data.get("title").and_then(|v| v.as_str()) {
-                    let t = t.trim();
-                    if !t.is_empty() {
-                        p.title = Some(clean_title_candidate(t));
-                    }
+                if let Some(t) = text_at(data, "title") {
+                    p.title = Some(clean_title_candidate(t));
                 }
             }
             "request/context" => {
@@ -648,7 +640,6 @@ impl AgentAdapter for DshAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        // 根不在是空;在却列不出报错,scanner 把这一家这一轮冻结住
         let dirs = self
             .session_dirs()
             .ok_or_else(|| anyhow!("cannot list {}", self.root.display()))?;
@@ -689,19 +680,23 @@ impl AgentAdapter for DshAdapter {
         true
     }
 
-    /// 子代理会话首行里的 parentSession。每批监听事件都会问:列目录、每个会话 stat 一次日志,
-    /// 首行读过的用缓存;没入库的会话 scanner 自己会丢掉。目录列不出、某个会话读不出又没读到过,
-    /// 都给 None,库里的关系原样保留
+    /// 子代理会话首行里的 parentSession。每批监听事件都会问:只列目录,读到过的会话直接用缓存
+    /// (首行不变),新目录才进去读;没入库的会话 scanner 自己会丢掉。目录列不出、某个会话读不出
+    /// 又没读到过,都给 None,库里的关系原样保留
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         let key = |id: &str| session_key(AgentId::Dsh, "", id);
         let mut links = Vec::new();
         for dir in self.session_dirs()? {
-            // 读不出又没读到过:不知道,库里的关系这一轮原样保留
-            let Some((_, header)) = self.session_log(&dir).ok()? else {
+            let known = self.logs.lock().unwrap().get(&dir).cloned();
+            let entry = match known {
+                Some(known) => Some(known),
+                None => self.session_log(&dir).ok()?,
+            };
+            let Some((r, parent)) = entry else {
                 continue;
             };
-            if let Some(parent) = header.parent.as_deref() {
-                links.push((key(&header.id), key(parent)));
+            if let Some(parent) = parent {
+                links.push((key(&r.native_id), key(&parent)));
             }
         }
         Some(links)
@@ -760,71 +755,68 @@ impl AgentAdapter for DshAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{log_generation, parse_dsh_log, parse_header, DshAdapter};
+    use super::{log_generation, parse_dsh_log, parse_header, DshAdapter, DshHeader, DshParse};
     use crate::adapters::AgentAdapter;
-    use crate::models::{MessageKind, Role};
+    use crate::models::{MessageKind, Role, TranscriptMessage};
+
+    /// 首行再加几个字段(`extra` 是接在 createdAt 后面的 JSON 片段)
+    fn header(extra: &str) -> DshHeader {
+        let line = format!(r#"{{"type":"session","version":4,"id":"c1","createdAt":1{extra}}}"#);
+        parse_header(&serde_json::from_str(&line).unwrap()).unwrap()
+    }
+
+    /// 几行日志写进临时文件再解析
+    fn parsed(lines: &[&str], decode_images: bool) -> DshParse {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.v4.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        parse_dsh_log(&path, decode_images).unwrap()
+    }
+
+    fn texts(messages: &[TranscriptMessage]) -> Vec<(Role, MessageKind, &str)> {
+        messages
+            .iter()
+            .map(|m| (m.role, m.kind, m.text.as_str()))
+            .collect()
+    }
 
     /// 只有子代理挂到父会话下;用户自己 fork 出来的会话也写 parentSession,是独立的对话
     #[test]
     fn only_subagents_hang_under_their_parent() {
-        let parent = |header: serde_json::Value| parse_header(&header).unwrap().parent;
-        let base = |extra: serde_json::Value| {
-            let mut header =
-                serde_json::json!({"type": "session", "version": 4, "id": "c1", "createdAt": 1});
-            header
-                .as_object_mut()
-                .unwrap()
-                .extend(extra.as_object().unwrap().clone());
-            header
-        };
+        let parent = |extra: &str| header(extra).parent;
         assert_eq!(
-            parent(base(
-                serde_json::json!({"origin": "subagent", "delegationDepth": 1, "parentSession": "p1"})
-            )),
+            parent(r#","origin":"subagent","delegationDepth":1,"parentSession":"p1""#),
             Some("p1".to_string())
         );
         assert_eq!(
-            parent(base(
-                serde_json::json!({"delegationDepth": 2, "parentSession": "p1"})
-            )),
+            parent(r#","delegationDepth":2,"parentSession":"p1""#),
             Some("p1".to_string())
         );
         assert_eq!(
-            parent(base(
-                serde_json::json!({"isSeeded": true, "delegationDepth": 0, "parentSession": "p1"})
-            )),
+            parent(r#","isSeeded":true,"delegationDepth":0,"parentSession":"p1""#),
             None
         );
-        assert_eq!(
-            parent(base(serde_json::json!({"origin": "subagent"}))),
-            None
-        );
+        assert_eq!(parent(r#","origin":"subagent""#), None);
     }
 
     /// v0 / v1 没有截点标记(那时的 session/end-seed 不带 inherited):截点在首行的 seedLength,
     /// seq 小于它的事件是复制来的;只认带 parentSession 的
     #[test]
     fn a_v0_fork_cuts_at_its_seed_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.jsonl");
-        let lines = [
-            r#"{"type":"session","version":0,"id":"sub0","createdAt":1,"cwd":"/w","origin":"subagent","delegationDepth":1,"parentSession":"p1","seedLength":3}"#,
-            r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
-            r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}],"source":{"model":"parent-model"}},"usage":{"inputTokens":900,"outputTokens":100}}}"#,
-            r#"{"type":"session/title","seq":2,"time":21,"data":{"title":"Parent title"}}"#,
-            r#"{"type":"session/end-seed","seq":3,"time":22,"data":{}}"#,
-            r#"{"type":"user/message","seq":4,"time":30,"data":{"content":[{"type":"text","text":"child task"}],"source":{"kind":"user"}}}"#,
-            r#"{"type":"assistant/message","seq":5,"time":40,"data":{"message":{"content":[{"type":"text","text":"child answer"}],"source":{"model":"child-model"}},"usage":{"inputTokens":40,"outputTokens":2}}}"#,
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-        let parsed = parse_dsh_log(&path, false).unwrap();
-        let texts: Vec<(Role, MessageKind, &str)> = parsed
-            .messages
-            .iter()
-            .map(|m| (m.role, m.kind, m.text.as_str()))
-            .collect();
+        let parsed = parsed(
+            &[
+                r#"{"type":"session","version":0,"id":"sub0","createdAt":1,"cwd":"/w","origin":"subagent","delegationDepth":1,"parentSession":"p1","seedLength":3}"#,
+                r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
+                r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}],"source":{"model":"parent-model"}},"usage":{"inputTokens":900,"outputTokens":100}}}"#,
+                r#"{"type":"session/title","seq":2,"time":21,"data":{"title":"Parent title"}}"#,
+                r#"{"type":"session/end-seed","seq":3,"time":22,"data":{}}"#,
+                r#"{"type":"user/message","seq":4,"time":30,"data":{"content":[{"type":"text","text":"child task"}],"source":{"kind":"user"}}}"#,
+                r#"{"type":"assistant/message","seq":5,"time":40,"data":{"message":{"content":[{"type":"text","text":"child answer"}],"source":{"model":"child-model"}},"usage":{"inputTokens":40,"outputTokens":2}}}"#,
+            ],
+            false,
+        );
         assert_eq!(
-            texts,
+            texts(&parsed.messages),
             vec![
                 (
                     Role::System,
@@ -844,14 +836,11 @@ mod tests {
         );
 
         // 没有 parentSession 的 seedLength 不作数(上游迁移同一判法)
-        let header = |extra: &str| {
-            let line = format!(r#"{{"type":"session","version":0,"id":"s","createdAt":1{extra}}}"#);
-            parse_header(&serde_json::from_str(&line).unwrap())
-                .unwrap()
-                .seed_length
-        };
-        assert_eq!(header(r#","seedLength":3"#), None);
-        assert_eq!(header(r#","seedLength":3,"parentSession":"p1""#), Some(3));
+        assert_eq!(header(r#","seedLength":3"#).seed_length, None);
+        assert_eq!(
+            header(r#","seedLength":3,"parentSession":"p1""#).seed_length,
+            Some(3)
+        );
     }
 
     /// 根目录在却列不出(权限):列表报错、parent_links 给 None——当成空的话,全量扫描会把会话
@@ -959,24 +948,18 @@ mod tests {
     /// 截点后紧跟着的回复另起一条:并进复制来的最后一条回复,折叠时会被一起折掉
     #[test]
     fn a_reply_right_after_the_cut_is_its_own() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("session.v4.jsonl");
-        let lines = [
-            r#"{"type":"session","version":4,"id":"f1","createdAt":1,"isSeeded":true,"delegationDepth":0,"parentSession":"p1"}"#,
-            r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
-            r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}]}}}"#,
-            r#"{"type":"session/end-seed","seq":2,"time":20,"data":{"inherited":true}}"#,
-            r#"{"type":"assistant/message","seq":3,"time":30,"data":{"message":{"content":[{"type":"text","text":"the fork's own answer"}]}}}"#,
-        ];
-        std::fs::write(&path, lines.join("\n")).unwrap();
-        let parsed = parse_dsh_log(&path, false).unwrap();
-        let texts: Vec<(Role, MessageKind, &str)> = parsed
-            .messages
-            .iter()
-            .map(|m| (m.role, m.kind, m.text.as_str()))
-            .collect();
+        let parsed = parsed(
+            &[
+                r#"{"type":"session","version":4,"id":"f1","createdAt":1,"isSeeded":true,"delegationDepth":0,"parentSession":"p1"}"#,
+                r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
+                r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}]}}}"#,
+                r#"{"type":"session/end-seed","seq":2,"time":20,"data":{"inherited":true}}"#,
+                r#"{"type":"assistant/message","seq":3,"time":30,"data":{"message":{"content":[{"type":"text","text":"the fork's own answer"}]}}}"#,
+            ],
+            false,
+        );
         assert_eq!(
-            texts,
+            texts(&parsed.messages),
             vec![
                 (
                     Role::System,
@@ -986,6 +969,29 @@ mod tests {
                 (Role::Assistant, MessageKind::Text, "the fork's own answer"),
             ]
         );
+    }
+
+    /// 复制来的那段里的图片不解码(收尾要折掉,还占会话自己的解码额度);截点之后照常解码
+    #[test]
+    fn images_after_the_cut_are_decoded() {
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+        let user = |seq: u32| {
+            format!(
+                r#"{{"type":"user/message","seq":{seq},"time":{seq},"data":{{"content":[{{"type":"text","text":"look"}},{{"type":"image","media_type":"image/png","data":"{png}"}}],"source":{{"kind":"user"}}}}}}"#
+            )
+        };
+        let (inherited, own) = (user(0), user(2));
+        let parsed = parsed(
+            &[
+                r#"{"type":"session","version":4,"id":"f1","createdAt":1,"isSeeded":true,"parentSession":"p1"}"#,
+                &inherited,
+                r#"{"type":"session/end-seed","seq":1,"time":1,"data":{"inherited":true}}"#,
+                &own,
+            ],
+            true,
+        );
+        assert_eq!(parsed.messages.len(), 2);
+        assert_eq!(parsed.messages[1].images.len(), 1);
     }
 
     #[test]

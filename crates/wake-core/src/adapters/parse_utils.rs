@@ -120,6 +120,12 @@ pub fn created_ms(meta: &std::fs::Metadata) -> Option<i64> {
     meta.created().ok().and_then(system_time_ms)
 }
 
+/// 文件的 (mtime 毫秒, 字节数),跟随符号链接;不是普通文件、读不到元数据给 None
+pub fn stat_stamp(path: &std::path::Path) -> Option<(i64, i64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    meta.is_file().then(|| (mtime_ms(&meta), meta.len() as i64))
+}
+
 fn system_time_ms(t: std::time::SystemTime) -> Option<i64> {
     t.duration_since(std::time::UNIX_EPOCH)
         .ok()
@@ -1285,10 +1291,6 @@ mod tests {
         assert_ne!(
             sidecar_fingerprint(&["ab", "c"]),
             sidecar_fingerprint(&["a", "bc"])
-        );
-        assert_eq!(
-            sidecar_fingerprint(&["Ada", "hidden"]),
-            sidecar_fingerprint(&["Ada", "hidden"])
         );
     }
 

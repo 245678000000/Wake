@@ -1216,14 +1216,17 @@ impl Store {
             .optional()?)
     }
 
-    /// file_path 落在 `[from, to)` 里的会话路径。watcher 对账 `sessions_in` 时拿它取挂在一个文件
-    /// 名下的虚拟路径(区间由 `sqlite_ro::virtual_path_bounds` 给)
-    pub fn file_paths_in(&self, from: &str, to: &str) -> Result<Vec<String>> {
+    /// file_path 落在 `[from, to)` 里的会话 → 它们的变更戳 (file_mtime, file_size)。watcher 对账
+    /// `sessions_in` 时一次取齐挂在一个文件名下的虚拟路径(区间由 `sqlite_ro::virtual_path_bounds` 给)
+    pub fn file_stamps_in(&self, from: &str, to: &str) -> Result<HashMap<String, (i64, i64)>> {
         let conn = self.read.lock().unwrap();
         let mut stmt = conn.prepare_cached(
-            "SELECT file_path FROM sessions WHERE file_path >= ?1 AND file_path < ?2",
+            "SELECT file_path, file_mtime, file_size FROM sessions
+             WHERE file_path >= ?1 AND file_path < ?2",
         )?;
-        let rows = stmt.query_map(params![from, to], |r| r.get(0))?;
+        let rows = stmt.query_map(params![from, to], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 

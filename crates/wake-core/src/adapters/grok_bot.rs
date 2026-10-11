@@ -91,22 +91,19 @@ impl GrokBotAdapter {
     /// 路径上那份文件存的是哪一种切片;别的存储文件、不是存储文件的都是 None。`.kblob` 的键在
     /// 首行,读出来的记下:文件没了(删除事件)、一时读不出,照样认得出
     fn slice_at(&self, path: &Path) -> Option<Slice> {
-        let framed = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.ends_with(FRAMED));
-        let slice = file_key(path).and_then(|key| slice_of(&key));
-        if !framed {
-            return slice;
+        if !is_framed(path) {
+            return file_key(path).and_then(|key| slice_of(&key));
         }
-        let mut seen = self.framed.lock().unwrap();
-        match slice {
-            Some(slice) => {
-                seen.insert(path.to_path_buf(), slice.clone());
-                Some(slice)
-            }
-            None => seen.get(path).cloned(),
+        // `.kblob` 的文件名就是它那个键的摘要:记下的键不会过时,不必每次打开文件
+        if let Some(slice) = self.framed.lock().unwrap().get(path) {
+            return Some(slice.clone());
         }
+        let slice = file_key(path).and_then(|key| slice_of(&key))?;
+        self.framed
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), slice.clone());
+        Some(slice)
     }
 
     /// 一个账号的列表文件:键编码进文件名的直接算出来,只有编码后太长(`.kblob`)才列目录找——每个
@@ -133,7 +130,7 @@ impl GrokBotAdapter {
     /// 不记这个版本,下次再读——记了的话错误过去之后 mtime / size 没变,连全量刷新都不会再读
     /// (2026-10-11 Codex review);读出来却解不开(写坏了)才记,同一个版本不再白解析
     fn roster(&self, path: &Path) -> Option<Arc<Roster>> {
-        let Some(stamp) = file_stamp(path) else {
+        let Some(stamp) = stat_stamp(path) else {
             self.rosters.lock().unwrap().remove(path);
             return None;
         };
@@ -235,7 +232,7 @@ fn file_key(path: &Path) -> Option<String> {
     if let Some(stem) = name.strip_suffix(ENCODED) {
         return String::from_utf8(base32_decode(stem)?).ok();
     }
-    if name.ends_with(FRAMED) {
+    if is_framed(path) {
         let mut line = String::new();
         BufReader::new(fs::File::open(path).ok()?)
             .read_line(&mut line)
@@ -249,28 +246,21 @@ fn is_store_file(name: &str) -> bool {
     name.ends_with(ENCODED) || name.ends_with(FRAMED)
 }
 
-/// 文件里存的值(`.kblob` 跳过首行的键)
-fn read_value(path: &Path) -> Result<Value> {
-    parse_value(path, &fs::read_to_string(path)?)
+/// 编码后太长、改存摘要名的 `.kblob`(首行是键)
+fn is_framed(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(FRAMED))
 }
 
-/// 读出来的文件内容 → 存的值
+/// 读出来的文件内容 → 存的值(`.kblob` 跳过首行的键)
 fn parse_value(path: &Path, raw: &str) -> Result<Value> {
-    let framed = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.ends_with(FRAMED));
-    let body = if framed {
+    let body = if is_framed(path) {
         raw.split_once('\n').map_or("", |(_, value)| value)
     } else {
         raw
     };
     Ok(serde_json::from_str(body)?)
-}
-
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let meta = fs::metadata(path).ok()?;
-    meta.is_file().then(|| (mtime_ms(&meta), meta.len() as i64))
 }
 
 /// 与会话有关的两种键。账号段原样保留(app 存的是 URI 编码过的账号,同一账号的副本与列表靠它配对)
@@ -382,7 +372,7 @@ fn parse_roster(v: &Value) -> Roster {
 // ---------------------------------------------------------------- 引用与元数据
 
 fn replica_ref(path: &Path, conversation: &str, row: Option<&Row>) -> Option<SessionFileRef> {
-    let (mtime_ms, size) = file_stamp(path).filter(|(_, size)| *size > 0)?;
+    let (mtime_ms, size) = stat_stamp(path).filter(|(_, size)| *size > 0)?;
     Some(SessionFileRef {
         agent: AgentId::GrokBot,
         native_id: conversation.to_string(),
@@ -495,7 +485,7 @@ struct Replica {
 }
 
 fn read_replica(path: &Path) -> Result<Replica> {
-    replica(&read_value(path)?)
+    replica(&parse_value(path, &fs::read_to_string(path)?)?)
         .ok_or_else(|| anyhow!("not a Grok Bot transcript: {}", path.display()))
 }
 
@@ -767,13 +757,10 @@ fn name_of(v: Option<&Value>) -> Option<&str> {
 /// `**标签**` 起头的一段:群聊里是谁说的、bot 之间的消息是发给谁的。正文是空的(流式中还没来
 /// 内容的占位)整段给空,`push` 才滤得掉——只剩一个名字的消息不是消息(2026-10-11 Codex review)
 fn labelled(label: &str, body: &str) -> String {
-    if body.trim().is_empty() {
-        return String::new();
+    match body.trim() {
+        "" => String::new(),
+        body => format!("**{label}**\n\n{body}"),
     }
-    let mut text = ParsedContent::default();
-    text.push_text(&format!("**{label}**"));
-    text.push_text(body);
-    text.text
 }
 
 fn is_image_name(name: &str) -> bool {

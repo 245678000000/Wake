@@ -13,9 +13,10 @@ use wake_core::models::AgentId;
 
 use crate::format::tilde_path;
 use crate::ui::{
-    action_button, axis_inset, overlay_layers, rails_factor, show_in_fm, sidebar_title, zpx, Zpx,
-    BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_LABEL, FONT_TITLE, ICON_TEXT_GAP,
-    LEAD_BOX, NAV_ICON, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL, SPACE_XS, SPACE_XXL,
+    action_button, axis_inset, lead_slot, overlay_layers, rails_factor, show_in_fm, sidebar_title,
+    zpx, Zpx, BUTTON_SM_H, FONT_BODY, FONT_CAPTION, FONT_DISPLAY, FONT_LABEL, FONT_TITLE,
+    ICON_TEXT_GAP, LEAD_BOX, NAV_ICON, RADIUS_BUTTON, SPACE_LG, SPACE_MD, SPACE_SM, SPACE_XL,
+    SPACE_XS, SPACE_XXL,
 };
 use crate::update::{self, UpdateStatus};
 use crate::workbench::{
@@ -409,13 +410,7 @@ impl SettingsView {
             .on_click(move |_, _, cx| {
                 workbench.update(cx, |this, cx| this.select_settings_page(page, cx));
             })
-            .child(
-                h_flex()
-                    .w(LEAD_BOX)
-                    .flex_shrink_0()
-                    .justify_center()
-                    .child(icon(icon_path).with_size(NAV_ICON)),
-            )
+            .child(lead_slot(LEAD_BOX, icon(icon_path).with_size(NAV_ICON)))
             // 放大档位下侧栏可能比标签窄:单行截断,行高是定的,换成两行会压到下一项
             .child(
                 div()

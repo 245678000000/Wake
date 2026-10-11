@@ -1509,19 +1509,18 @@ fn dsh_subagents_nest_under_the_session_that_started_them() {
     use wake_core::adapters::dsh::DshAdapter;
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("--Users-tester-Github-wakefx--");
-    for (dir, fixture) in [
-        ("dsh-e2e4-0001", "dsh/session.jsonl"),
-        ("dsh-sub-0002", "dsh/subagent.v4.jsonl"),
+    for (dir, fixture, log) in [
+        ("dsh-e2e4-0001", "dsh/session.jsonl", "session.jsonl.zstd"),
+        (
+            "dsh-sub-0002",
+            "dsh/subagent.v4.jsonl",
+            "session.v4.jsonl.zstd",
+        ),
     ] {
         let session = project.join(dir);
         std::fs::create_dir_all(&session).unwrap();
         let plain = std::fs::read_to_string(common::fixture(fixture)).unwrap();
-        let name = if fixture.ends_with(".v4.jsonl") {
-            "session.v4.jsonl.zstd"
-        } else {
-            "session.jsonl.zstd"
-        };
-        std::fs::write(session.join(name), common::dsh_zstd(&plain)).unwrap();
+        std::fs::write(session.join(log), common::dsh_zstd(&plain)).unwrap();
     }
     let adapters: Vec<Box<dyn AgentAdapter>> =
         vec![DshAdapter::new().with_custom_root(root.path().to_path_buf())];

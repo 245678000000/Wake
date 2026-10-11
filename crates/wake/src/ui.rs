@@ -285,6 +285,15 @@ pub const NAV_ICON: Zpx = Zpx(15.);
 pub const fn axis_inset(lead: Zpx, edge: Zpx) -> Zpx {
     Zpx(LEAD_AXIS.0 - lead.0 / 2. - edge.0)
 }
+/// 宽 `width` 的行首槽位,内容居中:比槽位小的图标中心也落在槽位中心上。槽位宽与传给
+/// `axis_inset` 的 `lead` 是一对——侧栏行、设置窗导航、底部状态行的行首都经它
+pub fn lead_slot(width: impl Into<Pixels>, child: impl IntoElement) -> Div {
+    h_flex()
+        .w(width.into())
+        .flex_shrink_0()
+        .justify_center()
+        .child(child)
+}
 /// 行左内边距 = 26.75(轴) − 9(槽位半宽) − 10(SIDEBAR_EDGE,容器那一半)
 pub const LEAD_INSET: Zpx = axis_inset(LEAD_BOX, SIDEBAR_EDGE);
 /// 分组项(agent/项目)相对轴的右缩进,表达从属。

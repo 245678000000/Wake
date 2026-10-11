@@ -5646,50 +5646,39 @@ impl Workbench {
             };
             bar.into_any_element()
         });
-        let status: Option<AnyElement> = if let Some(note) = note {
-            let lead = if busy {
-                div()
-                    .flex_shrink_0()
-                    .child(
-                        Spinner::new()
-                            .with_size(STATUS_LEAD)
-                            .color(theme.muted_foreground),
-                    )
-                    .into_any_element()
-            } else {
+        let status = match note {
+            Some(note) if busy => Some((
+                Spinner::new()
+                    .with_size(STATUS_LEAD)
+                    .color(theme.muted_foreground)
+                    .into_any_element(),
+                note,
+            )),
+            Some(note) => Some((
                 icon("icons/refresh-cw.svg")
                     .with_size(STATUS_LEAD)
-                    .flex_shrink_0()
-                    .into_any_element()
-            };
-            Some(
-                h_flex()
-                    .w_full()
-                    .gap(ICON_TEXT_GAP)
-                    .text_color(theme.muted_foreground)
-                    .child(lead)
-                    .child(div().min_w_0().truncate().child(note))
                     .into_any_element(),
-            )
-        } else if self.watcher.is_none() {
-            Some(
-                h_flex()
-                    .w_full()
-                    .gap(ICON_TEXT_GAP)
-                    .text_color(theme.muted_foreground)
-                    .child(
-                        h_flex()
-                            .w(STATUS_LEAD)
-                            .flex_shrink_0()
-                            .justify_center()
-                            .child(div().size(zpx(7.)).rounded_full().bg(theme.warning)),
-                    )
-                    .child(div().min_w_0().truncate().child(t("Live updates off")))
+                note,
+            )),
+            None if self.watcher.is_none() => Some((
+                div()
+                    .size(zpx(7.))
+                    .rounded_full()
+                    .bg(theme.warning)
                     .into_any_element(),
-            )
-        } else {
-            None
-        };
+                t("Live updates off").to_string(),
+            )),
+            None => None,
+        }
+        .map(|(lead, text)| {
+            h_flex()
+                .w_full()
+                .gap(ICON_TEXT_GAP)
+                .text_color(theme.muted_foreground)
+                .child(lead_slot(STATUS_LEAD, lead))
+                .child(div().min_w_0().truncate().child(text))
+                .into_any_element()
+        });
 
         // macOS 恒挂 TitleBar(traffic light 占位 + 拖拽区);Linux/Windows 按
         // 运行时装饰状态:系统给了标题栏(Server)就不挂——TitleBar 的非 mac
@@ -9603,7 +9592,8 @@ fn sidebar_footer_width() -> Pixels {
 /// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽),工具条贴着侧栏左缘、
 /// 没有容器边距:最左那颗图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
 const FOOTER_LEAD_INSET: Zpx = axis_inset(FOOTER_BTN, Zpx(0.));
-/// 侧栏底部状态行的行首框:转圈、出错图标都是这么宽,"Live updates off" 的圆点在框里居中
+/// 侧栏底部状态行的行首槽位(`lead_slot`):转圈、出错图标都是这么宽,"Live updates off" 的
+/// 圆点在里面居中
 const STATUS_LEAD: Zpx = Zpx(12.);
 /// 状态行左内边距:行首框中心压在侧栏中轴上,与上面的导航行、下面的工具条同一条线
 const STATUS_LEAD_INSET: Zpx = axis_inset(STATUS_LEAD, Zpx(0.));
@@ -9690,13 +9680,9 @@ fn sidebar_row(
                 .child(
                     // 定宽槽位保证文字起点统一;内部居中,使小图标的中心也落在
                     // LEAD_AXIS 上(左对齐会让 14/15px 图标的中心偏离轴 1.5~2pt)
-                    div()
-                        .w(LEAD_BOX)
-                        .flex_shrink_0()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(match lead {
+                    lead_slot(
+                        LEAD_BOX,
+                        match lead {
                             // 线条图标比实心品牌图视觉轻,给它小一档才平衡
                             RowLead::Icon(ic) => ic
                                 .with_size(if sub { zpx(14.) } else { NAV_ICON.get() })
@@ -9709,7 +9695,8 @@ fn sidebar_row(
                             // 品牌图不着色:img 走 AssetSource 取内嵌 PNG,原色渲染
                             // (侧栏单色化试过,用户否决——保持彩色)
                             RowLead::Brand(path) => img(path).size(LEAD_BOX).into_any_element(),
-                        }),
+                        },
+                    ),
                 )
                 .child(
                     div()

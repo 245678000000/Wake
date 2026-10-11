@@ -357,8 +357,8 @@ pub fn run_memory_sync(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -
 /// 写事务内副本裁决(`Store::write_session_guarded`)用的位次查询:按 file_path
 /// 找拥有它的实例、问它这份副本的 `dedup_rank`;无实例认领的路径落到该家首个
 /// 实例——与枚举时的候选排序同一把尺子,全量与增量两条写库路径才给出同一个胜者
-/// (watcher 预判一份副本值不值得交给 scan_files 也用它)
-pub(crate) fn rank_of<'a>(
+/// (`scan_files` 预判一份副本值不值得解析也用它)
+fn rank_of<'a>(
     adapters: &'a [Box<dyn AgentAdapter>],
     agent: crate::models::AgentId,
 ) -> impl Fn(&str) -> u8 + 'a {
@@ -1175,6 +1175,14 @@ pub fn scan_files(
         // 认领的替身连解析都省了;合并改过 key 的情形由写入闸门兜住
         if store.is_key_tombstoned(&key) || store.is_key_claimed(&key) {
             continue;
+        }
+        // 同一会话已由位次严格更优的另一份副本代表着:写事务里的副本裁决必判它输,解析也省了
+        // (Grok Bot 的侧栏列表每变一次,有副本的对话的卡片都会来一遍)
+        if let Ok(Some(indexed)) = store.file_path_of(&key) {
+            let rank = rank_of(adapters, r.agent);
+            if indexed != r.file_path && rank(&indexed) < rank(&r.file_path) {
+                continue;
+            }
         }
         by_adapter.entry(ix).or_default().push(r);
     }
