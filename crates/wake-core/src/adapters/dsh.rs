@@ -26,9 +26,9 @@ use std::sync::Mutex;
 pub struct DshAdapter {
     root: PathBuf,
     /// 会话目录 → 最近一次读出来的(日志引用, 父会话 id)。列表、file_ref 与每批监听都问的
-    /// parent_links 都要首行里的 id 与 parentSession:首行写下就不变,迁移出的新一代也是同一个
-    /// id / parentSession,所以每个目录只解压一次,之后只 stat 选代;目录一时列不出(权限、锁)
-    /// 交回上次读到的
+    /// parent_links 都要首行里的 id 与 parentSession:首行写下就不变,同一份日志只解压一次,追加
+    /// 之后只 stat 选代;换了一代、换了压缩格式才再读一次。目录一时列不出、新的那份一时打不开
+    /// (权限、锁)交回上次读到的
     logs: Mutex<HashMap<PathBuf, (SessionFileRef, Option<String>)>>,
 }
 
@@ -95,12 +95,18 @@ impl DshAdapter {
         else {
             return Ok(None);
         };
+        let same_log = last
+            .as_ref()
+            .is_some_and(|(r, _)| Path::new(&r.file_path) == path);
         let (native_id, parent) = match last {
-            Some((r, parent)) => (r.native_id, parent),
-            // 解压不持锁
-            None => match read_header(&path)? {
-                Some(header) => (header.id, header.parent),
-                None => return Ok(None),
+            Some((r, parent)) if same_log => (r.native_id, parent),
+            // 新目录,或者换了一代、换了压缩格式(解压不持锁)。读到过的会话读不出新的那份(打不开、
+            // 首帧坏)就交回上一份——旧代原样留着;换到解析不了的新路径的话,旧路径又不在枚举里,
+            // 全量扫描会把会话连同搜索记录删掉(2026-10-11 Codex review)
+            _ => match read_header(&path) {
+                Ok(Some(header)) => (header.id, header.parent),
+                Ok(None) => return Ok(last),
+                Err(e) => return last.map(Some).ok_or(e),
             },
         };
         let r = SessionFileRef {
@@ -943,6 +949,49 @@ mod tests {
             assert_eq!(cold_now, (None, 2));
         }
         assert_eq!(links(&cold), full);
+    }
+
+    /// 读到过的会话换了一代日志,新的那份读不出(首帧坏、一时打不开):交回上一代,会话不从列表里
+    /// 掉——换到解析不了的新路径的话,旧路径又不在枚举里,全量扫描会把它从索引里删掉
+    #[test]
+    fn a_new_generation_that_cannot_be_read_keeps_the_old_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("--w--").join("s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let header = |version: u32| {
+            format!(r#"{{"type":"session","version":{version},"id":"s1","createdAt":1}}"#) + "\n"
+        };
+        let (v0, v4) = (
+            session.join("session.jsonl"),
+            session.join("session.v4.jsonl"),
+        );
+        std::fs::write(&v0, header(0)).unwrap();
+        let adapter = DshAdapter::at(dir.path().to_path_buf());
+        let listed = || -> Vec<String> {
+            let refs = adapter.list_session_files().unwrap();
+            refs.into_iter().map(|r| r.file_path).collect()
+        };
+        let path = |p: &std::path::Path| vec![p.to_string_lossy().into_owned()];
+        assert_eq!(listed(), path(&v0));
+
+        std::fs::write(&v4, "not a header\n").unwrap();
+        assert_eq!(listed(), path(&v0), "首帧坏的新一代不顶掉读得出的旧代");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::write(&v4, header(4)).unwrap();
+            std::fs::set_permissions(&v4, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // root 读得动没有权限的文件,前提不成立就不测
+            let unreadable = std::fs::read(&v4).is_err();
+            let now = listed();
+            std::fs::set_permissions(&v4, std::fs::Permissions::from_mode(0o644)).unwrap();
+            if unreadable {
+                assert_eq!(now, path(&v0), "一时打不开的新一代不顶掉旧代");
+            }
+        }
+        std::fs::write(&v4, header(4)).unwrap();
+        assert_eq!(listed(), path(&v4));
     }
 
     /// 截点后紧跟着的回复另起一条:并进复制来的最后一条回复,折叠时会被一起折掉
