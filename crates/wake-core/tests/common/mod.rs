@@ -295,6 +295,8 @@ pub struct Sidecars {
     pub opencode_next_db: PathBuf,
     pub antigravity_db: PathBuf,
     pub dsh_log: PathBuf,
+    /// fork 后端派出的子代理会话(开头带着从父会话复制来的一段),挂在 dsh_log 那个会话下
+    pub dsh_sub_log: PathBuf,
     pub hermes_db: PathBuf,
     pub openclaw_db: PathBuf,
     pub cursor_ide_db: PathBuf,
@@ -350,7 +352,7 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     .expect("write kimi session_index");
 
     // dsh:检入的明文 fixture 压成真实写端布局的 zstd 多帧文件(首帧 header
-    // 行、次帧事件批,帧直接连接),另放一个子代理会话验证 file_ref 过滤
+    // 行、次帧事件批,帧直接连接),另放一个 fork 后端派出的子代理会话(issue #63)
     let dsh_project = home
         .join(".dsh")
         .join("sessions")
@@ -362,16 +364,9 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
     fs::write(&dsh_log, dsh_zstd(&plain)).expect("write dsh zstd log");
     let dsh_sub = dsh_project.join("dsh-sub-0002");
     fs::create_dir_all(&dsh_sub).expect("mkdir dsh subagent dir");
-    fs::write(
-        dsh_sub.join("session.jsonl"),
-        concat!(
-            r#"{"type":"session","version":0,"id":"dsh-sub-0002","createdAt":1786100000000,"cwd":"/Users/tester/Github/wakefx","origin":"subagent","delegationDepth":1}"#,
-            "\n",
-            r#"{"type":"user/message","seq":0,"time":1786100001000,"data":{"id":"m","role":"user","content":[{"type":"text","text":"child task"}],"source":{"kind":"user"}}}"#,
-            "\n",
-        ),
-    )
-    .expect("write dsh subagent log");
+    let plain = fs::read_to_string(fixture("dsh/subagent.v4.jsonl")).expect("read dsh subagent");
+    let dsh_sub_log = dsh_sub.join("session.v4.jsonl.zstd");
+    fs::write(&dsh_sub_log, dsh_zstd(&plain)).expect("write dsh subagent log");
 
     let hermes_dir = home.join(".hermes");
     fs::create_dir_all(&hermes_dir).expect("mkdir .hermes");
@@ -434,6 +429,7 @@ pub fn stage_sidecars(home: &Path) -> Sidecars {
         opencode_next_db,
         antigravity_db,
         dsh_log,
+        dsh_sub_log,
         hermes_db,
         openclaw_db,
         cursor_ide_db,

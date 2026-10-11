@@ -1502,6 +1502,49 @@ fn dsh_newer_generation_takes_over_an_indexed_older_one() {
     );
 }
 
+/// dsh 委派出去的子代理(issue #63):照常收录,经首行的 parentSession 挂到派它的会话下面,
+/// 不进顶层列表;它自己的 token 计在它名下
+#[test]
+fn dsh_subagents_nest_under_the_session_that_started_them() {
+    use wake_core::adapters::dsh::DshAdapter;
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("--Users-tester-Github-wakefx--");
+    for (dir, fixture) in [
+        ("dsh-e2e4-0001", "dsh/session.jsonl"),
+        ("dsh-sub-0002", "dsh/subagent.v4.jsonl"),
+    ] {
+        let session = project.join(dir);
+        std::fs::create_dir_all(&session).unwrap();
+        let plain = std::fs::read_to_string(common::fixture(fixture)).unwrap();
+        let name = if fixture.ends_with(".v4.jsonl") {
+            "session.v4.jsonl.zstd"
+        } else {
+            "session.jsonl.zstd"
+        };
+        std::fs::write(session.join(name), common::dsh_zstd(&plain)).unwrap();
+    }
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![DshAdapter::new().with_custom_root(root.path().to_path_buf())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let (parent, child) = ("dsh:dsh-e2e4-0001", "dsh:dsh-sub-0002");
+    assert_eq!(store.parent_key_of(child).unwrap().as_deref(), Some(parent));
+    let sub = store.get_session(child).unwrap().expect("子代理入库");
+    assert_eq!(sub.title, "Audit the scanner effects");
+    assert_eq!(sub.tokens_used, Some(1820));
+    let filter = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, total) = store.list_sessions(&filter).unwrap();
+    assert_eq!(total, 1, "子代理不进顶层列表");
+    assert_eq!(roots[0].key, parent);
+    assert_eq!(store.child_counts(&filter).unwrap().get(parent), Some(&1));
+}
+
 /// Kimi 分叉:关系写在子会话自己的 state.json(`forkedFrom`),全量扫描后子会话挂在父会话
 /// 下面;state.json 的 archived 照搬进索引
 #[test]

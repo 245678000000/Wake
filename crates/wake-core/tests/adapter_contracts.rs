@@ -49,6 +49,7 @@ struct TestEnv {
     opencode_next_db: PathBuf,
     antigravity_db: PathBuf,
     dsh_log: PathBuf,
+    dsh_sub_log: PathBuf,
     hermes_db: PathBuf,
     openclaw_db: PathBuf,
     cursor_ide_db: PathBuf,
@@ -103,6 +104,7 @@ fn setup() -> &'static TestEnv {
             opencode_next_db: sc.opencode_next_db,
             antigravity_db: sc.antigravity_db,
             dsh_log: sc.dsh_log,
+            dsh_sub_log: sc.dsh_sub_log,
             hermes_db: sc.hermes_db,
             openclaw_db: sc.openclaw_db,
             cursor_ide_db: sc.cursor_ide_db,
@@ -2736,24 +2738,31 @@ fn dsh_parse_contract() {
     let env = setup();
     let adapter = DshAdapter::new();
     // file_ref 是公开 API:只认会话日志(session[.vN].jsonl[.zstd]),native_id 取
-    // header 的权威 id(目录名是转义过的 id);子代理会话(origin=subagent)在此过滤
+    // header 的权威 id(目录名是转义过的 id);子代理会话照常收录(issue #63)
     let r = adapter.file_ref(&env.dsh_log).expect("dsh file_ref");
     assert_eq!(r.native_id, "dsh-e2e4-0001");
-    let sub = env
-        .dsh_log
-        .parent()
-        .and_then(|d| d.parent())
-        .expect("dsh project dir")
-        .join("dsh-sub-0002")
-        .join("session.jsonl");
-    assert!(adapter.file_ref(&sub).is_none(), "子代理会话不进列表");
+    let sub = adapter
+        .file_ref(&env.dsh_sub_log)
+        .expect("子代理会话也是会话");
+    assert_eq!(sub.native_id, "dsh-sub-0002");
 
-    // list 走 <project>/<session>/<日志> 两层布局,子代理被滤掉
-    let listed = adapter
+    // list 走 <project>/<session>/<日志> 两层布局
+    let mut listed: Vec<String> = adapter
         .list_session_files()
-        .expect("dsh list_session_files");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].native_id, "dsh-e2e4-0001");
+        .expect("dsh list_session_files")
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    listed.sort();
+    assert_eq!(listed, vec!["dsh-e2e4-0001", "dsh-sub-0002"]);
+    // 子代理首行的 parentSession 把它挂到派它的会话下
+    assert_eq!(
+        adapter.parent_links(),
+        Some(vec![(
+            "dsh:dsh-sub-0002".to_string(),
+            "dsh:dsh-e2e4-0001".to_string()
+        )])
+    );
 
     // 压缩配置换挡会两后缀并存:陈旧的一份在 file_ref 就让位(裁决单点,
     // watcher 入口同样受保护,不会把旧文件当主文件解析)。在私有拷贝里摆
@@ -2821,6 +2830,54 @@ fn dsh_parse_contract() {
     assert_eq!(
         s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
         vec![0, 1]
+    );
+}
+
+/// fork 后端派出的子代理(issue #63):开头原样复制了父会话到截点为止的事件——折成一条,
+/// 标题取派活时的任务名,模型与 token 只算子代理自己的调用,父会话的不重复计
+#[test]
+fn dsh_subagent_keeps_only_its_own_turns() {
+    let env = setup();
+    let adapter = DshAdapter::new();
+    let r = adapter
+        .file_ref(&env.dsh_sub_log)
+        .expect("dsh subagent file_ref");
+    let s = adapter
+        .parse_session(&r)
+        .expect("dsh subagent parse_session");
+    let t = adapter
+        .parse_transcript(&r)
+        .expect("dsh subagent parse_transcript");
+    assert_eq!(s.meta.key, "dsh:dsh-sub-0002");
+    assert_eq!(s.meta.title, "Audit the scanner effects"); // 复制来的 session/title 不算
+    assert_eq!(s.meta.model.as_deref(), Some("deepseek-v4-flash"));
+    assert_eq!(s.meta.tokens_used, Some(1820)); // 复制来的 1480 是父会话的
+    assert_eq!(s.meta.created_at, 1786100005000);
+    assert_eq!(s.meta.message_count, 2);
+    assert_eq!(s.unknown_line_count, 0);
+    assert_eq!(
+        texts(&t.mainline),
+        vec![
+            (
+                Role::System,
+                MessageKind::Meta,
+                "── 2 messages inherited from the parent session ──"
+            ),
+            (
+                Role::User,
+                MessageKind::Text,
+                "Check every effect in the scanner page and report which ones never clean up."
+            ),
+            (
+                Role::Assistant,
+                MessageKind::Text,
+                "Two effects never unsubscribe: the camera stream and the resize listener."
+            ),
+        ]
+    );
+    assert_eq!(
+        s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
+        vec![1, 2]
     );
 }
 
@@ -2994,6 +3051,10 @@ fn seq_contract_holds_for_all_agents() {
         (
             Box::new(DshAdapter::new()),
             fs_ref(AgentId::Dsh, &env.dsh_log, "dsh-e2e4-0001"),
+        ),
+        (
+            Box::new(DshAdapter::new()),
+            fs_ref(AgentId::Dsh, &env.dsh_sub_log, "dsh-sub-0002"),
         ),
         (
             Box::new(HermesAdapter::new()),

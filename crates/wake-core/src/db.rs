@@ -223,8 +223,10 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 ///       的回复合并改走同一个封顶合并(恰好停在上限上的回复也补截断标记),老行靠这轮重解析回填;
 /// "12" = Claude Code 的分支会话(开头原样复制了原对话的那种)折掉复制来的一段、挂到原件下,
 ///       token / 标题 / 创建时间只算分支自己的行;后台任务结束时注入的 `<task-notification>`
-///       user 行归注入内容(Meta),老行靠这轮重解析回填。
-pub const FTS_FORMAT: &str = "12";
+///       user 行归注入内容(Meta),老行靠这轮重解析回填;
+/// "13" = dsh 的子代理会话收录、挂到派它的会话下(issue #63),fork 出来的会话折掉从父会话
+///       复制来的一段、标题 / 模型 / 用量只算截点之后的,老行靠这轮重解析回填。
+pub const FTS_FORMAT: &str = "13";
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把

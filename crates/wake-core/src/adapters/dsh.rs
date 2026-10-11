@@ -1,11 +1,12 @@
 use super::parse_utils::*;
 use super::AgentAdapter;
 use crate::models::*;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// DeepSeek Harness(dsh):`~/.dsh/sessions/--<cwd转义>--/<id转义>/<日志>`,一目录一会话。
 /// 日志文件名带**格式代数**:v0 是 `session.jsonl[.zstd]`,之后每代 `session.vN.jsonl[.zstd]`
@@ -13,30 +14,120 @@ use std::path::{Path, PathBuf};
 /// 读的永远是编号最大的那一代——`session_log` 单点裁决。默认落盘是 zstd **多帧连接**
 /// (首帧 header 行,之后每次 append 一帧),标准流式解码到 EOF 即可;`compression: none`
 /// 配置则是纯文本 .jsonl,两种后缀都认。首行 {type:"session",version,id,createdAt,cwd,…}
-/// 给权威 id/cwd/created,不反推目录名;origin=="subagent" 或 delegationDepth>0 是子代理
-/// 会话,不进列表。事件行 {type,seq,time,data}:assistant/message 是一次模型调用的合成体
+/// 给权威 id/cwd/created,不反推目录名。origin=="subagent" 或 delegationDepth>0 是委派出去的
+/// 子代理会话(issue #63):照常收录,经首行的 parentSession 挂到派它的会话下面。fork 出来的会话
+/// (fork 后端派的子代理、用户自己 fork 的)开头原样复制了父会话到截点为止的事件,截点是最后一个
+/// `session/end-seed {inherited: true}`,之前的折成一条、标题 / 模型 / 用量只算之后的。
+/// 事件行 {type,seq,time,data}:assistant/message 是一次模型调用的合成体
 /// (v0/v1 的 assistant/chunk 与其打包行 *-chunks 直接跳过,v2 起流嵌在消息里),tool/result
 /// 按 toolCallId 回填(v0–v3 包在一个 tool-result 块里,v4 直接挂在 tool 角色消息上),
 /// system/message(v3 起系统提示在对话里)与 developer/message(v4)归 Meta,session/title
 /// 事件 last-wins 给标题,model 在 assistant 消息的 source 里。
 pub struct DshAdapter {
     root: PathBuf,
+    /// 会话目录 → 最近一次读出来的(日志引用, 首行)。列表、file_ref 与每批监听都问的 parent_links
+    /// 都要每个会话的首行:同一份日志((mtime, size) 没变)不再解压;目录或日志一时读不出(权限、
+    /// 锁)交回上次读到的——首行写下就不变,迁移出新一代也是同一个 id / parentSession
+    logs: Mutex<HashMap<PathBuf, (SessionFileRef, Arc<DshHeader>)>>,
 }
 
 impl DshAdapter {
     pub fn new() -> Self {
-        Self {
-            root: super::home_dir()
+        Self::at(
+            super::home_dir()
                 .unwrap_or_default()
                 .join(".dsh")
                 .join("sessions"),
+        )
+    }
+
+    fn at(root: PathBuf) -> Self {
+        Self {
+            root,
+            logs: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// `<project-dir>/<session-dir>` 固定两层,不 walkdir 全递归(会话目录里还放别的 artifacts)。
+    /// 根不在 = 确定没有;根或某个项目目录在却列不出 = 这一刻不知道(None)——列表据此冻结这一家
+    /// 这一轮,parent_links 据此保留库里的关系(当成空的话,一个读不出的目录就让全量扫描把会话
+    /// 整批删掉、子代理全打回顶层,2026-10-11 Codex review)
+    fn session_dirs(&self) -> Option<Vec<PathBuf>> {
+        let listed = |dir: &Path| match fs::read_dir(dir) {
+            Ok(entries) => Some(entries.collect::<std::io::Result<Vec<_>>>().ok()?),
+            Err(e) if e.kind() == ErrorKind::NotFound => Some(Vec::new()),
+            Err(_) => None,
+        };
+        let is_dir = |entry: &fs::DirEntry| entry.file_type().is_ok_and(|t| t.is_dir());
+        let mut dirs = Vec::new();
+        for project in listed(&self.root)?.iter().filter(|e| is_dir(e)) {
+            let sessions = listed(&project.path())?;
+            dirs.extend(sessions.iter().filter(|e| is_dir(e)).map(|e| e.path()));
+        }
+        Some(dirs)
+    }
+
+    /// 会话目录 → (被读的那一代日志的引用, 它的首行)。日志取 dsh 自己会读的那一份:编号最大的
+    /// 一代(迁移只新增、不删旧代,旧代的 mtime 可能更新);同一代压缩与明文并存(换过
+    /// compression 配置)时 mtime 新者胜、平局 .zstd 胜。list、watcher(经 file_ref)与
+    /// parent_links 共用这一处裁决——只做在 list 会让 watcher 把旧代的事件当主文件解析。首行
+    /// header 给权威 id(目录名是转义过的 id)。Ok(None) = 确定不是会话(没有日志、首行不是会话
+    /// header);目录列不出、日志打不开(权限、锁)交回上次读到的(见 `logs`),没读到过才报错——
+    /// parent_links 据此整份交 None。把读不出当成没有,parent_links 会交出缺一截的关系:A 派 B、
+    /// B 派 C,B 一时读不出,C 就从 A 下面挪到 B 下面(2026-10-11 Codex review)
+    fn session_log(&self, dir: &Path) -> std::io::Result<Option<(SessionFileRef, Arc<DshHeader>)>> {
+        let last = self.logs.lock().unwrap().get(dir).cloned();
+        let unreadable = |e: std::io::Error| last.clone().map(Some).ok_or(e);
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return unreadable(e),
+        };
+        let Some(((_, mtime, _), path, size)) = entries
+            .flatten()
+            .filter_map(|entry| {
+                let (generation, zstd) = log_generation(&entry.file_name().to_string_lossy())?;
+                let path = entry.path();
+                // fs::metadata 跟随符号链接(DirEntry::metadata 不跟)
+                let meta = fs::metadata(&path)
+                    .ok()
+                    .filter(|m| m.is_file() && m.len() > 0)?;
+                Some(((generation, mtime_ms(&meta), zstd), path, meta.len() as i64))
+            })
+            .max_by_key(|(rank, ..)| *rank)
+        else {
+            return Ok(None);
+        };
+        let file_path = path.to_string_lossy().to_string();
+        if let Some((r, _)) = &last {
+            if r.file_path == file_path && r.mtime_ms == mtime && r.size == size {
+                return Ok(last);
+            }
+        }
+        // 解压不持锁
+        let header = match read_header(&path) {
+            Ok(Some(header)) => Arc::new(header),
+            Ok(None) => return Ok(None),
+            Err(e) => return unreadable(e),
+        };
+        let r = SessionFileRef {
+            agent: AgentId::Dsh,
+            native_id: header.id.clone(),
+            file_path,
+            mtime_ms: mtime,
+            size,
+        };
+        self.logs
+            .lock()
+            .unwrap()
+            .insert(dir.to_path_buf(), (r.clone(), header.clone()));
+        Ok(Some((r, header)))
     }
 }
 
 /// 打开会话日志为行读取器,按后缀透明解压(.zstd = 多帧连接,Decoder 默认解到
 /// EOF)。cap 是缓冲尺寸:只读首行的 header 路径用小值,免得每次列举都预读兆级
-fn open_log(path: &Path, cap: usize) -> Result<Box<dyn BufRead>> {
+fn open_log(path: &Path, cap: usize) -> std::io::Result<Box<dyn BufRead>> {
     let file = fs::File::open(path)?;
     if path.extension().is_some_and(|e| e == "zstd") {
         let dec = zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(cap, file))?;
@@ -50,35 +141,61 @@ struct DshHeader {
     id: String,
     cwd: String,
     created_at: i64,
-    subagent: bool,
+    /// 派出这个子代理会话的会话 id(首行的 parentSession)。用户自己 fork 出来的会话也写
+    /// parentSession,但那是一段独立的对话——dsh 自己也只把子代理当成父会话的孩子——不挂
+    parent: Option<String>,
+    /// v0 / v1 的 fork 截点:首行的 seedLength,seq 小于它的事件是从父会话复制来的(上游 v1→v2
+    /// 迁移同一判法,且要带 parentSession);v2 起换成 `session/end-seed {inherited: true}` 标记
+    seed_length: Option<i64>,
 }
 
 fn parse_header(v: &serde_json::Value) -> Option<DshHeader> {
     if v.get("type").and_then(|t| t.as_str()) != Some("session") {
         return None;
     }
+    let id = v.get("id")?.as_str()?.to_string();
+    let subagent = v.get("origin").and_then(|o| o.as_str()) == Some("subagent")
+        || v.get("delegationDepth")
+            .and_then(|d| d.as_i64())
+            .unwrap_or(0)
+            > 0;
+    let forked_from = v
+        .get("parentSession")
+        .and_then(|p| p.as_str())
+        .filter(|p| !p.is_empty() && *p != id);
+    let parent = forked_from.filter(|_| subagent).map(String::from);
+    let seed_length = forked_from
+        .and(v.get("seedLength"))
+        .and_then(|n| n.as_i64())
+        .filter(|n| *n > 0);
     Some(DshHeader {
-        id: v.get("id")?.as_str()?.to_string(),
         cwd: v
             .get("cwd")
             .and_then(|c| c.as_str())
             .unwrap_or_default()
             .to_string(),
         created_at: v.get("createdAt").and_then(|t| t.as_i64()).unwrap_or(0),
-        subagent: v.get("origin").and_then(|o| o.as_str()) == Some("subagent")
-            || v.get("delegationDepth")
-                .and_then(|d| d.as_i64())
-                .unwrap_or(0)
-                > 0,
+        id,
+        parent,
+        seed_length,
     })
 }
 
 /// 只读首行拿 header(zstd 惰性解码,不会解整个文件;非会话日志返回 None)
-fn read_header(path: &Path) -> Option<DshHeader> {
-    let mut reader = open_log(path, 8 << 10).ok()?;
+fn read_header(path: &Path) -> std::io::Result<Option<DshHeader>> {
+    // 打不开(权限、锁)是这一刻读不出;打开了却读不出首行(坏帧)当不是会话——重试也好不了,
+    // 报错会让 parent_links 一直交 None、关系永远冻住
+    let mut reader = match open_log(path, 8 << 10) {
+        Ok(reader) => reader,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let mut line = String::new();
-    reader.read_line(&mut line).ok()?;
-    parse_header(&serde_json::from_str(line.trim_end()).ok()?)
+    if reader.read_line(&mut line).is_err() {
+        return Ok(None);
+    }
+    let header = serde_json::from_str(line.trim_end()).ok();
+    Ok(header.as_ref().and_then(parse_header))
 }
 
 /// dsh 的事件词汇,照抄上游 `KNOWN_SESSION_EVENT_TYPES`(dsh-session 包的 known-event-types.ts,
@@ -182,43 +299,30 @@ fn log_generation(name: &str) -> Option<(u32, bool)> {
     Some((digits.parse().ok()?, zstd))
 }
 
-/// 会话目录 → 会话引用。日志取 dsh 自己会读的那一份:编号最大的一代(迁移只新增、不删
-/// 旧代,旧代的 mtime 可能更新);同一代压缩与明文并存(换过 compression 配置)时 mtime
-/// 新者胜、平局 .zstd 胜。list 与 watcher(经 file_ref)两条入口共用这一处裁决——只做在
-/// list 会让 watcher 把旧代的事件当主文件解析。首行 header 给权威 id(目录名是转义过的
-/// id);子代理会话在此过滤
-fn session_log(dir: &Path) -> Option<SessionFileRef> {
-    let ((_, mtime, _), path, size) = fs::read_dir(dir)
-        .ok()?
-        .flatten()
-        .filter_map(|entry| {
-            let (generation, zstd) = log_generation(&entry.file_name().to_string_lossy())?;
-            let path = entry.path();
-            // fs::metadata 跟随符号链接(DirEntry::metadata 不跟)
-            let meta = fs::metadata(&path)
-                .ok()
-                .filter(|m| m.is_file() && m.len() > 0)?;
-            Some(((generation, mtime_ms(&meta), zstd), path, meta.len()))
-        })
-        .max_by_key(|(rank, ..)| *rank)?;
-    let header = read_header(&path).filter(|h| !h.subagent)?;
-    Some(SessionFileRef {
-        agent: AgentId::Dsh,
-        native_id: header.id,
-        file_path: path.to_string_lossy().to_string(),
-        mtime_ms: mtime,
-        size: size as i64,
-    })
-}
-
 struct DshParse {
     header: Option<DshHeader>,
     title: Option<String>,
+    /// 子代理的任务名:`subagent/descriptor` 的 label(派活时那句简短说明),截点之后的第一个
+    label: Option<String>,
     last_ts: i64,
     messages: Vec<TranscriptMessage>,
     model: Option<String>,
     tokens_used: Option<i64>,
     unknown_lines: u32,
+    /// fork 的截点落在第几条消息上:之前的消息是从父会话原样复制来的
+    inherited: Option<usize>,
+}
+
+impl DshParse {
+    /// 到了 fork 的截点:之前的消息是从父会话复制来的(收尾时折成一条);标题、任务名、模型、
+    /// 用量都是父会话的,清零,只算会话自己的
+    fn cut(&mut self) {
+        self.inherited = Some(self.messages.len());
+        self.title = None;
+        self.label = None;
+        self.model = None;
+        self.tokens_used = None;
+    }
 }
 
 fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
@@ -228,11 +332,13 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
     let mut p = DshParse {
         header: None,
         title: None,
+        label: None,
         last_ts: 0,
         messages: Vec::new(),
         model: None,
         tokens_used: None,
         unknown_lines: 0,
+        inherited: None,
     };
     // toolCallId → (消息下标, tool_calls 下标),tool/result 事件回填用
     let mut tool_index: HashMap<String, (usize, usize)> = HashMap::new();
@@ -268,6 +374,12 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
         let ts = row.get("time").and_then(|v| v.as_i64()).unwrap_or(0);
         p.last_ts = p.last_ts.max(ts);
         let data = row.get("data").unwrap_or(&serde_json::Value::Null);
+        // v0 / v1 没有截点标记:第一个 seq 不小于首行 seedLength 的事件起是会话自己的
+        let seed_length = p.header.as_ref().and_then(|h| h.seed_length);
+        let seq = row.get("seq").and_then(|v| v.as_i64());
+        if p.inherited.is_none() && seed_length.is_some_and(|n| seq.is_some_and(|seq| seq >= n)) {
+            p.cut();
+        }
         match ty {
             "session" => {
                 if row
@@ -387,6 +499,10 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                 {
                     continue;
                 }
+                // 截点后的第一段回复另起一条:并进复制来的最后一条回复,收尾折叠时会一起折掉
+                if p.inherited == Some(p.messages.len()) {
+                    p.messages.push(text_msg(Role::Assistant, "", ts));
+                }
                 // 一个 turn 多个 step,每 step 一条 assistant/message;连续 assistant
                 // 行(中间只隔 tool/result)合并成一条,详情页每回合一条助手消息
                 let base = merge_into_last_assistant(
@@ -435,6 +551,24 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
                     append_images_to_message_end(message, parsed.images);
                 }
             }
+            // v2 起的 fork 截点(dsh-session fork.ts 的 buildForkSeed;最后一个带 inherited 的
+            // 才是本会话的——嵌套 fork 里祖先的标记也在复制来的那段里)
+            "session/end-seed" => {
+                if data.get("inherited").and_then(|v| v.as_bool()) == Some(true) {
+                    p.cut();
+                }
+            }
+            // 子代理在第一个回合里记下的身份;上游按截点之后的第一个算
+            "subagent/descriptor" => {
+                if p.label.is_none() {
+                    p.label = data
+                        .get("label")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .map(clean_title_candidate);
+                }
+            }
             "session/title" => {
                 if let Some(t) = data.get("title").and_then(|v| v.as_str()) {
                     let t = t.trim();
@@ -461,6 +595,9 @@ fn parse_dsh_log(path: &Path, decode_images: bool) -> Result<DshParse> {
             }
         }
     }
+    if let Some(cut) = p.inherited {
+        collapse_inherited(&mut p.messages, cut, "session");
+    }
     assign_seq(&mut p.messages);
     Ok(p)
 }
@@ -470,10 +607,12 @@ fn build_meta(r: &SessionFileRef, p: &DshParse) -> SessionMeta {
         Some(h) => (h.id.clone(), h.cwd.clone(), h.created_at),
         None => (r.native_id.clone(), String::new(), 0),
     };
+    // 改过名的(session/title)> 子代理的任务名 > 第一句话
     let title = p
         .title
         .clone()
         .filter(|t| !t.is_empty())
+        .or_else(|| p.label.clone())
         .or_else(|| title_from_messages(&p.messages))
         .unwrap_or_else(|| UNTITLED.to_string());
     SessionMeta {
@@ -509,23 +648,20 @@ impl AgentAdapter for DshAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let mut refs = Vec::new();
-        // 固定两层:<project-dir>/<session-dir>/<日志>,不 walkdir 全递归(会话目录还会
-        // 放别的 artifacts);根目录读不了就本家降级为空,不把整轮扫描炸掉
-        let Ok(projects) = fs::read_dir(&self.root) else {
-            return Ok(refs);
-        };
-        for project in projects.flatten() {
-            if !project.file_type().is_ok_and(|t| t.is_dir()) {
-                continue;
-            }
-            for session in fs::read_dir(project.path()).into_iter().flatten().flatten() {
-                if !session.file_type().is_ok_and(|t| t.is_dir()) {
-                    continue;
-                }
-                refs.extend(session_log(&session.path()));
-            }
-        }
+        // 根不在是空;在却列不出报错,scanner 把这一家这一轮冻结住
+        let dirs = self
+            .session_dirs()
+            .ok_or_else(|| anyhow!("cannot list {}", self.root.display()))?;
+        let refs: Vec<SessionFileRef> = dirs
+            .iter()
+            .filter_map(|dir| Some(self.session_log(dir).ok()??.0))
+            .collect();
+        // 删掉的会话目录不留在缓存里
+        let alive: std::collections::HashSet<&PathBuf> = dirs.iter().collect();
+        self.logs
+            .lock()
+            .unwrap()
+            .retain(|dir, _| alive.contains(dir));
         Ok(refs)
     }
 
@@ -545,7 +681,35 @@ impl AgentAdapter for DshAdapter {
         // 名字先粗筛(session.lock、迁移临时文件等不碰磁盘就不要),再看它是不是这个目录里
         // 被读的那一代
         log_generation(&path.file_name()?.to_string_lossy())?;
-        session_log(path.parent()?).filter(|r| Path::new(&r.file_path) == path)
+        let (r, _) = self.session_log(path.parent()?).ok()??;
+        (Path::new(&r.file_path) == path).then_some(r)
+    }
+
+    fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// 子代理会话首行里的 parentSession。每批监听事件都会问:列目录、每个会话 stat 一次日志,
+    /// 首行读过的用缓存;没入库的会话 scanner 自己会丢掉。目录列不出、某个会话读不出又没读到过,
+    /// 都给 None,库里的关系原样保留
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        let key = |id: &str| session_key(AgentId::Dsh, "", id);
+        let mut links = Vec::new();
+        for dir in self.session_dirs()? {
+            // 读不出又没读到过:不知道,库里的关系这一轮原样保留
+            let Some((_, header)) = self.session_log(&dir).ok()? else {
+                continue;
+            };
+            if let Some(parent) = header.parent.as_deref() {
+                links.push((key(&header.id), key(parent)));
+            }
+        }
+        Some(links)
+    }
+
+    /// 关系写在子会话自己的首行里:多 location 下按子会话的胜出文件认边
+    fn parent_links_in_child(&self) -> bool {
+        true
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
@@ -586,7 +750,7 @@ impl AgentAdapter for DshAdapter {
         } else {
             dir
         };
-        Box::new(Self { root })
+        Box::new(Self::at(root))
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
@@ -596,7 +760,233 @@ impl AgentAdapter for DshAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::log_generation;
+    use super::{log_generation, parse_dsh_log, parse_header, DshAdapter};
+    use crate::adapters::AgentAdapter;
+    use crate::models::{MessageKind, Role};
+
+    /// 只有子代理挂到父会话下;用户自己 fork 出来的会话也写 parentSession,是独立的对话
+    #[test]
+    fn only_subagents_hang_under_their_parent() {
+        let parent = |header: serde_json::Value| parse_header(&header).unwrap().parent;
+        let base = |extra: serde_json::Value| {
+            let mut header =
+                serde_json::json!({"type": "session", "version": 4, "id": "c1", "createdAt": 1});
+            header
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            header
+        };
+        assert_eq!(
+            parent(base(
+                serde_json::json!({"origin": "subagent", "delegationDepth": 1, "parentSession": "p1"})
+            )),
+            Some("p1".to_string())
+        );
+        assert_eq!(
+            parent(base(
+                serde_json::json!({"delegationDepth": 2, "parentSession": "p1"})
+            )),
+            Some("p1".to_string())
+        );
+        assert_eq!(
+            parent(base(
+                serde_json::json!({"isSeeded": true, "delegationDepth": 0, "parentSession": "p1"})
+            )),
+            None
+        );
+        assert_eq!(
+            parent(base(serde_json::json!({"origin": "subagent"}))),
+            None
+        );
+    }
+
+    /// v0 / v1 没有截点标记(那时的 session/end-seed 不带 inherited):截点在首行的 seedLength,
+    /// seq 小于它的事件是复制来的;只认带 parentSession 的
+    #[test]
+    fn a_v0_fork_cuts_at_its_seed_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.jsonl");
+        let lines = [
+            r#"{"type":"session","version":0,"id":"sub0","createdAt":1,"cwd":"/w","origin":"subagent","delegationDepth":1,"parentSession":"p1","seedLength":3}"#,
+            r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
+            r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}],"source":{"model":"parent-model"}},"usage":{"inputTokens":900,"outputTokens":100}}}"#,
+            r#"{"type":"session/title","seq":2,"time":21,"data":{"title":"Parent title"}}"#,
+            r#"{"type":"session/end-seed","seq":3,"time":22,"data":{}}"#,
+            r#"{"type":"user/message","seq":4,"time":30,"data":{"content":[{"type":"text","text":"child task"}],"source":{"kind":"user"}}}"#,
+            r#"{"type":"assistant/message","seq":5,"time":40,"data":{"message":{"content":[{"type":"text","text":"child answer"}],"source":{"model":"child-model"}},"usage":{"inputTokens":40,"outputTokens":2}}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let parsed = parse_dsh_log(&path, false).unwrap();
+        let texts: Vec<(Role, MessageKind, &str)> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.role, m.kind, m.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                (
+                    Role::System,
+                    MessageKind::Meta,
+                    "── 2 messages inherited from the parent session ──"
+                ),
+                (Role::User, MessageKind::Text, "child task"),
+                (Role::Assistant, MessageKind::Text, "child answer"),
+            ]
+        );
+        assert_eq!(parsed.title, None, "父会话的标题不算");
+        assert_eq!(parsed.model.as_deref(), Some("child-model"));
+        assert_eq!(parsed.tokens_used, Some(42));
+        assert_eq!(
+            parsed.header.as_ref().and_then(|h| h.parent.as_deref()),
+            Some("p1")
+        );
+
+        // 没有 parentSession 的 seedLength 不作数(上游迁移同一判法)
+        let header = |extra: &str| {
+            let line = format!(r#"{{"type":"session","version":0,"id":"s","createdAt":1{extra}}}"#);
+            parse_header(&serde_json::from_str(&line).unwrap())
+                .unwrap()
+                .seed_length
+        };
+        assert_eq!(header(r#","seedLength":3"#), None);
+        assert_eq!(header(r#","seedLength":3,"parentSession":"p1""#), Some(3));
+    }
+
+    /// 根目录在却列不出(权限):列表报错、parent_links 给 None——当成空的话,全量扫描会把会话
+    /// 整批删掉、子代理全打回顶层。根不在才是确定没有
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_root_is_unknown_not_empty() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        std::fs::create_dir_all(root.join("--w--").join("s1")).unwrap();
+        let adapter = DshAdapter::at(root.clone());
+        assert_eq!(adapter.parent_links(), Some(Vec::new()));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // root 读得动没有权限的目录,前提不成立就不测
+        if std::fs::read_dir(&root).is_err() {
+            assert!(adapter.list_session_files().is_err());
+            assert_eq!(adapter.parent_links(), None);
+        }
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let missing = DshAdapter::at(dir.path().join("missing"));
+        assert!(missing.list_session_files().unwrap().is_empty());
+        assert_eq!(missing.parent_links(), Some(Vec::new()));
+    }
+
+    /// 日志一时读不出(锁、权限)而它又刚追加过:首行写下就不变,沿用上次读到的,会话不从列表里掉
+    #[cfg(unix)]
+    #[test]
+    fn a_log_that_cannot_be_read_right_now_keeps_its_header() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let session = dir.path().join("--w--").join("s1");
+        std::fs::create_dir_all(&session).unwrap();
+        let log = session.join("session.jsonl");
+        std::fs::write(
+            &log,
+            "{\"type\":\"session\",\"version\":0,\"id\":\"s1\",\"createdAt\":1}\n",
+        )
+        .unwrap();
+        let adapter = DshAdapter::at(dir.path().to_path_buf());
+        assert_eq!(adapter.list_session_files().unwrap().len(), 1);
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"turn/start\",\"seq\":0,\"time\":2,\"data\":{{}}}}"
+        )
+        .unwrap();
+        drop(file);
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let listed = adapter.list_session_files().unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|r| r.native_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["s1"]
+        );
+    }
+
+    /// A 派 B、B 派 C,B 的目录一时读不出:读到过的照旧报全(少了 B→A 的快照会让 scanner 把 C
+    /// 从 A 下面挪到 B 下面),列表里 B 也还在;重启后从没读到过,parent_links 整份给 None
+    #[cfg(unix)]
+    #[test]
+    fn a_session_directory_that_turns_unreadable_keeps_its_place() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("--w--");
+        for (id, parent) in [("a", None), ("b", Some("a")), ("c", Some("b"))] {
+            let session = project.join(id);
+            std::fs::create_dir_all(&session).unwrap();
+            let link = parent.map_or(String::new(), |p| {
+                format!(r#","origin":"subagent","delegationDepth":1,"parentSession":"{p}""#)
+            });
+            let header =
+                format!(r#"{{"type":"session","version":4,"id":"{id}","createdAt":1{link}}}"#);
+            std::fs::write(session.join("session.v4.jsonl"), header + "\n").unwrap();
+        }
+        let warm = DshAdapter::at(dir.path().to_path_buf());
+        let links = |adapter: &DshAdapter| {
+            adapter.parent_links().map(|mut links| {
+                links.sort();
+                links
+            })
+        };
+        let full = links(&warm);
+        assert_eq!(full.as_ref().map(Vec::len), Some(2));
+        assert_eq!(warm.list_session_files().unwrap().len(), 3);
+
+        let b = project.join("b");
+        std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let unreadable = std::fs::read_dir(&b).is_err(); // root 读得动
+        let warm_now = (links(&warm), warm.list_session_files().unwrap().len());
+        let cold = DshAdapter::at(dir.path().to_path_buf());
+        let cold_now = (links(&cold), cold.list_session_files().unwrap().len());
+        std::fs::set_permissions(&b, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if unreadable {
+            assert_eq!(warm_now, (full.clone(), 3));
+            assert_eq!(cold_now, (None, 2));
+        }
+        assert_eq!(links(&cold), full);
+    }
+
+    /// 截点后紧跟着的回复另起一条:并进复制来的最后一条回复,折叠时会被一起折掉
+    #[test]
+    fn a_reply_right_after_the_cut_is_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session.v4.jsonl");
+        let lines = [
+            r#"{"type":"session","version":4,"id":"f1","createdAt":1,"isSeeded":true,"delegationDepth":0,"parentSession":"p1"}"#,
+            r#"{"type":"user/message","seq":0,"time":10,"data":{"content":[{"type":"text","text":"parent question"}],"source":{"kind":"user"}}}"#,
+            r#"{"type":"assistant/message","seq":1,"time":20,"data":{"message":{"content":[{"type":"text","text":"parent answer"}]}}}"#,
+            r#"{"type":"session/end-seed","seq":2,"time":20,"data":{"inherited":true}}"#,
+            r#"{"type":"assistant/message","seq":3,"time":30,"data":{"message":{"content":[{"type":"text","text":"the fork's own answer"}]}}}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let parsed = parse_dsh_log(&path, false).unwrap();
+        let texts: Vec<(Role, MessageKind, &str)> = parsed
+            .messages
+            .iter()
+            .map(|m| (m.role, m.kind, m.text.as_str()))
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                (
+                    Role::System,
+                    MessageKind::Meta,
+                    "── 2 messages inherited from the parent session ──"
+                ),
+                (Role::Assistant, MessageKind::Text, "the fork's own answer"),
+            ]
+        );
+    }
 
     #[test]
     fn log_names_carry_their_format_generation() {
