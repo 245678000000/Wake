@@ -5953,13 +5953,14 @@ impl Workbench {
         cx: &Context<Self>,
     ) -> Stateful<Div> {
         let dark = cx.theme().mode.is_dark();
+        // 上面的导航块自带 SPACE_XS 下边距,这里不再加上边距:Starred 到 Agents 与导航行
+        // 之间同一个间距
         v_flex()
             .id(id)
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
             .px(SIDEBAR_EDGE)
-            .pt(SPACE_XS)
             .pb(SPACE_LG)
             .gap(SPACE_XS)
             .child(group_header(
@@ -7762,13 +7763,16 @@ fn group_header(
     div()
         .id(id)
         .flex_shrink_0()
+        // 与主导航行同高、文字居中:All Sessions / Starred / Agents / Projects 等距(用户
+        // 2026-10-12 "下面的明显更宽"——原先组头上留 12、下留 4,收起时比导航行疏一截)
+        .h(ROW_HEIGHT)
+        .flex()
+        .items_center()
         // chevron 不占 18px 槽位、只按自己的框居中压轴:槽位居中再接统一间距,墨迹到
         // 文字会比导航行空出一截(chevron 墨迹只有约 5px 宽,用户 2026-09-22 "间隔太大");
         // 按框压轴后文字起点比导航行标签左 1.5px,墨迹到文字视觉约 10.9px、与导航行相当
         .pl(axis_inset(NAV_ICON, SIDEBAR_EDGE))
         .pr(SIDEBAR_EDGE)
-        .pt(SPACE_MD)
-        .pb(SPACE_XS)
         .cursor_pointer()
         .active(|s| s.opacity(0.7))
         .on_click(on_click)

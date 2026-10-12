@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - New: Grok Bot conversations show up in Wake, read from what the Grok Bot desktop app keeps on this computer — the latest messages of your recent conversations; in group chats each message shows which bot sent it. A conversation the app no longer keeps stays listed with its last message, and deleting one in Wake only hides it, since the conversation itself lives in Grok Bot's cloud
-- Fix: The Settings sidebar lines up with the main window's: its title sits under the window buttons, and its icons and labels start where the main sidebar's do. The refresh status at the bottom of the main sidebar lines up with the icons above it too
+- Fix: The Settings sidebar lines up with the main window's: its title sits under the window buttons, and its icons and labels start where the main sidebar's do. The refresh status at the bottom of the main sidebar lines up with the icons above it too, and the Agents and Projects headers are spaced like All Sessions and Starred above them
 - Fix: DeepSeek Harness subagent sessions are indexed and listed under the session that started them, titled with their task; a subagent or forked session no longer repeats the conversation it started from, and its tokens are its own. Existing indexes are re-read once after upgrading (#63, thanks @ztcngadget888)
 - Update: Subagent sessions from OpenCode, Kilo Code, ZCode, Antigravity and OpenClaw are listed under the session that started them. ZCode side chats and workflow steps sit under their task too, and ZCode workflow tasks are listed
 - Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
