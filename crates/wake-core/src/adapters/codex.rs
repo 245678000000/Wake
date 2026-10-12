@@ -938,6 +938,7 @@ fn build_meta(r: &SessionFileRef, p: &CodexParse, archived_dir: &Path) -> Sessio
             .file_path
             .starts_with(&archived_dir.to_string_lossy().to_string()),
         source: p.source.clone(),
+        spawned: p.spawn.is_some(),
         favorite: false,
         pinned: false,
     }
@@ -1076,11 +1077,11 @@ impl AgentAdapter for CodexAdapter {
             let Some(row) = by_name.get(path_tail(&r.file_path)) else {
                 continue;
             };
-            // 结构化 source(对象)= 子代理线程。它的 `title` 是 Codex 按首条
-            // 消息自动生成的,而子线程开头是 fork 进来的父线程对话——用它会让
-            // 子会话又变成父会话标题的副本(0.6.6 修掉的那个症状)。这类行只
-            // 认用户手工命名的 `name`,其余交回解析侧合成的任务名
-            let auto_title_is_parents = row
+            // 结构化 source(对象)= 子代理线程(列得出来的只剩 spawn_agent 派的,内部
+            // 线程枚举时就滤掉了)。它的 `title` 是 Codex 按首条消息自动生成的,而子线程
+            // 开头是 fork 进来的父线程对话——用它会让子会话又变成父会话标题的副本(0.6.6
+            // 修掉的那个症状)。这类行只认用户手工命名的 `name`,其余交回解析侧合成的任务名
+            let subagent_thread = row
                 .source
                 .as_deref()
                 .is_some_and(|source| source.trim_start().starts_with('{'));
@@ -1090,7 +1091,7 @@ impl AgentAdapter for CodexAdapter {
                 .filter(|n| !n.trim().is_empty())
                 .map(String::from)
                 .or_else(|| {
-                    if auto_title_is_parents {
+                    if subagent_thread {
                         return None;
                     }
                     // Codex 自家 state DB 会把注入文本存进 title,同样要过滤
@@ -1126,6 +1127,7 @@ impl AgentAdapter for CodexAdapter {
                     tokens_used: row.tokens_used,
                     archived: row.archived,
                     source: row.source.clone(),
+                    spawned: subagent_thread,
                     favorite: false,
                     pinned: false,
                 },

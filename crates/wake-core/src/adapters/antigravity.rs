@@ -178,6 +178,7 @@ fn base_meta(r: &SessionFileRef) -> SessionMeta {
         tokens_used: None,
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }
@@ -198,6 +199,7 @@ fn card_meta(r: &SessionFileRef, row: &AgRow) -> SessionMeta {
         updated_at: ts,
         message_count: row.step_count,
         source: surface(&row.app),
+        spawned: row.parent.is_some(),
         ..base_meta(r)
     }
 }
@@ -254,6 +256,7 @@ fn transcript(
         message_count: t.messages.len() as i64,
         model: t.model,
         source: surface(app),
+        spawned: row.is_some_and(|row| row.parent.is_some()),
         ..base_meta(r)
     };
     Ok((meta, t.messages, t.unknown_lines))

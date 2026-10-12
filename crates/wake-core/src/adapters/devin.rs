@@ -207,6 +207,7 @@ fn build_meta(
         tokens_used: (tokens > 0).then_some(tokens),
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

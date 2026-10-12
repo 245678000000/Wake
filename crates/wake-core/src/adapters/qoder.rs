@@ -614,6 +614,7 @@ fn build_meta(r: &SessionFileRef, parsed: &QoderParse) -> SessionMeta {
         tokens_used: (parsed.tokens_used > 0).then_some(parsed.tokens_used),
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

@@ -686,6 +686,7 @@ mod tests {
                 tokens_used: None,
                 archived,
                 source: None,
+                spawned: false,
                 favorite: false,
                 pinned: false,
             };

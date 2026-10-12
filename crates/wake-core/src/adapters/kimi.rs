@@ -609,6 +609,7 @@ fn build_meta(
         tokens_used: None,
         archived: state.archived,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

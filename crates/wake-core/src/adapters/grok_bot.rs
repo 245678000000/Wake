@@ -412,6 +412,7 @@ fn base_meta(r: &SessionFileRef) -> SessionMeta {
         tokens_used: None,
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

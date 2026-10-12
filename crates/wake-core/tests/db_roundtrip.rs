@@ -1236,6 +1236,76 @@ fn insights_snapshot_and_streaks() {
     assert_eq!((d.current_streak, d.longest_streak), (0, 3));
 }
 
+/// agent 派出去的子会话(sessions.spawned)不算 Insights 里的会话,也不算提问:开头那句"用户
+/// 消息"是派活的 agent 写的。token 照算——那是模型实际花掉的
+#[test]
+fn insights_leave_out_spawned_sessions() {
+    let (_dir, store) = temp_store();
+    let turn = [
+        unit(0, Role::User, "do the thing"),
+        unit(1, Role::Assistant, "done"),
+    ];
+    let codex = |key: &str, model: &str, tokens: i64, spawned: bool| SessionMeta {
+        agent: AgentId::Codex,
+        model: Some(model.into()),
+        tokens_used: Some(tokens),
+        spawned,
+        ..meta(key, key)
+    };
+    let own = codex("codex:own", "gpt-5", 100, false);
+    let mut child = codex("codex:child", "gpt-5-mini", 40, true);
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 13).unwrap();
+
+    // 只剩子会话(父会话归档了、自定义目录里只有子线程)也有可看的:会话数是 0,token 照列
+    store
+        .write_session(&child, child.updated_at, &turn)
+        .unwrap();
+    let d = store.insights(today).unwrap();
+    assert_eq!((d.sessions, d.prompts, d.tokens), (0, 0, 40));
+    assert!(d.has_activity());
+
+    store.write_session(&own, own.updated_at, &turn).unwrap();
+    let d = store.insights(today).unwrap();
+    assert_eq!((d.sessions, d.prompts, d.tokens), (1, 1, 140));
+    assert_eq!(d.daily.iter().map(|(_, n)| n).sum::<i64>(), 1);
+    assert_eq!(d.daily_sessions.iter().map(|(_, n)| n).sum::<i64>(), 1);
+    assert_eq!(
+        d.agents,
+        vec![UsageTally {
+            name: "codex".into(),
+            sessions: 1,
+            prompts: 1,
+            tokens: 140,
+        }]
+    );
+    // 只给子代理用过的模型:会话与提问都是 0,token 照列
+    assert_eq!(
+        d.models,
+        vec![
+            UsageTally {
+                name: "gpt-5".into(),
+                sessions: 1,
+                prompts: 1,
+                tokens: 100,
+            },
+            UsageTally {
+                name: "gpt-5-mini".into(),
+                sessions: 0,
+                prompts: 0,
+                tokens: 40,
+            },
+        ]
+    );
+
+    // 重写时标记跟着改(判据变了、FTS_FORMAT 换代重解析)
+    child.spawned = false;
+    store
+        .write_session(&child, child.updated_at, &turn)
+        .unwrap();
+    let d = store.insights(today).unwrap();
+    assert_eq!((d.sessions, d.prompts), (2, 2));
+}
+
 /// 老库(无 host 列)打开即迁移;既有行落 ''(本地域),写入远程行后
 /// host_counts 只统计非空 host。remote_hosts 配置与同步状态可往返。
 #[test]

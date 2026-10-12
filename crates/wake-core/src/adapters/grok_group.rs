@@ -41,18 +41,25 @@ pub fn load_group_ctx(sessions_root: &Path, grok_home: &Path) -> Arc<GroupCtx> {
 /// 扁平到 root，否则局部快照提前压平会丢失跨 location 的后半段父链。
 pub fn parent_links(ctx: &GroupCtx) -> Vec<(String, String)> {
     ctx.parents
-        .iter()
-        .filter_map(|(child_id, parent)| {
-            if parent.parent_id.is_empty() || parent.parent_id == *child_id {
-                None
-            } else {
-                Some((
-                    format!("grok:{child_id}"),
-                    format!("grok:{}", parent.parent_id),
-                ))
-            }
+        .keys()
+        .filter_map(|child_id| {
+            let parent_id = direct_parent(ctx, child_id)?;
+            Some((format!("grok:{child_id}"), format!("grok:{parent_id}")))
         })
         .collect()
+}
+
+/// 这条会话是不是某个会话 `subagents/` 下记着的子代理
+pub fn is_subagent(ctx: &GroupCtx, id: &str) -> bool {
+    direct_parent(ctx, id).is_some()
+}
+
+/// 登记表里这条会话的直接父会话(指回自己的不算)
+fn direct_parent<'a>(ctx: &'a GroupCtx, id: &str) -> Option<&'a str> {
+    ctx.parents
+        .get(id)
+        .map(|parent| parent.parent_id.as_str())
+        .filter(|parent_id| !parent_id.is_empty() && *parent_id != id)
 }
 
 pub fn canonical_project(

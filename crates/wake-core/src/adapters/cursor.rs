@@ -81,6 +81,8 @@ impl CursorAdapter {
             tokens_used: None,
             archived: false,
             source: None,
+            // 子代理的转录在父会话目录的 subagents/ 里,不作为顶层转录列出;子代理会话由 IDE 库那一路标
+            spawned: false,
             favorite: false,
             pinned: false,
         }

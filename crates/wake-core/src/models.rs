@@ -281,6 +281,13 @@ pub struct SessionMeta {
     pub tokens_used: Option<i64>,
     pub archived: bool,
     pub source: Option<String>,
+    /// agent 派出去的子会话(子代理、工作流里的一步):开头那句"用户消息"是派活的 agent 写的,
+    /// Insights 的提问数与会话数不算它(token 照算)。用户自己分出去的分支 / 分叉、侧聊不是。
+    /// 由各家解析时填,扫描写进 sessions.spawned;共享的会话行读取(SESSION_COLS)不取它——只读
+    /// 旁路也走那套 SELECT,取了就得把 NEWEST_COLUMN 改指它、对还没被 GUI 迁移过的库拒开。所以
+    /// 从库里读回来的 SessionMeta 这一位恒为 false,别拿读回来的 meta 写回库
+    #[serde(default)]
+    pub spawned: bool,
     // app 自有状态(user_data 表)
     pub favorite: bool,
     pub pinned: bool,
@@ -541,7 +548,7 @@ pub struct InsightsData {
     pub weekday: [i64; 7],
     /// 月份分布(1–12 月聚合到 12 桶,跨年叠加)
     pub monthly: [i64; 12],
-    /// 每家 agent 的三个度量,按会话数降序;UI 切换度量时自行重排
+    /// 每家 agent 的三个度量,按会话数(不含子会话)降序;UI 切换度量时自行重排
     pub agents: Vec<UsageTally>,
     /// 全量项目——不截断,top-N 由 UI 按当前度量排序后取(SQL 里加 LIMIT
     /// 会让 Prompts/Tokens 榜漏掉会话数排不进前列的项)
@@ -589,6 +596,12 @@ impl TrendSeries {
 pub const TREND_WEEKS: usize = 53;
 
 impl InsightsData {
+    /// 有没有可看的:任何一条未归档的会话,agent 派出去的子会话也算——会话数不算它们,
+    /// 它们的 token 与榜单照样要显示,不能拿 `sessions > 0` 判(榜单每家 agent 一行,含子会话)
+    pub fn has_activity(&self) -> bool {
+        !self.agents.is_empty()
+    }
+
     /// 活跃天数 = daily 长度(派生不另存,免第二个写入点失步)
     pub fn active_days(&self) -> i64 {
         self.daily.len() as i64

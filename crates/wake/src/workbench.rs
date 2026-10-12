@@ -1071,6 +1071,7 @@ mod session_group_tests {
             tokens_used: None,
             archived: false,
             source: None,
+            spawned: false,
             favorite: false,
             pinned,
         }
@@ -6662,7 +6663,7 @@ impl Workbench {
         let theme = cx.theme();
         // 副标题只说 "Since {首会话月份}"(用户定稿);拿不到时间时回落默认句
         let subtitle: SharedString = match &self.insights {
-            Some(d) if d.sessions > 0 => match month_year(d.first_ts) {
+            Some(d) if d.has_activity() => match month_year(d.first_ts) {
                 my if my.is_empty() => t("Your coding agent activity").into(),
                 my => crate::tf!("Since {}", my).into(),
             },
@@ -6670,7 +6671,7 @@ impl Workbench {
         };
 
         let body: AnyElement = match &self.insights {
-            Some(d) if d.sessions > 0 => self.render_insights_content(d, cx),
+            Some(d) if d.has_activity() => self.render_insights_content(d, cx),
             _ if self.insights_loading => div()
                 .flex_1()
                 .flex()
@@ -6914,8 +6915,9 @@ impl Workbench {
         );
         let mut sorted: Vec<&UsageTally> = rows
             .iter()
-            // Tokens 档只列报了用量的组:空条不是"用了 0",是没数据
-            .filter(|u| metric != Tokens || u.tokens > 0)
+            // 只列这一档有数的组:Tokens 的空条不是"用了 0",是没数据;Sessions 是 0 的组
+            // 只有 agent 派出去的子会话(不算会话,token 照算)
+            .filter(|u| metric.value(u) > 0)
             .collect();
         // stable sort:平局保持 SQL 的 sessions desc + 名称序
         sorted.sort_by_key(|u| std::cmp::Reverse(metric.value(u)));

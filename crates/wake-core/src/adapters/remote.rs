@@ -238,6 +238,10 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.children_outlive_parent()
     }
 
+    fn linked_children_are_spawned(&self) -> bool {
+        self.inner.linked_children_are_spawned()
+    }
+
     fn manages_claims(&self) -> bool {
         self.inner.manages_claims()
     }

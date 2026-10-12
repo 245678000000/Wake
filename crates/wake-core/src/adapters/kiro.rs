@@ -150,6 +150,7 @@ fn build_meta(r: &SessionFileRef, side: &Sidecar, messages: &[TranscriptMessage]
         tokens_used: None,
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

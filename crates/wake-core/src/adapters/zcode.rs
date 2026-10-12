@@ -118,6 +118,9 @@ struct ZcRow {
     content_len: i64,
     /// 挂在哪个会话下(`CHILD_TYPES`;fork 也带 parent_id,但不挂)
     parent: Option<String>,
+    /// agent 派出去的:子代理、工作流的子会话(辅助对话不算,里面的话是用户打的);老库没有
+    /// task_type 时挂着的都算
+    spawned: bool,
 }
 
 /// ALTER 追加的列各自在不在(初始 schema 的列不用探)
@@ -322,6 +325,7 @@ fn build_meta(r: &SessionFileRef, row: &ZcRow, parsed: &Parsed) -> SessionMeta {
         archived: row.archived,
         // 列出的都是桌面端里的任务或任务里的会话,没有可打的 via 徽章
         source: None,
+        spawned: row.spawned,
         favorite: false,
         pinned: false,
     }
@@ -385,6 +389,14 @@ fn query_rows(
     let rows = stmt.query_map([id], |r| {
         let task_type = r.get::<_, Option<String>>(9)?;
         let side_chat = task_type.as_deref() == Some("selection_side_chat");
+        let parent = r
+            .get::<_, Option<String>>(8)?
+            .filter(|parent| !parent.is_empty())
+            .filter(|_| {
+                task_type
+                    .as_deref()
+                    .is_none_or(|t| CHILD_TYPES.contains(&t))
+            });
         Ok(ZcRow {
             id: r.get(0)?,
             directory: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
@@ -398,14 +410,8 @@ fn query_rows(
             updated_ms: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             archived: r.get::<_, Option<i64>>(6)?.is_some(),
             content_len: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
-            parent: r
-                .get::<_, Option<String>>(8)?
-                .filter(|parent| !parent.is_empty())
-                .filter(|_| {
-                    task_type
-                        .as_deref()
-                        .is_none_or(|t| CHILD_TYPES.contains(&t))
-                }),
+            spawned: parent.is_some() && !side_chat,
+            parent,
         })
     })?;
     rows.collect()

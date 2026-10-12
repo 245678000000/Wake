@@ -173,6 +173,16 @@ fn sorted_links(adapter: &dyn AgentAdapter) -> Vec<(String, String)> {
     links
 }
 
+/// 列出来的会话里哪些标成了 agent 派出去的(`SessionMeta.spawned`),按 id 排序
+fn spawned_ids(adapter: &dyn AgentAdapter) -> Vec<String> {
+    let mut refs = adapter.list_session_files().unwrap();
+    refs.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+    refs.iter()
+        .filter(|r| adapter.parse_session(r).unwrap().meta.spawned)
+        .map(|r| r.native_id.clone())
+        .collect()
+}
+
 /// 一条父子关系:(子会话 key, 父会话 key)
 fn edge(child: &str, parent: &str) -> (String, String) {
     (child.to_string(), parent.to_string())
@@ -811,6 +821,10 @@ fn codex_spawned_subagent_keeps_only_its_own_turns() {
         parsed.meta.title, "review_issue17",
         "标题取 spawn_agent 的任务名:子线程自己没有用户消息"
     );
+    // Insights 不把 agent 派出去的子会话算成一场会话
+    assert!(parsed.meta.spawned);
+    let parent = refs.iter().find(|r| r.native_id == parent_id).unwrap();
+    assert!(!adapter.parse_session(parent).unwrap().meta.spawned);
 
     let transcript = adapter.parse_transcript(child).unwrap();
     let visible: Vec<&TranscriptMessage> = transcript
@@ -1024,9 +1038,13 @@ fn codex_spawn_title_survives_codex_auto_title() {
     let refs = adapter.list_session_files().unwrap();
     let child = refs.iter().find(|r| r.native_id == child_id).unwrap();
     let quick = adapter.quick_meta(&refs).expect("state db readable");
+    // quick 先入库的那一刻也要标对:结构化 source 只剩子代理线程
+    assert!(quick.get(&child.file_path).unwrap().spawned);
+    assert!(quick.values().any(|m| m.id != child_id && !m.spawned));
     let parsed = adapter.parse_session(child).unwrap();
     let merged = adapter.merge_quick_meta(parsed.meta, quick.get(&child.file_path).unwrap());
     assert_eq!(merged.title, "review_issue17");
+    assert!(merged.spawned);
 
     // 用户手工命名(name 列)仍然说了算
     let conn = rusqlite::Connection::open(home.path().join("state_5.sqlite")).unwrap();
@@ -1471,6 +1489,10 @@ fn cursor_ide_parse_contract() {
             "cursor:cide-0001".to_string()
         )]
     );
+    // 子代理是 agent 派出去的,Insights 不算它
+    assert!(!s.meta.spawned);
+    let r4 = db_ref(AgentId::Cursor, &env.cursor_ide_db, "cide-0004");
+    assert!(adapter.parse_session(&r4).unwrap().meta.spawned);
 }
 
 #[test]
@@ -1997,6 +2019,34 @@ fn grok_parse_contract() {
     );
 }
 
+/// 主会话 `subagents/` 下登记过的子代理会话是 agent 派出去的,Insights 不算它
+#[test]
+fn grok_registered_subagents_are_spawned() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    common::copy_tree(&fixture("grok"), home.path());
+    let project = home
+        .path()
+        .join("sessions")
+        .join("%2FUsers%2Ftester%2FGithub%2Fwakefx");
+    let child = project.join("aaaaaaaa-aaaa-bbbb-cccc-0000000000aa");
+    fs::create_dir_all(&child).unwrap();
+    fs::copy(
+        project
+            .join("77777777-aaaa-bbbb-cccc-000000000007")
+            .join("updates.jsonl"),
+        child.join("updates.jsonl"),
+    )
+    .unwrap();
+
+    let adapter = GrokAdapter::new().with_custom_root(home.path().to_path_buf());
+    adapter.begin_scan();
+    assert_eq!(
+        spawned_ids(adapter.as_ref()),
+        ["aaaaaaaa-aaaa-bbbb-cccc-0000000000aa"]
+    );
+}
+
 /// 没发过消息就关掉的 Grok 会话只剩插件钩子之类的流水,不列(PR #55)。判据与解析器是
 /// 同一个分类:只有思考、只有工具调用的会话照列,列出来的都解析得出消息,空壳一条都没有。
 /// 钩子行的真实格式还没见过样本,这里只要它不是会起消息的更新;current_mode_update 是
@@ -2350,6 +2400,10 @@ fn antigravity_parse_contract() {
     assert!(t.mainline[0].text.contains("encrypted"));
     assert_eq!(s.units.len(), 1);
     assert!(s.units[0].text.contains("QR overlay polish"));
+    // 子会话是 agent 派出去的,Insights 不算它
+    assert!(!s.meta.spawned);
+    let r2 = db_ref(AgentId::Antigravity, &env.antigravity_db, "ag-0002");
+    assert!(adapter.parse_session(&r2).unwrap().meta.spawned);
 }
 
 /// 新版本写下的明文转录(PR #52 整理的格式,合成 fixture):转录与索引卡片都如实列出,
@@ -2439,6 +2493,12 @@ fn antigravity_transcripts_replace_index_cards() {
     // 同一个 id 的卡片与转录同时出现时,转录胜出
     assert_eq!(adapter.dedup_rank(&refs[1].file_path), 0);
     assert_eq!(adapter.dedup_rank(&refs[0].file_path), 1);
+    // 子会话的转录与卡片都标成派出去的;没进索引的转录(ag-4)认不出,按用户的算
+    let spawned = |ix: usize| adapter.parse_session(&refs[ix]).unwrap().meta.spawned;
+    assert_eq!(
+        (0..refs.len()).map(spawned).collect::<Vec<_>>(),
+        vec![false, false, false, true, true, false]
+    );
 
     let r = &refs[1];
     let s = adapter.parse_session(r).expect("ag-1 parse_session");
@@ -2819,6 +2879,7 @@ fn dsh_parse_contract() {
 
     assert_eq!(s.meta.title, "QR scan dependency fix"); // session/title 事件 last-wins
     assert_eq!(s.meta.key, "dsh:dsh-e2e4-0001");
+    assert!(!s.meta.spawned);
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx"); // header cwd,不反推目录名
     assert_eq!(s.meta.model.as_deref(), Some("deepseek-chat-v4")); // assistant source.model
                                                                    // usage 是"one model call"的账,按调用累加(1480 + 1560 + 空载体 400)。
@@ -2882,6 +2943,7 @@ fn dsh_subagent_keeps_only_its_own_turns() {
         .parse_transcript(&r)
         .expect("dsh subagent parse_transcript");
     assert_eq!(s.meta.key, "dsh:dsh-sub-0002");
+    assert!(s.meta.spawned, "委派出去的子代理会话");
     assert_eq!(s.meta.title, "Audit the scanner effects"); // 复制来的 session/title 不算
     assert_eq!(s.meta.model.as_deref(), Some("deepseek-v4-flash"));
     assert_eq!(s.meta.tokens_used, Some(1820)); // 复制来的 1480 是父会话的
@@ -3367,6 +3429,31 @@ fn write_craft_session(workspace: &Path, session: &str, header: serde_json::Valu
     fs::write(dir.join("session.jsonl"), format!("{header}\n{line}\n")).unwrap();
 }
 
+/// Tasks Conductor 跑出来的子节点(首行带 taskRunId / taskNodeId)是 agent 派出去的,Insights
+/// 不算。只带 parentSessionId 的子任务分不出是看板上手建的(提示词是用户写的标题)还是 agent
+/// 用 spawn_session 派的——两条路落盘一模一样——照用户的算
+#[test]
+fn craft_conductor_nodes_are_spawned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("notes");
+    write_craft_session(&ws, "260901-task", serde_json::json!({"taskSlug": "ship"}));
+    write_craft_session(
+        &ws,
+        "260902-node",
+        serde_json::json!({
+            "parentSessionId": "260901-task", "taskSlug": "ship",
+            "taskRunId": "run_1", "taskNodeId": "build"
+        }),
+    );
+    write_craft_session(
+        &ws,
+        "260903-subtask",
+        serde_json::json!({"parentSessionId": "260901-task"}),
+    );
+    let adapter = CraftAdapter::new().with_custom_root(ws);
+    assert_eq!(spawned_ids(adapter.as_ref()), ["notes/260902-node"]);
+}
+
 #[test]
 fn craft_keys_are_namespaced_by_the_workspace_id() {
     // 会话 id 只在工作区内唯一:两个同名文件夹的工作区同一天各生成一条同名会话,key 不能撞
@@ -3678,6 +3765,16 @@ fn zcode_parse_contract() {
     assert_eq!(s9.meta.model.as_deref(), Some("GLM-5.3-Flash"));
     assert_eq!(s9.meta.message_count, 2);
     assert!(s9.units.iter().all(|u| !u.text.contains("二维码")));
+
+    // Insights 不算 agent 派出去的子会话:子代理与工作流的一步算;fork 与辅助对话里的话
+    // 是用户自己打的,不算
+    let spawned = |id: &str| {
+        let r = db_ref(AgentId::Zcode, &env.zcode_db, id);
+        adapter.parse_session(&r).unwrap().meta.spawned
+    };
+    assert!(spawned("zc-0005") && spawned("zc-0012"));
+    assert!(!spawned("zc-0001") && !spawned("zc-0008") && !spawned("zc-0009"));
+    assert!(!spawned("zc-0011"), "工作流的父任务是用户开的");
 }
 
 /// 老库缺列(title_source / task_type / sequence 是 ALTER 追加的;parent_id 在
@@ -3723,6 +3820,9 @@ fn zcode_degrades_on_old_schema_and_missing_task_index() {
     assert_eq!(s.meta.project_path, "/work/old");
     assert_eq!(s.meta.message_count, 1);
     assert!(!s.meta.archived);
+    assert!(!s.meta.spawned);
+    // 分不出类型时挂着的都算派出去的
+    assert!(adapter.parse_session(&refs[1]).unwrap().meta.spawned);
 }
 
 /// 库在却读不出(不是 SQLite、表结构对不上)时列表报错,父子关系给 None:scanner 冻结这一家
@@ -3758,6 +3858,43 @@ fn unreadable_session_databases_freeze_instead_of_emptying() {
     let openclaw = OpenclawAdapter::new().with_custom_root(agents);
     assert!(openclaw.list_session_files().is_err());
     assert_eq!(openclaw.parent_links(), None);
+}
+
+/// 只有 agent 派生的子会话不算 Insights 里的会话:sessions_spawn 起的可见子会话只记
+/// parentSessionKey,靠 spawnDepth 认出来;面板上新建的子会话(spawnDepth 0)是用户自己的
+/// 对话,照样挂在父会话下,但算数
+#[test]
+fn openclaw_spawn_depth_marks_visible_spawns() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = openclaw_copy(tmp.path());
+    rusqlite::Connection::open(main.join("agent").join("openclaw-agent.sqlite"))
+        .unwrap()
+        .execute_batch(
+            r#"UPDATE session_windows SET spawned_by = NULL WHERE session_id = 'claw-0002';
+               UPDATE session_nodes SET entry_json =
+                   '{"sessionId":"claw-0002","updatedAt":1786266100000,"parentSessionKey":"agent:main:main","spawnDepth":1}'
+                   WHERE session_key = 'agent:main:subagent:sub1';"#,
+        )
+        .unwrap();
+    let index = main.join("sessions").join("sessions.json");
+    let dashboard = fs::read_to_string(&index).unwrap().replace(
+        r#""spawnedBy":"agent:main:main""#,
+        r#""parentSessionKey":"agent:main:main""#,
+    );
+    fs::write(&index, dashboard).unwrap();
+
+    let adapter = OpenclawAdapter::new().with_custom_root(tmp.path().join("agents"));
+    assert_eq!(
+        spawned_ids(adapter.as_ref()),
+        vec!["claw-0002", "claw-0004", "claw-0005"]
+    );
+    let links = sorted_links(adapter.as_ref());
+    assert!(links.contains(&edge("openclaw:claw-0002", "openclaw:claw-0001")));
+    assert!(links.contains(&edge(
+        "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
+        "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017"
+    )));
 }
 
 /// OpenClaw 的检入 fixture(旧版 jsonl + 现版库)拷进临时目录,返回 `agents/main`;要改文件的
@@ -4251,7 +4388,11 @@ fn kilo_parse_contract() {
     assert_eq!(p.meta.tokens_used, Some(150));
     assert_eq!(p.meta.source, None, "opencode2 徽章是 OpenCode 自己的");
     assert!(!p.meta.archived);
+    assert!(!p.meta.spawned);
     assert_eq!(p.unknown_line_count, 0, "agent / retry 是已知的 part");
+    // 子代理会话不算 Insights 里的会话与提问
+    let r3 = db_ref(AgentId::Kilo, &env.kilo_db, "ses_kilo_0003");
+    assert!(kilo.parse_session(&r3).unwrap().meta.spawned);
     let t = kilo.parse_transcript(&r1).unwrap();
     assert_eq!(
         roles_kinds(&t.mainline),
@@ -4479,6 +4620,16 @@ fn kilo_legacy_parse_contract() {
         links.contains(&(legacy_task_key(KILO_T3), legacy_task_key(KILO_T2))),
         "{links:?}"
     );
+    // 子任务是 agent 用 new_task 派出去的,Insights 不算它
+    let spawned = |id: &str| {
+        legacy
+            .parse_session(&kilo_task_ref(&env.kilo_tasks, id))
+            .unwrap()
+            .meta
+            .spawned
+    };
+    assert!(spawned(KILO_T3));
+    assert!(!spawned(KILO_T2));
 
     // 装在 Cursor 里的旧版:via 写的是 Cursor
     let r7 = kilo_task_ref(&env.kilo_cursor_tasks, "cursor-task-0007");
@@ -4816,6 +4967,38 @@ fn hermes_legacy_schema_still_parses() {
     assert_eq!(s.meta.title, "老库里的会话");
     assert_eq!(s.meta.tokens_used, Some(15));
     assert_eq!(s.meta.message_count, 2);
+    assert!(!s.meta.spawned, "没有 model_config 列就认不出委派");
+}
+
+/// 委派出去的子代理(model_config 带 `_delegate_from`,上游 delegate_tool 写)是 agent 派出去的,
+/// Insights 不算;/branch 带的是 `_branched_from`,压缩续段只有 parent_session_id,都是用户自己
+/// 的对话。model_config 写坏了也不能让整家读不出来
+#[test]
+fn hermes_delegated_sessions_are_spawned() {
+    setup();
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    common::build_hermes_db(&db);
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        r#"
+        UPDATE sessions SET model_config = '{"_branched_from":"hs-0001"}' WHERE id = 'hs-0005';
+        INSERT INTO sessions (id, source, model, model_config, started_at, ended_at,
+                              message_count, parent_session_id) VALUES
+            ('hs-0006', 'cli', 'gpt-5.4', '{"_delegate_from":"hs-0001"}', 1786176400.0,
+             1786176401.0, 1, 'hs-0001'),
+            ('hs-0007', 'cli', 'gpt-5.4', 'not json', 1786176500.0, 1786176501.0, 1, NULL);
+        INSERT INTO messages (session_id, role, content, timestamp) VALUES
+            ('hs-0006', 'user', 'delegated by hs-0001', 1786176400.5),
+            ('hs-0007', 'user', 'model_config is broken', 1786176500.5);
+        "#,
+    )
+    .unwrap();
+    drop(conn);
+
+    let adapter = HermesAdapter::new().with_custom_root(db);
+    assert_eq!(spawned_ids(adapter.as_ref()), ["hs-0006"]);
+    assert!(sorted_links(adapter.as_ref()).contains(&edge("hermes:hs-0006", "hermes:hs-0001")));
 }
 
 #[test]
@@ -4857,6 +5040,16 @@ fn openclaw_parse_contract() {
                 "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
                 "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017"
             ),
+        ]
+    );
+    // 派生出来的子代理(库里窗口的 spawned_by、旧版条目的 spawnedBy)Insights 不算
+    assert_eq!(
+        spawned_ids(&adapter),
+        vec![
+            "claw-0002",
+            "claw-0004",
+            "claw-0005",
+            "dddddddd-aaaa-bbbb-cccc-000000000018"
         ]
     );
 
@@ -4987,11 +5180,8 @@ fn openclaw_parse_contract() {
 
 fn mk_meta(agent: AgentId, key: &str, id: &str, title: &str, source: Option<&str>) -> SessionMeta {
     SessionMeta {
-        host: String::new(),
-        key: key.to_string(),
         id: id.to_string(),
         agent,
-        title: title.to_string(),
         project_path: "/Users/tester/Github/wakefx".to_string(),
         project_name: "wakefx".to_string(),
         file_path: "/dev/null".to_string(),
@@ -4999,13 +5189,8 @@ fn mk_meta(agent: AgentId, key: &str, id: &str, title: &str, source: Option<&str
         updated_at: 2,
         message_count: 0,
         size_bytes: 0,
-        git_branch: None,
-        model: None,
-        tokens_used: None,
-        archived: false,
         source: source.map(String::from),
-        favorite: false,
-        pinned: false,
+        ..common::meta(key, title)
     }
 }
 

@@ -574,6 +574,7 @@ fn build_meta(r: &SessionFileRef, p: &CraftParse) -> SessionMeta {
             .get("triggeredBy")
             .is_some_and(|t| t.is_object())
             .then(|| "automation".to_string()),
+        spawned: str_at(h, "taskRunId").is_some() || str_at(h, "taskNodeId").is_some(),
         favorite: false,
         pinned: false,
     }

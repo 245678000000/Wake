@@ -172,6 +172,7 @@ impl OpenclawAdapter {
             channel: None,
             created_ms: 0,
             updated_ms: norm_ms(v.get("updatedAt").and_then(Value::as_i64).unwrap_or(0)),
+            spawned: entry_spawned(v),
         }
     }
 
@@ -217,6 +218,7 @@ impl OpenclawAdapter {
             archived: false,
             // 频道即启动面(telegram/discord/webchat…);cli/空不打徽章
             source: hint.channel.clone().filter(|c| !c.is_empty() && c != "cli"),
+            spawned: hint.spawned,
             favorite: false,
             pinned: false,
         }
@@ -311,6 +313,19 @@ struct RowHint {
     channel: Option<String>,
     created_ms: i64,
     updated_ms: i64,
+    /// agent 派生出来的子会话(`entry_spawned`);面板上新建的子会话、频道里的话题只记了
+    /// parentSessionKey,那是用户自己的对话
+    spawned: bool,
+}
+
+/// 条目是 agent 派生出来的:spawn 时写 spawnedBy / spawnedBySessionId;sessions_spawn 起的
+/// 可见子会话只记 parentSessionKey,但 spawnDepth 一定 ≥ 1——上游的派生层级只由 spawn 声明,
+/// 面板新建、fork、频道话题一律是 0
+fn entry_spawned(entry: &Value) -> bool {
+    ["spawnedBy", "spawnedBySessionId"]
+        .iter()
+        .any(|key| text_at(entry, key).is_some())
+        || entry.get("spawnDepth").and_then(Value::as_i64).unwrap_or(0) > 0
 }
 
 /// 子会话指向父会话的线索
@@ -391,7 +406,9 @@ fn query_rows(conn: &rusqlite::Connection) -> Option<Vec<ClawRow>> {
                 r.get::<_, Option<String>>(ix)
                     .map(|key| key.filter(|key| !key.is_empty()))
             };
-            let own_key = key_at(1)?.or(key_at(16)?);
+            let spawned_by = key_at(1)?;
+            let spawned = spawned_by.is_some() || (is_current && entry_spawned(&entry));
+            let own_key = spawned_by.or(key_at(16)?);
             Ok(ClawRow {
                 session_key: r.get(15)?,
                 parent: ParentRef::of(is_current.then_some(&entry), own_key),
@@ -407,6 +424,7 @@ fn query_rows(conn: &rusqlite::Connection) -> Option<Vec<ClawRow>> {
                         .into_iter()
                         .max()
                         .unwrap_or(0),
+                    spawned,
                 },
                 session_id,
             })

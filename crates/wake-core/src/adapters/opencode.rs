@@ -345,6 +345,7 @@ impl OpencodeAdapter {
             },
             archived: row.archived,
             source: self.flavor.marks_preview.then(|| row.source(db)).flatten(),
+            spawned: row.parent.is_some(),
             favorite: false,
             pinned: false,
         }

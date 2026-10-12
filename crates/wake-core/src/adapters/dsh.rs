@@ -140,6 +140,8 @@ struct DshHeader {
     id: String,
     cwd: String,
     created_at: i64,
+    /// 委派出去的子代理会话(origin subagent / delegationDepth > 0)
+    subagent: bool,
     /// 派出这个子代理会话的会话 id(首行的 parentSession)。用户自己 fork 出来的会话也写
     /// parentSession,但那是一段独立的对话——dsh 自己也只把子代理当成父会话的孩子——不挂
     parent: Option<String>,
@@ -176,6 +178,7 @@ fn parse_header(v: &serde_json::Value) -> Option<DshHeader> {
         created_at: v.get("createdAt").and_then(|t| t.as_i64()).unwrap_or(0),
         seeded: true_at(v, "isSeeded") || seed_length.is_some(),
         id,
+        subagent,
         parent,
         seed_length,
     })
@@ -635,6 +638,7 @@ fn build_meta(r: &SessionFileRef, p: &DshParse) -> SessionMeta {
         tokens_used: p.tokens_used,
         archived: false,
         source: None,
+        spawned: p.header.as_ref().is_some_and(|h| h.subagent),
         favorite: false,
         pinned: false,
     }
@@ -803,6 +807,14 @@ mod tests {
             None
         );
         assert_eq!(parent(r#","origin":"subagent""#), None);
+
+        // Insights 不算子会话的提问:子代理是 agent 派出去的,用户 fork 的仍是用户自己的对话
+        let spawned = |extra: &str| header(extra).subagent;
+        assert!(spawned(r#","origin":"subagent""#));
+        assert!(spawned(r#","delegationDepth":2,"parentSession":"p1""#));
+        assert!(!spawned(
+            r#","isSeeded":true,"delegationDepth":0,"parentSession":"p1""#
+        ));
     }
 
     /// v0 / v1 没有截点标记(那时的 session/end-seed 不带 inherited):截点在首行的 seedLength,

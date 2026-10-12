@@ -431,6 +431,7 @@ fn build_meta(
         tokens_used: None,
         archived: false,
         source: None,
+        spawned: grok_group::is_subagent(group, &r.native_id),
         favorite: false,
         pinned: false,
     }
@@ -451,6 +452,11 @@ impl AgentAdapter for GrokAdapter {
 
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         Some(grok_group::parent_links(&self.group_ctx()))
+    }
+
+    /// 登记表里的子会话都是 subagent 派出去的,而登记长在父会话目录里
+    fn linked_children_are_spawned(&self) -> bool {
+        true
     }
 
     fn is_snapshot_event(&self, path: &Path) -> bool {

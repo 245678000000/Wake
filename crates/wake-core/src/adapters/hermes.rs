@@ -53,6 +53,7 @@ struct HermesSchema {
     cache_write: bool,
     reasoning_tokens: bool,
     msg_reasoning: bool,
+    model_config: bool,
 }
 
 impl HermesSchema {
@@ -65,6 +66,7 @@ impl HermesSchema {
             cache_write: sessions.contains("cache_write_tokens"),
             reasoning_tokens: sessions.contains("reasoning_tokens"),
             msg_reasoning: messages.contains("reasoning"),
+            model_config: sessions.contains("model_config"),
         }
     }
 }
@@ -165,6 +167,7 @@ impl HermesAdapter {
             archived: false,
             // cli 是默认启动面,徽章只给非 cli 的(telegram/discord/…)
             source: row.source.clone().filter(|s| !s.is_empty() && s != "cli"),
+            spawned: row.delegated,
             favorite: false,
             pinned: false,
         }
@@ -308,6 +311,10 @@ struct HermesRow {
     /// `/branch`、上下文压缩续段、子代理委派都会设它;这些仍是用户可见的
     /// 会话,照常列出,但按父子关系挂到父会话下(parent_links)
     parent_id: Option<String>,
+    /// 委派出去的子代理:model_config 带 `_delegate_from`(上游 hermes_state_sessions.py 的
+    /// `_delegate_from_json`;/branch 带的是 `_branched_from`,压缩续段是父会话以 compression
+    /// 结束,这两种都是用户自己的对话)
+    delegated: bool,
 }
 
 /// Hermes 全部时间戳恒为 unix 秒(写端 time.time()),不做秒/毫秒猜测
@@ -330,12 +337,19 @@ fn query_rows(ro: &SqliteRo, db: &HermesDb) -> Option<Vec<HermesRow>> {
     } else {
         "''"
     };
+    // 坏 JSON 上的 json_extract 会让整条查询报错,先 json_valid(CASE 按顺序求值)
+    let delegated_col = if schema.model_config {
+        "CASE WHEN json_valid(s.model_config)
+              THEN json_extract(s.model_config, '$._delegate_from') IS NOT NULL ELSE 0 END"
+    } else {
+        "0"
+    };
     let sql = format!(
         "SELECT s.id, s.source, s.model, {title_col}, s.started_at, s.ended_at,
                 COALESCE(s.input_tokens,0) + COALESCE(s.output_tokens,0) + {} + {} + {},
                 COUNT(m.id), COALESCE(MAX(m.timestamp), 0),
                 COALESCE(SUM(LENGTH(COALESCE(m.content,'')) + LENGTH(COALESCE(m.tool_calls,''))), 0),
-                s.parent_session_id
+                s.parent_session_id, {delegated_col}
          FROM sessions s LEFT JOIN messages m ON m.session_id = s.id
          GROUP BY s.id",
         col(schema.cache_read, "cache_read_tokens"),
@@ -359,6 +373,7 @@ fn query_rows(ro: &SqliteRo, db: &HermesDb) -> Option<Vec<HermesRow>> {
                 message_count: r.get(7)?,
                 content_len: r.get(9)?,
                 parent_id: r.get::<_, Option<String>>(10)?.filter(|p| !p.is_empty()),
+                delegated: r.get(11)?,
             })
         })
         .ok()?

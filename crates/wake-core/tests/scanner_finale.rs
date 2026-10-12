@@ -371,6 +371,9 @@ fn parent_links_from_multiple_locations_are_merged_by_winning_file() {
     // parent location；child 的胜出 updates.jsonl 则来自另一 location。
     parent.manages_links = true;
     parent.parent_links = vec![("grok:child".into(), "grok:parent".into())];
+    // 登记只在 parent 那边:child 自己的实例看不见,解析时标不出是派出去的,关系同步来标
+    child.links_spawn = true;
+    parent.links_spawn = true;
 
     let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(child), Box::new(parent)];
     run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
@@ -386,6 +389,12 @@ fn parent_links_from_multiple_locations_are_merged_by_winning_file() {
             .unwrap()
             .project_path,
         "/Users/tester/Github/source"
+    );
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 1, 13).unwrap();
+    assert_eq!(
+        store.insights(today).unwrap().sessions,
+        1,
+        "子会话是派出去的,Insights 只算 parent"
     );
 }
 
@@ -731,6 +740,8 @@ struct SeedAdapter {
     parent_links: Vec<(String, String)>,
     /// 模拟"这一刻读不出关系"(state DB 打不开):parent_links 交 None
     links_unknown: bool,
+    /// 关系只记派出去的子会话(Grok 的登记表)
+    links_spawn: bool,
     rank: u8,
 }
 
@@ -774,6 +785,9 @@ impl AgentAdapter for SeedAdapter {
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         (!self.links_unknown).then(|| self.parent_links.clone())
     }
+    fn linked_children_are_spawned(&self) -> bool {
+        self.links_spawn
+    }
     fn parse_session(&self, _: &SessionFileRef) -> Result<ParsedSession> {
         if self.fail_parse {
             bail!("simulated corrupt copy")
@@ -803,6 +817,7 @@ impl AgentAdapter for SeedAdapter {
             manages_links: self.manages_links,
             parent_links: self.parent_links.clone(),
             links_unknown: self.links_unknown,
+            links_spawn: self.links_spawn,
             rank: self.rank,
         })
     }
@@ -1183,11 +1198,8 @@ fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> 
             size: 1,
         },
         meta: SessionMeta {
-            host: String::new(),
-            key: format!("{}:{native_id}", agent.as_str()),
             id: native_id.into(),
             agent,
-            title: "seed".into(),
             project_path: "/tmp/p".into(),
             project_name: "p".into(),
             file_path: path.into(),
@@ -1195,13 +1207,7 @@ fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> 
             updated_at: mtime,
             message_count: 0,
             size_bytes: 1,
-            git_branch: None,
-            model: None,
-            tokens_used: None,
-            archived: false,
-            source: None,
-            favorite: false,
-            pinned: false,
+            ..common::meta(&format!("{}:{native_id}", agent.as_str()), "seed")
         },
         fail_parse: false,
         fail_list: false,
@@ -1209,6 +1215,7 @@ fn seed(agent: AgentId, root: &str, path: &str, native_id: &str, mtime: i64) -> 
         manages_links: false,
         parent_links: Vec::new(),
         links_unknown: false,
+        links_spawn: false,
         rank: 0,
     }
 }
@@ -1220,11 +1227,7 @@ fn tombstoned_session_does_not_resurrect_on_rescan() {
     let dir = tempfile::tempdir().unwrap();
     let store = temp_store(dir.path());
     let meta = SessionMeta {
-        host: String::new(),
-        key: "codex:ghost".into(),
-        id: "ghost".into(),
         agent: AgentId::Codex,
-        title: "残留会话".into(),
         project_path: "/tmp/p".into(),
         project_name: "p".into(),
         file_path: "/tmp/fixtures/ghost.jsonl".into(),
@@ -1232,13 +1235,7 @@ fn tombstoned_session_does_not_resurrect_on_rescan() {
         updated_at: 2,
         message_count: 0,
         size_bytes: 1,
-        git_branch: None,
-        model: None,
-        tokens_used: None,
-        archived: false,
-        source: None,
-        favorite: false,
-        pinned: false,
+        ..common::meta("codex:ghost", "残留会话")
     };
     let r = SessionFileRef {
         agent: AgentId::Codex,
@@ -1258,6 +1255,7 @@ fn tombstoned_session_does_not_resurrect_on_rescan() {
         manages_links: false,
         parent_links: Vec::new(),
         links_unknown: false,
+        links_spawn: false,
         rank: 0,
     })];
     let rec = Recorder::new();

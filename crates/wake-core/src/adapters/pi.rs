@@ -153,6 +153,7 @@ fn build_meta(agent: AgentId, r: &SessionFileRef, p: &PiParse) -> SessionMeta {
         tokens_used: p.tokens_used,
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

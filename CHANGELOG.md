@@ -7,6 +7,7 @@
 - Fix: DeepSeek Harness subagent sessions are indexed and listed under the session that started them, titled with their task; a subagent or forked session no longer repeats the conversation it started from, and its tokens are its own. Existing indexes are re-read once after upgrading (#63, thanks @ztcngadget888)
 - Update: Subagent sessions from OpenCode, Kilo Code, ZCode, Antigravity and OpenClaw are listed under the session that started them. ZCode side chats and workflow steps sit under their task too, and ZCode workflow tasks are listed
 - Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
+- Update: Insights no longer counts subagent sessions, or the prompts in them, as yours; their tokens still count
 
 ## [0.9.1] — 2026-10-10
 

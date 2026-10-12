@@ -260,6 +260,13 @@ pub trait AgentAdapter: Send + Sync {
     fn children_outlive_parent(&self) -> bool {
         false
     }
+    /// `parent_links` 只记 agent 派出去的子会话(Grok 的 subagents 登记表)时为 true:关系同步
+    /// 把挂上的子会话标成 `SessionMeta::spawned`。这类标记出自别的会话的边车,解析子会话时
+    /// 未必看得见——父会话在另一个 location、登记晚于子会话最后一次写入才落盘——合并了全部
+    /// location 的关系同步才说得准;解析时照常按看得见的填。远程装饰器必须转发
+    fn linked_children_are_spawned(&self) -> bool {
+        false
+    }
     /// 本家会话在**别家**目录里的替身。外壳产品(Craft Agents)跑的是别家的引擎,
     /// 引擎自己也往自家目录落了一份转录(Claude Agent SDK → `~/.claude/projects`),
     /// 同一段对话就会以两家身份各列一次。返回那些替身的 `(别家, 别家 native id)`:

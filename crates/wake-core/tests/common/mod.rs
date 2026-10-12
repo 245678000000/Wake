@@ -31,6 +31,7 @@ pub fn meta(key: &str, title: &str) -> SessionMeta {
         tokens_used: None,
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }
@@ -1068,7 +1069,8 @@ pub fn stage_antigravity_transcript(brain: &Path, id: &str, uploads: &[i64]) -> 
 /// - `cide-0002`:`name` 为空且无 lastUpdatedAt,验证标题回退首条用户消息、
 ///   updated_at 回退末条气泡的 ISO createdAt。
 /// - `cide-0003`:零气泡的草稿 composer,不进列表。
-/// - `cide-0004`:子代理会话,composerHeaders 给出 parentComposerId。
+/// - `cide-0004`:子代理会话,composerHeaders 给出 parentComposerId(composerData 里也带同一份
+///   subagentInfo,与真机一致)。
 /// - `33333333-…-03`:与 CLI 转录 fixture 同 id 的 IDE 副本——转录带正文,
 ///   scanner 按 dedup_rank 让 CLI 那份胜出(scanner_finale 有端到端)。
 /// - `44444444-…-04`:转录只剩 turn_ended 空壳(fixtures/cursor 下同名文件),
@@ -1151,6 +1153,7 @@ pub fn build_cursor_ide_db(path: &Path) {
 
           ('composerData:cide-0004',
            '{"_v":18,"composerId":"cide-0004","name":"Explore subagent",
+             "subagentInfo":{"subagentType":3,"parentComposerId":"cide-0001","subagentTypeName":"explore"},
              "createdAt":1786330000000,"lastUpdatedAt":1786330100000,
              "workspaceIdentifier":{"id":"ws1","uri":{"fsPath":"/Users/tester/Github/wakefx","path":"/Users/tester/Github/wakefx","scheme":"file"}},
              "fullConversationHeadersOnly":[{"bubbleId":"s1","type":1}]}'),

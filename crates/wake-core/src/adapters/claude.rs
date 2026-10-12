@@ -887,6 +887,7 @@ fn build_meta(r: &SessionFileRef, p: &ParseResult) -> SessionMeta {
         },
         archived: false,
         source: None,
+        spawned: false,
         favorite: false,
         pinned: false,
     }

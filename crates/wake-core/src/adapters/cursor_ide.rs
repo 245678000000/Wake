@@ -257,7 +257,8 @@ impl CursorIdeAdapter {
                             COALESCE(json_extract(CAST(k.value AS TEXT), '$.fullConversationHeadersOnly[#-1].createdAt'), ''),
                             json_array_length(CAST(k.value AS TEXT), '$.fullConversationHeadersOnly'),
                             COALESCE(json_extract(CAST(k.value AS TEXT), '$.workspaceIdentifier.uri.fsPath'), ''),
-                            COALESCE(json_extract(CAST(k.value AS TEXT), '$.trackedGitRepos[0].repoPath'), '')
+                            COALESCE(json_extract(CAST(k.value AS TEXT), '$.trackedGitRepos[0].repoPath'), ''),
+                            json_extract(CAST(k.value AS TEXT), '$.subagentInfo') IS NOT NULL
                      FROM cursorDiskKV k
                      WHERE k.key LIKE '{COMPOSER_PREFIX}%'
                        AND json_array_length(CAST(k.value AS TEXT), '$.fullConversationHeadersOnly') > 0",
@@ -280,6 +281,7 @@ impl CursorIdeAdapter {
                         updated_ms: pick_updated(updated, last_bubble_ms, created),
                         bubble_count: r.get(5)?,
                         cwd: if fs_path.is_empty() { repo_path } else { fs_path },
+                        subagent: r.get(8)?,
                     })
                 })
                 .ok()?
@@ -327,6 +329,7 @@ impl CursorIdeAdapter {
             tokens_used: usage.tokens,
             archived: false,
             source: None,
+            spawned: row.subagent,
             favorite: false,
             pinned: false,
         }
@@ -431,6 +434,11 @@ fn parent_links_from(db: &std::path::Path) -> Option<Vec<(String, String)>> {
             })
             .collect(),
     )
+}
+
+/// 子代理会话:composer 带 subagentInfo(与 `rows` 的 SQL 同一判据)
+fn has_subagent_info(data: &Value) -> bool {
+    data.get("subagentInfo").is_some_and(|info| !info.is_null())
 }
 
 /// updated_at 的三段回退,见 `rows` 的说明
@@ -541,6 +549,8 @@ struct IdeRow {
     updated_ms: i64,
     bubble_count: i64,
     cwd: String,
+    /// 子代理会话(composer 带 subagentInfo;父子关系另由 composerHeaders 给)
+    subagent: bool,
 }
 
 impl IdeRow {
@@ -568,6 +578,7 @@ impl IdeRow {
             updated_ms: pick_updated(int("lastUpdatedAt"), last_bubble, int("createdAt")),
             bubble_count: heads.map_or(0, |h| h.len() as i64),
             cwd: project_path_from_data(data).unwrap_or_default().to_string(),
+            subagent: has_subagent_info(data),
         }
     }
 }

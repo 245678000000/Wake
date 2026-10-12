@@ -414,6 +414,11 @@ fn id_timestamp(task_id: &str) -> i64 {
     0
 }
 
+/// 派出这个任务的任务:new_task 子任务在自己的元数据里记着 parentTaskId(指回自己的不算)
+fn parent_task_id(item: Option<&Value>, task_id: &str) -> Option<String> {
+    optional_string(item.and_then(|item| item.get("parentTaskId"))).filter(|p| p != task_id)
+}
+
 fn build_meta(
     r: &SessionFileRef,
     task_id: &str,
@@ -464,6 +469,7 @@ fn build_meta(
         tokens_used: (tokens > 0).then_some(tokens),
         archived: false,
         source: editor.map(String::from),
+        spawned: parent_task_id(item, task_id).is_some(),
         favorite: false,
         pinned: false,
     }
@@ -989,18 +995,14 @@ impl AgentAdapter for KiloLegacyAdapter {
                 };
                 let task_id = entry.file_name().to_string_lossy().to_string();
                 let parent = match read_item_file(&task_dir) {
-                    Ok(Some(item)) => optional_string(item.get("parentTaskId")),
+                    Ok(Some(item)) => parent_task_id(Some(&item), &task_id),
                     Ok(None) => {
                         let index = index.get_or_insert_with(|| root.index()).as_ref()?;
-                        optional_string(
-                            index
-                                .get(&task_id)
-                                .and_then(|item| item.get("parentTaskId")),
-                        )
+                        parent_task_id(index.get(&task_id), &task_id)
                     }
                     Err(_) => return None,
                 };
-                if let Some(parent) = parent.filter(|p| *p != task_id) {
+                if let Some(parent) = parent {
                     links.push((
                         session_key(AgentId::Kilo, "", &r.native_id),
                         legacy_task_key(&parent),

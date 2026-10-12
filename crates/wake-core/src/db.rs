@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS sessions (
   file_mtime     INTEGER DEFAULT 0,
   unknown_lines  INTEGER DEFAULT 0,
   parent_key     TEXT NOT NULL DEFAULT '',
-  host           TEXT NOT NULL DEFAULT ''
+  host           TEXT NOT NULL DEFAULT '',
+  spawned        INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sessions_agent   ON sessions(agent_id, updated_at DESC);
@@ -227,8 +228,10 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 /// "13" = dsh 的子代理会话收录、挂到派它的会话下(issue #63),fork 出来的会话折掉从父会话
 ///       复制来的一段、标题 / 模型 / 用量只算截点之后的,老行靠这轮重解析回填;
 /// "14" = ZCode 的分叉折掉从父任务复制来的一段、辅助对话的固定标题退回首条提问,两者的
-///       token / 模型只算复制边界之后的,时间线分隔条不再计未知行,老行靠这轮重解析回填。
-pub const FTS_FORMAT: &str = "14";
+///       token / 模型只算复制边界之后的,时间线分隔条不再计未知行,老行靠这轮重解析回填;
+/// "15" = 各家把 agent 派出去的子会话标出来(sessions.spawned,Insights 的提问数与会话数不算
+///       它),老行靠这轮重解析写对。
+pub const FTS_FORMAT: &str = "15";
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把
@@ -316,6 +319,14 @@ fn open_conn(path: &Path) -> Result<Connection> {
     if !table_has_column(&conn, "sessions", "host")? {
         conn.execute(
             "ALTER TABLE sessions ADD COLUMN host TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
+    // agent 派出去的子会话(2026-10-12):Insights 的提问数与会话数不算它。只有 GUI 的 Insights
+    // 读,不进 NEWEST_COLUMN(只读旁路不查它);老行是 0,FTS_FORMAT "15" 的重解析把它写对
+    if !table_has_column(&conn, "sessions", "spawned")? {
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN spawned INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -1105,6 +1116,37 @@ impl Store {
                 }
             }
         }))
+    }
+
+    /// 把这些会话标成 agent 派出去的(sessions.spawned;`AgentAdapter::linked_children_are_spawned`
+    /// 的家在关系同步时调)。已经标过的不动:一条都不用改时只在读连接上看一眼、不开写事务——
+    /// watcher 每批 Grok 事件都会走到这里
+    pub fn mark_spawned<'a>(&self, keys: impl IntoIterator<Item = &'a str>) -> Result<()> {
+        let pending = {
+            let conn = self.read.lock().unwrap();
+            let mut stmt =
+                conn.prepare_cached("SELECT 1 FROM sessions WHERE key = ?1 AND spawned = 0")?;
+            let mut pending = Vec::new();
+            for key in keys {
+                if stmt.exists(params![key])? {
+                    pending.push(key);
+                }
+            }
+            pending
+        };
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare_cached("UPDATE sessions SET spawned = 1 WHERE key = ?1")?;
+            for key in pending {
+                stmt.execute(params![key])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 出库、不记墓碑:扫描与 watcher 发现文件已经不在了。用户删除走
@@ -2525,11 +2567,17 @@ impl Store {
                 .ok()
                 .filter(|d| *d <= today)
         };
+        // 会话数与提问数只算用户自己开的会话:agent 派出去的子会话(子代理、工作流里的一步)
+        // 不算一场会话,它开头那句"用户消息"是派活的 agent 写的,也不算提问(会话内部的
+        // sidechain 本来就不算);token 照常全算,那是模型实际花掉的(2026-10-12)
+        const OWN_SESSION: &str = "s.spawned = 0";
         // "一条 prompt" 的行集(主线用户消息)——整页口径共用这一个片段,
         // 内联多份的话谓词一漂移,总数就会与分桶/榜单悄悄不一致
-        const PROMPT_ROWS: &str = "FROM messages m JOIN sessions s ON s.key = m.session_key
+        let prompt_rows = format!(
+            "FROM messages m JOIN sessions s ON s.key = m.session_key
              WHERE s.archived = 0 AND m.role = 'user' AND m.sidechain_id IS NULL
-               AND s.key IN canonical_sessions";
+               AND {OWN_SESSION} AND s.key IN canonical_sessions"
+        );
 
         // 临时连接,不与 UI 的 read 连接抢锁:WAL 多读并发,几十毫秒的
         // 统计扫描不该让导航点击的列表查询排队(2026-08-27 Codex review)
@@ -2570,10 +2618,12 @@ impl Store {
             data.first_ts,
             data.project_count,
         ) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(tokens_used),0),
-                    COALESCE(MIN(NULLIF(created_at,0)),0),
-                    COUNT(DISTINCT NULLIF(project_path,''))
-             FROM sessions WHERE archived = 0 AND key IN canonical_sessions",
+            &format!(
+                "SELECT COUNT(*) FILTER (WHERE {OWN_SESSION}), COALESCE(SUM(s.tokens_used),0),
+                        COALESCE(MIN(NULLIF(s.created_at,0)),0),
+                        COUNT(DISTINCT NULLIF(s.project_path,''))
+                 FROM sessions s WHERE s.archived = 0 AND s.key IN canonical_sessions"
+            ),
             [],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
         )?;
@@ -2585,7 +2635,7 @@ impl Store {
             "SELECT CASE WHEN m.ts > 0 THEN date(m.ts/1000,'unixepoch','localtime') END d,
                     CASE WHEN m.ts > 0 THEN CAST(strftime('%H', m.ts/1000,'unixepoch','localtime') AS INTEGER) END h,
                     COUNT(*)
-             {PROMPT_ROWS}
+             {prompt_rows}
              GROUP BY d, h ORDER BY d"
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -2626,7 +2676,7 @@ impl Store {
             "SELECT s.agent_id, s.project_path, COALESCE(s.model,''),
                     CASE WHEN m.ts > 0 THEN date(m.ts/1000,'unixepoch','localtime') END d,
                     COUNT(*)
-             {PROMPT_ROWS}
+             {prompt_rows}
              GROUP BY 1, 2, 3, 4"
         ))?;
         let rows = stmt.query_map([], |r| {
@@ -2674,9 +2724,10 @@ impl Store {
                      prompts: &HashMap<String, i64>|
          -> Result<Vec<UsageTally>> {
             let sql = format!(
-                "SELECT {display}, {group}, COUNT(*), COALESCE(SUM(s.tokens_used),0)
+                "SELECT {display}, {group}, COUNT(*) FILTER (WHERE {OWN_SESSION}) AS own,
+                        COALESCE(SUM(s.tokens_used),0)
                  FROM sessions s WHERE s.archived = 0 AND s.key IN canonical_sessions{filter}
-                 GROUP BY {group} ORDER BY COUNT(*) DESC, {display}"
+                 GROUP BY {group} ORDER BY own DESC, {display}"
             );
             let mut stmt = conn.prepare_cached(&sql)?;
             let rows = stmt.query_map([], |r| {
@@ -2717,12 +2768,12 @@ impl Store {
         // 会话按创建日分桶(Last 7 days 的 sessions 对比用)。date() 对超出
         // 其范围的正数(微秒戳、脏值)返回 NULL——按 Option 读,坏行跳过,
         // 不能让一条脏 created_at 掀翻整张快照(2026-09-03 Codex review)
-        let mut stmt = conn.prepare_cached(
-            "SELECT date(created_at/1000,'unixepoch','localtime'), COUNT(*)
-             FROM sessions WHERE archived = 0 AND created_at > 0
-               AND key IN canonical_sessions
-             GROUP BY 1 ORDER BY 1",
-        )?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT date(s.created_at/1000,'unixepoch','localtime'), COUNT(*)
+             FROM sessions s WHERE s.archived = 0 AND s.created_at > 0 AND {OWN_SESSION}
+               AND s.key IN canonical_sessions
+             GROUP BY 1 ORDER BY 1"
+        ))?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?))
         })?;
@@ -3273,6 +3324,7 @@ fn row_to_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {
         tokens_used: r.get(10)?,
         model: r.get(11)?,
         source: r.get(12)?,
+        spawned: false,
         archived: r.get::<_, i64>(13)? == 1,
         file_path: r.get(14)?,
         size_bytes: r.get(15)?,
@@ -3452,8 +3504,8 @@ fn upsert_session(tx: &rusqlite::Transaction<'_>, m: &SessionMeta, file_mtime: i
     tx.execute(
         "INSERT INTO sessions(key, agent_id, native_id, title, project_path, project_name,
            git_branch, created_at, updated_at, message_count, tokens_used, model, source,
-           archived, file_path, file_size, file_mtime, unknown_lines, host)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,0,?18)
+           archived, file_path, file_size, file_mtime, unknown_lines, host, spawned)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,0,?18,?19)
          ON CONFLICT(key) DO UPDATE SET
            title=excluded.title, project_path=excluded.project_path,
            project_name=excluded.project_name, git_branch=excluded.git_branch,
@@ -3461,7 +3513,7 @@ fn upsert_session(tx: &rusqlite::Transaction<'_>, m: &SessionMeta, file_mtime: i
            message_count=excluded.message_count, tokens_used=excluded.tokens_used,
            model=excluded.model, source=excluded.source, archived=excluded.archived,
            file_path=excluded.file_path, file_size=excluded.file_size,
-           file_mtime=excluded.file_mtime, host=excluded.host",
+           file_mtime=excluded.file_mtime, host=excluded.host, spawned=excluded.spawned",
         params![
             m.key,
             m.agent.as_str(),
@@ -3481,6 +3533,7 @@ fn upsert_session(tx: &rusqlite::Transaction<'_>, m: &SessionMeta, file_mtime: i
             m.size_bytes,
             file_mtime,
             m.host,
+            m.spawned as i64,
         ],
     )?;
     Ok(())

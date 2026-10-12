@@ -987,6 +987,14 @@ fn sync_parent_links(
         let mut desired: Vec<(String, String)> = desired_map.into_iter().collect();
         desired.sort();
         changed |= store.replace_parent_links(agent, &desired)?;
+        // 关系只记派出去的子会话的家(Grok):挂上的就是派出去的。解析时子会话所在的实例未必
+        // 看得见登记,合并了全部 location 的这一步才说得准
+        if adapters
+            .iter()
+            .any(|adapter| adapter.agent() == agent && adapter.linked_children_are_spawned())
+        {
+            store.mark_spawned(desired.iter().map(|(child, _)| child.as_str()))?;
+        }
     }
     Ok(changed)
 }
