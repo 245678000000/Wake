@@ -272,6 +272,212 @@ pub fn collapse_inherited(messages: &mut Vec<TranscriptMessage>, cut: usize, par
     messages.splice(..cut, std::iter::once(marker));
 }
 
+// ---- Claude 式会话目录里的子代理(Claude Code、CodeBuddy / WorkBuddy、Qoder 同构) ----
+
+/// 会话的同名目录(`<projects>/<slug>/<id>/`,子代理转录等边车在里面)
+pub fn session_dir(r: &SessionFileRef) -> std::path::PathBuf {
+    std::path::Path::new(&r.file_path)
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join(&r.native_id)
+}
+
+/// 子代理转录所在会话的目录(目录名就是派它的会话的 id):Task / Agent 派的在
+/// `<会话>/subagents/agent-<id>.jsonl`,Workflow 跑出来的再深一层 `subagents/workflows/wf_<id>/`;
+/// 同一目录里的 journal.jsonl 是 Workflow 的运行日志,不是转录。这些转录作为子会话入库,但不是
+/// 能单独恢复的会话
+pub fn subagent_session_dir(path: &std::path::Path) -> Option<&std::path::Path> {
+    let name = path.file_name()?.to_str()?;
+    if !(name.starts_with("agent-") && name.ends_with(".jsonl")) {
+        return None;
+    }
+    let named = |dir: &std::path::Path, name: &str| dir.file_name().is_some_and(|n| n == name);
+    let dir = path.parent()?;
+    let subagents = if named(dir, "subagents") {
+        dir
+    } else {
+        let run = dir.file_name()?.to_str()?;
+        let workflows = dir.parent()?;
+        let subagents = workflows.parent()?;
+        (run.starts_with("wf_") && named(workflows, "workflows") && named(subagents, "subagents"))
+            .then_some(subagents)?
+    };
+    subagents.parent()
+}
+
+pub fn is_subagent_transcript(path: &str) -> bool {
+    subagent_session_dir(std::path::Path::new(path)).is_some()
+}
+
+/// 子代理转录所在会话的原生 id(`AgentAdapter::parent_in_path`)
+pub fn subagent_parent(path: &std::path::Path) -> Option<String> {
+    Some(
+        subagent_session_dir(path)?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// 一个会话目录里全部子代理转录的引用(Task / Agent 派的与 Workflow 跑出来的),读不出的目录跳过
+pub fn subagent_refs(agent: AgentId, session_dir: &std::path::Path) -> Vec<SessionFileRef> {
+    let files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    };
+    let mut transcripts = Vec::new();
+    for path in files(&session_dir.join("subagents")) {
+        if path.file_name().is_some_and(|name| name == "workflows") {
+            transcripts.extend(files(&path).iter().flat_map(|run| files(run)));
+        } else {
+            transcripts.push(path);
+        }
+    }
+    transcripts
+        .iter()
+        .filter(|path| subagent_session_dir(path).is_some())
+        .filter_map(|path| subagent_ref(agent, path))
+        .collect()
+}
+
+/// 监听事件落在子代理转录或它的边车上:换成转录的引用。`session_ok` 判它所在的会话目录是不是这个
+/// 实例认的那一层(各家的数据根与目录深度不同)
+pub fn subagent_event_ref(
+    agent: AgentId,
+    path: &std::path::Path,
+    session_ok: impl FnOnce(&std::path::Path) -> bool,
+) -> Option<SessionFileRef> {
+    let transcript = match path.file_name()?.to_str()?.strip_suffix(".meta.json") {
+        Some(stem) => path.with_file_name(format!("{stem}.jsonl")),
+        None => path.to_path_buf(),
+    };
+    if !session_ok(subagent_session_dir(&transcript)?) {
+        return None;
+    }
+    subagent_ref(agent, &transcript)
+}
+
+/// 子代理转录的边车 `agent-<id>.meta.json`:agentType / 任务说明 / 派它的 tool_use id
+fn subagent_sidecar(transcript: &std::path::Path) -> std::path::PathBuf {
+    transcript.with_extension("meta.json")
+}
+
+/// 子代理转录的引用,边车并进戳(列表与监听同一个)
+fn subagent_ref(agent: AgentId, transcript: &std::path::Path) -> Option<SessionFileRef> {
+    let mut r = default_file_ref(agent, transcript)?;
+    if let Some((mtime, size)) = stat_stamp(&subagent_sidecar(transcript)) {
+        r.mtime_ms = r.mtime_ms.max(mtime);
+        r.size += size;
+    }
+    Some(r)
+}
+
+/// 一份子代理转录读成 `SidechainInfo`:边车给是谁、干什么、哪次调用派的(没有边车的家这几项为空);
+/// 它同时作为子会话入库,`session_id` 就是文件名
+pub fn sidechain_info(transcript: &std::path::Path) -> Option<SidechainInfo> {
+    let id = transcript.file_stem()?.to_string_lossy().to_string();
+    let sidecar = std::fs::read_to_string(subagent_sidecar(transcript))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+    let field = |key: &str| {
+        sidecar
+            .as_ref()
+            .and_then(|v| text_at(v, key))
+            .map(String::from)
+    };
+    Some(SidechainInfo {
+        session_id: Some(id.clone()),
+        agent_type: field("agentType"),
+        description: field("description"),
+        tool_use_id: field("toolUseId"),
+        id,
+    })
+}
+
+/// 会话直属的子代理(`<会话>/subagents/` 那一层;MCP 的 `subagent` 参数与导出按它读),派活的
+/// 调用按边车记的 tool_use id 指向子会话。子代理自己下面没有这一层目录,给空
+pub fn link_subagents(
+    session_dir: &std::path::Path,
+    mainline: &mut [TranscriptMessage],
+) -> Vec<SidechainInfo> {
+    let Ok(entries) = std::fs::read_dir(session_dir.join("subagents")) else {
+        return Vec::new();
+    };
+    let sidechains: Vec<SidechainInfo> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| subagent_session_dir(path).is_some())
+        .filter_map(|path| sidechain_info(&path))
+        .collect();
+    let by_call: std::collections::HashMap<&str, &SidechainInfo> = sidechains
+        .iter()
+        .filter_map(|s| s.tool_use_id.as_deref().map(|id| (id, s)))
+        .collect();
+    for call in mainline.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
+        if let Some(sidechain) = by_call.get(call.id.as_str()) {
+            call.child_id = sidechain.session_id.clone();
+        }
+    }
+    sidechains
+}
+
+/// Claude 式布局的会话转录:会话里派活的调用指向它派出去的子会话(`link_subagents`)
+pub fn transcript_with_subagents(
+    r: &SessionFileRef,
+    meta: SessionMeta,
+    mut mainline: Vec<TranscriptMessage>,
+    unknown_line_count: u32,
+) -> ParsedTranscript {
+    let sidechains = link_subagents(&session_dir(r), &mut mainline);
+    ParsedTranscript {
+        meta,
+        mainline,
+        sidechains,
+        unknown_line_count,
+    }
+}
+
+/// 按 id 读会话直属的一份子代理转录(`AgentAdapter::load_sidechain`,MCP 的 `subagent` 参数);
+/// 没有这份给空
+pub fn load_subagent(
+    r: &SessionFileRef,
+    id: &str,
+    parse: impl FnOnce(&std::path::Path) -> anyhow::Result<Vec<TranscriptMessage>>,
+) -> anyhow::Result<Vec<TranscriptMessage>> {
+    let file = session_dir(r).join("subagents").join(format!("{id}.jsonl"));
+    if !file.is_file() {
+        return Ok(Vec::new());
+    }
+    parse(&file)
+}
+
+/// 子代理转录作为子会话:是 agent 派出去的(Insights 不算),标题取边车记的任务说明——没有就照常
+/// (多半是派活那句话)。不是子代理转录的不动
+pub fn mark_subagent(meta: &mut SessionMeta, transcript: &std::path::Path) {
+    if subagent_session_dir(transcript).is_none() {
+        return;
+    }
+    meta.spawned = true;
+    if let Some(task) = sidechain_info(transcript)
+        .and_then(|info| info.description)
+        .map(|task| clean_title_candidate(&task))
+        .filter(|task| !task.is_empty())
+    {
+        meta.title = task;
+    }
+}
+
+/// 子代理自己的文件:转录与它的边车(删除时一起走)
+pub fn subagent_paths(transcript: &str) -> Vec<String> {
+    let sidecar = subagent_sidecar(std::path::Path::new(transcript));
+    let mut paths = vec![transcript.to_string()];
+    if sidecar.is_file() {
+        paths.push(sidecar.to_string_lossy().to_string());
+    }
+    paths
+}
+
 /// `AgentAdapter::file_ref` 的默认实现:非空 .jsonl,stem 即 native_id。
 /// 覆写方可在此结果上做路径过滤或 native_id 改写。
 pub fn default_file_ref(agent: AgentId, path: &std::path::Path) -> Option<SessionFileRef> {
@@ -295,22 +501,28 @@ pub fn default_file_ref(agent: AgentId, path: &std::path::Path) -> Option<Sessio
 
 /// Claude 式 projects 树(Qoder / CodeBuddy / WorkBuddy)的会话枚举:根直属的
 /// `<session>.jsonl` 与下一层 `<slug>/<session>.jsonl` 都收——自定义 location
-/// 允许直接选中某个 slug 目录;**不再往下走**,`<session>/subagents/` 里的子
-/// 代理转录不是顶层会话(递归的 list_jsonl_refs 会把它们吞进来)。按路径排序
+/// 允许直接选中某个 slug 目录;会话同名目录里派出去的子代理(`<session>/subagents/`)
+/// 作为子会话一并收,别的边车不收(递归的 list_jsonl_refs 会把它们吞进来)。按路径排序
 pub fn list_project_tree_refs(root: &std::path::Path, agent: AgentId) -> Vec<SessionFileRef> {
     let mut refs = Vec::new();
     let Ok(entries) = std::fs::read_dir(root) else {
         return refs;
     };
+    let is_dir = |entry: &std::fs::DirEntry| entry.file_type().is_ok_and(|t| t.is_dir());
     for entry in entries.flatten() {
         let path = entry.path();
-        if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            if let Ok(inner) = std::fs::read_dir(&path) {
-                refs.extend(
-                    inner
-                        .flatten()
-                        .filter_map(|e| default_file_ref(agent, &e.path())),
-                );
+        if is_dir(&entry) {
+            // slug 目录(里面是会话),或者根本身就是 slug 目录时的会话同名目录
+            refs.extend(subagent_refs(agent, &path));
+            let Ok(inner) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for e in inner.flatten() {
+                if is_dir(&e) {
+                    refs.extend(subagent_refs(agent, &e.path()));
+                } else if let Some(r) = default_file_ref(agent, &e.path()) {
+                    refs.push(r);
+                }
             }
         } else if let Some(r) = default_file_ref(agent, &path) {
             refs.push(r);
@@ -318,6 +530,26 @@ pub fn list_project_tree_refs(root: &std::path::Path, agent: AgentId) -> Vec<Ses
     }
     refs.sort_by(|a, b| a.file_path.cmp(&b.file_path));
     refs
+}
+
+/// Claude 式 projects 树里监听事件对应的会话(Qoder / CodeBuddy / WorkBuddy):根下一两层的
+/// `<session>.jsonl`,或会话同名目录里的子代理转录(边车的事件换成转录的引用)。更深的
+/// 别的边车(state、memory)都不是
+pub fn project_tree_file_ref(
+    root: &std::path::Path,
+    agent: AgentId,
+    path: &std::path::Path,
+) -> Option<SessionFileRef> {
+    let relative = path.strip_prefix(root).ok()?;
+    if relative.components().count() <= 2 {
+        return default_file_ref(agent, path);
+    }
+    // 会话同名目录在根下一两层(根是 projects 目录或某个 slug 目录)
+    subagent_event_ref(agent, path, |session| {
+        session
+            .strip_prefix(root)
+            .is_ok_and(|session| session.components().count() <= 2)
+    })
 }
 
 /// 上面那棵树里有没有任何会话文件:env 候选根只在探到真实数据时才采信
@@ -1035,7 +1267,7 @@ pub fn tool_call_view(
         },
         output: output.map(|o| clip(&o, MAX_TOOL_IO).0),
         is_error,
-        sidechain_ref: None,
+        child_id: None,
     }
 }
 
@@ -1117,6 +1349,8 @@ fn clean_user_text(raw: &str, whole_command: bool) -> String {
     let mut s = strip_tag_block(raw, "system-reminder");
     s = strip_tag_block(&s, "local-command-caveat");
     s = strip_tag_block(&s, "local-command-stdout");
+    // Kimi 派出去的 explore 子代理收到的任务前面垫着仓库现状
+    s = strip_tag_block(&s, "git-context");
 
     let args = extract_tag(&s, "command-args");
     let name = extract_tag(&s, "command-name");

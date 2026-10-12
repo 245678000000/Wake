@@ -55,13 +55,28 @@ pub fn resolve_watch_agent<T: Copy>(roots: &[(PathBuf, T)], path: &Path) -> Opti
 /// 引用,交常规增量收编(该 key 已无既有行,scan_files 的副本裁决自然放行)。
 /// 期望 key 经 session_key 按实例 host 构造——远程三段 key 也走名字快路径。
 /// codex 经 state DB 改写过的 key(thread-id ≠ 文件 native_id)反查不到,由
-/// 下一次全量扫描兜底;删除事件罕见,逐家枚举(纯 stat)代价可忽略
+/// 下一次全量扫描兜底。每个实例只枚举一次(纯 stat):删掉一个会话目录时,它派出去的子代理
+/// 各是一个被删的 key,逐个重列整家会把同一份清单列上百遍
 pub fn promote_survivors(
     adapters: &[Box<dyn AgentAdapter>],
     store: &Arc<Store>,
     events: &dyn ScanEvents,
     removed_keys: &[String],
 ) {
+    let agents: std::collections::HashSet<AgentId> = removed_keys
+        .iter()
+        .filter_map(|key| key.split(':').next().and_then(AgentId::from_str))
+        .collect();
+    let listings: Vec<Vec<SessionFileRef>> = adapters
+        .iter()
+        .map(|a| {
+            if agents.contains(&a.agent()) {
+                a.list_session_files().unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        })
+        .collect();
     let mut seen = std::collections::HashSet::new();
     let mut survivors: Vec<SessionFileRef> = Vec::new();
     for key in removed_keys {
@@ -71,36 +86,37 @@ pub fn promote_survivors(
         let Some(agent) = key.split(':').next().and_then(AgentId::from_str) else {
             continue;
         };
-        let mut agent_refs: Vec<SessionFileRef> = Vec::new();
-        let mut by_name: Vec<SessionFileRef> = Vec::new();
-        for a in adapters.iter().filter(|a| a.agent() == agent) {
-            // host 段对不上的实例整个跳过(本地实例对远程 key、A 机对 B 机):
-            // 名字与解析比对都不可能命中——实例出口的 key 恒带自己的 host
-            let Some(native_id) = strip_key_prefix(key, agent, a.host()) else {
-                continue;
-            };
-            if let Ok(refs) = a.list_session_files() {
-                by_name.extend(refs.iter().filter(|r| r.native_id == native_id).cloned());
-                agent_refs.extend(refs);
-            }
-        }
+        // host 段对不上的实例整个跳过(本地实例对远程 key、A 机对 B 机):
+        // 名字与解析比对都不可能命中——实例出口的 key 恒带自己的 host
+        let candidates: Vec<(&str, &[SessionFileRef])> = adapters
+            .iter()
+            .zip(&listings)
+            .filter(|(a, _)| a.agent() == agent)
+            .filter_map(|(a, refs)| Some((strip_key_prefix(key, agent, a.host())?, &refs[..])))
+            .collect();
+        let by_name: Vec<SessionFileRef> = candidates
+            .iter()
+            .flat_map(|(native_id, refs)| refs.iter().filter(move |r| r.native_id == *native_id))
+            .cloned()
+            .collect();
         if !by_name.is_empty() {
             survivors.extend(by_name);
             continue;
         }
         // key 后缀是**内容 id** 的家(gemini 的 sessionId、pi/dsh 的首行 id)
         // 文件名对不上——退而解析比对,规模封顶防重罚(超限交下次全量扫描)
-        if agent_refs.len() <= 32 {
+        let agent_refs = candidates.iter().flat_map(|(_, refs)| refs.iter());
+        if agent_refs.clone().count() <= 32 {
             for r in agent_refs {
                 let Some(owner) = crate::adapters::adapter_for(adapters, r.agent, &r.file_path)
                 else {
                     continue;
                 };
                 if owner
-                    .parse_session(&r)
+                    .parse_session(r)
                     .is_ok_and(|p| p.meta.key.as_str() == key.as_str())
                 {
-                    survivors.push(r);
+                    survivors.push(r.clone());
                     break;
                 }
             }
@@ -519,6 +535,60 @@ mod tests {
         event(EventKind::Create(CreateKind::File));
         assert_eq!(shared_turn(), vec![key_a.clone()]);
         assert_eq!(parent_of_b(), Some(key_a));
+    }
+
+    /// Kimi 在自己那边归档会话只写 state.json:子代理跟着归档。它们的转录没动、没有事件——
+    /// state.json 的事件经 `ref_dependents` 把它们补进同一批,不用等下一次全量扫描
+    #[test]
+    fn kimi_subagents_follow_their_session_into_the_archive() {
+        use crate::adapters::kimi::KimiAdapter;
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("kimi");
+        let session = home.join("sessions").join("wd_x_1").join("session_w1");
+        let agents = session.join("agents");
+        let prompt = |text: &str, origin: serde_json::Value| {
+            serde_json::json!({ "type": "turn.prompt", "time": 1791417601000i64,
+                "input": [{ "type": "text", "text": text }], "origin": origin })
+            .to_string()
+                + "\n"
+        };
+        for (agent, line) in [
+            (
+                "main",
+                prompt("Review the parser", serde_json::json!({ "kind": "user" })),
+            ),
+            (
+                "agent-1",
+                prompt(
+                    "Look at src/parser.rs",
+                    serde_json::json!({ "kind": "system_trigger", "name": "subagent" }),
+                ),
+            ),
+        ] {
+            std::fs::create_dir_all(agents.join(agent)).unwrap();
+            std::fs::write(agents.join(agent).join("wire.jsonl"), line).unwrap();
+        }
+        let state = session.join("state.json");
+        std::fs::write(&state, r#"{"title":"Review the parser"}"#).unwrap();
+
+        let store = Arc::new(Store::open(&tmp.path().join("wake.db")).unwrap());
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![KimiAdapter::new().with_custom_root(home)];
+        let roots: Vec<(PathBuf, usize)> = adapters[0]
+            .watch_paths()
+            .into_iter()
+            .map(|path| (path, 0))
+            .collect();
+        crate::scanner::run_scan(&adapters, &store, &NullEvents, true).unwrap();
+        let archived = |key: &str| store.get_session(key).unwrap().unwrap().archived;
+        assert!(!archived("kimi:session_w1/agent-1"));
+
+        std::fs::write(&state, r#"{"title":"Review the parser","archived":true}"#).unwrap();
+        let batch = vec![Ok(
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(state.clone())
+        )];
+        process_batch(&adapters, &store, &NullEvents, &roots, batch);
+        assert!(archived("kimi:session_w1"));
+        assert!(archived("kimi:session_w1/agent-1"), "子代理没跟着会话归档");
     }
 
     #[test]

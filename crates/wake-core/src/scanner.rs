@@ -821,6 +821,11 @@ fn sync_memories(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool
     changed
 }
 
+/// 这个实例管不管父子关系:报 `parent_links` 的,与父会话写在路径里的(`parent_in_path`)
+fn manages_links(adapter: &dyn AgentAdapter) -> bool {
+    adapter.manages_parent_links() || adapter.parent_in_path().is_some()
+}
+
 /// 多 location 下关系元数据跟着 parent 会话，而 child 的胜出文件可能在另一根。
 /// 因此先接受“关系目标 parent 的胜出文件也属于该快照”的直接边，再跨快照把
 /// 嵌套链扁平到 root。解除/换父前重解析 child，恢复被旧父项目覆盖的自身归属。
@@ -836,7 +841,8 @@ fn sync_parent_links(
     let mut links_by_adapter: Vec<std::collections::HashMap<String, String>> =
         Vec::with_capacity(adapters.len());
     for adapter in adapters {
-        if adapter.manages_parent_links() && only.is_none_or(|only| only.contains(&adapter.agent()))
+        if manages_links(adapter.as_ref())
+            && only.is_none_or(|only| only.contains(&adapter.agent()))
         {
             managed_agents.insert(adapter.agent());
             match adapter.parent_links() {
@@ -862,16 +868,19 @@ fn sync_parent_links(
         if unknown_agents.contains(&agent) {
             continue;
         }
-        // 这一家眼下一条关系都没有、库里也没有:整段对账是纯浪费——
-        // session_sources_for_agent 要把这家全部会话读一遍,replace_parent_links
-        // 还要开写事务与扫描线程抢锁。全量扫描对每家管关系的都走一遍,而多数
-        // agent 常年零关系(Codex 是 spawn_agent 用过才有)
+        // 这一家眼下一条关系都没有、库里也没有:对账是纯浪费——要把这家的会话读一遍,
+        // replace_parent_links 还要与扫描线程抢锁。全量扫描对每家管关系的都走一遍,而多数
+        // agent 常年零关系(Codex 是 spawn_agent 用过才有)。父会话写在路径里的家得先看过
+        // 会话才知道有没有
         let current = store.parent_links_for_agent(agent)?;
-        let has_links = links_by_adapter
+        let reported = links_by_adapter
             .iter()
             .enumerate()
             .any(|(ix, links)| adapters[ix].agent() == agent && !links.is_empty());
-        if !has_links && current.is_empty() {
+        let in_paths = adapters
+            .iter()
+            .any(|a| a.agent() == agent && a.parent_in_path().is_some());
+        if !reported && !in_paths && current.is_empty() {
             continue;
         }
 
@@ -884,6 +893,21 @@ fn sync_parent_links(
                 owner_by_key.insert(key.clone(), adapter_ix);
             }
         }
+        // 父会话写在路径里的(子代理转录):按每条会话的胜出文件推、按那个实例的 host 拼 key,
+        // 天然是现行的关系
+        let from_paths: Vec<(String, String)> = source_by_key
+            .iter()
+            .filter_map(|(child, path)| {
+                let adapter = &adapters[owner_by_key[child]];
+                let parent = adapter.parent_in_path()?(Path::new(path))?;
+                Some((child.clone(), session_key(agent, adapter.host(), &parent)))
+            })
+            .collect();
+        if !reported && from_paths.is_empty() && current.is_empty() {
+            continue;
+        }
+        let pinned: std::collections::HashSet<String> =
+            from_paths.iter().map(|(child, _)| child.clone()).collect();
 
         // meta.json 位于 parent 的 location。只采纳由当前胜出 parent 所属快照
         // 提供的边，避免另一份陈旧备份把已解除的关系重新挂回去。关系写在 child
@@ -904,6 +928,7 @@ fn sync_parent_links(
                 }
             }
         }
+        direct.extend(from_paths);
         // 上面那条"报边的实例必须拥有 parent"是照 Grok 写的:它的边车长在
         // parent 自己的 location 里,报边者天然就是拥有者。Codex 的
         // thread_spawn_edges 是 home 的一张总表,parent 的胜出文件完全可能
@@ -927,10 +952,11 @@ fn sync_parent_links(
             }
         }
 
-        // 各 location 只能看见自己的直接/局部链；合并后再走到全局 root。
+        // 各 location 只能看见自己的直接/局部链；合并后再走到全局 root。转录放在父会话
+        // 目录里的子代理停在那个会话上(见 flattened_parent)
         let mut desired_map = std::collections::HashMap::new();
         for child in direct.keys() {
-            if let Some(parent) = flattened_parent(child, &direct) {
+            if let Some(parent) = flattened_parent(child, &direct, |key| pinned.contains(key)) {
                 desired_map.insert(child.clone(), parent);
             }
         }
@@ -1068,7 +1094,7 @@ pub fn refresh_parent_links(
 ) {
     let mut refreshable = false;
     for adapter in adapters {
-        if affected_agents.contains(&adapter.agent()) && adapter.manages_parent_links() {
+        if affected_agents.contains(&adapter.agent()) && manages_links(adapter.as_ref()) {
             adapter.begin_scan();
             refreshable = true;
         }
@@ -1084,9 +1110,15 @@ pub fn refresh_parent_links(
     }
 }
 
+/// 沿直接关系往上走到根。`pinned` 的会话(父会话写在路径里的子代理,`parent_in_path`)
+/// 停在直接父会话上、不再往上走:它的转录在那个会话的目录里,删那个会话时连目录一起进
+/// 废纸篓,树得与目录一致——压到更上一层,删分支 / 分叉时它的墓碑就漏了,另一个 location
+/// 里的副本会再冒出来(Codex review 2026-10-12)。这种子代理的目录里不再套会话,也没有哪家
+/// 从子代理分叉,所以树最多两层:根 → 分支或分叉 → 它派的子代理(db 的 ROOT_* 汇总按两层算)
 fn flattened_parent(
     child: &str,
     direct: &std::collections::HashMap<String, String>,
+    pinned: impl Fn(&str) -> bool,
 ) -> Option<String> {
     let mut current = child;
     let mut seen = std::collections::HashSet::from([child]);
@@ -1095,11 +1127,10 @@ fn flattened_parent(
         if !seen.insert(parent.as_str()) {
             return None;
         }
-        if direct.contains_key(parent) {
-            current = parent;
-        } else {
+        if pinned(current) || !direct.contains_key(parent) {
             return Some(parent.clone());
         }
+        current = parent;
     }
 }
 
@@ -1248,10 +1279,9 @@ pub fn scan_files(
             }
         }
     }
-    if adapters
-        .iter()
-        .any(|adapter| affected_agents.contains(&adapter.agent()) && adapter.manages_parent_links())
-    {
+    if adapters.iter().any(|adapter| {
+        affected_agents.contains(&adapter.agent()) && manages_links(adapter.as_ref())
+    }) {
         changed |=
             sync_parent_links(adapters, store, Some(&affected_agents)).unwrap_or_else(|error| {
                 eprintln!("[scanner] parent-link refresh failed: {error}");

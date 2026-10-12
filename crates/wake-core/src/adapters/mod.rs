@@ -38,6 +38,9 @@ use crate::models::*;
 use anyhow::{Context as _, Result};
 use std::path::Path;
 
+/// 从子会话转录的路径推它父会话的原生 id(`AgentAdapter::parent_in_path`)
+pub type ParentInPath = fn(&Path) -> Option<String>;
+
 /// agent 数据源适配器。列表扫描与详情解析共用同一核心解析器,
 /// 保证 FTS 的 seq 与详情页消息序号一致(搜索跳转依赖)。
 pub trait AgentAdapter: Send + Sync {
@@ -253,12 +256,23 @@ pub trait AgentAdapter: Send + Sync {
     fn parent_links_in_child(&self) -> bool {
         false
     }
-    /// 本家的子会话是不是**分支**——从父会话分出去、自己完整的一段对话(Claude Code 的
-    /// fork),而不是父会话的一部分(子代理、子任务)。是的话删父会话不带上它们:详情页
-    /// 删除只删父会话本身,Clean Up 里分支自成一棵清理树;父会话没了,分支变回顶层会话、
-    /// 露出完整历史。默认 false(随父会话一起删)。远程装饰器必须转发
-    fn children_outlive_parent(&self) -> bool {
+    /// 这条子会话(按它的文件)是不是**分支**——从父会话分出去、自己完整的一段对话(Claude
+    /// Code 的 fork),而不是父会话的一部分(子代理、子任务)。是的话删父会话不带上它:详情页
+    /// 删除只删父会话那一支,Clean Up 里分支自成一棵清理树;父会话没了,分支变回顶层会话、
+    /// 露出完整历史。按子会话判而不是按家判:同一家里分支与子代理并存(Claude Code)。默认
+    /// false(随父会话一起删)。远程装饰器必须转发
+    fn child_outlives_parent(&self, _child_path: &str) -> bool {
         false
+    }
+    /// 父会话就写在子会话自己的**路径**里的家(Claude Code、Cursor、CodeBuddy、Qoder 的子代理转录
+    /// 在 `<父会话>/subagents/` 里,Kimi 的在 `<会话>/agents/<名字>/` 里)给出从路径推父会话**原生 id**
+    /// 的函数:纯路径计算、不碰文件系统。关系同步对库里这一家的每条会话按它的胜出文件问一遍、按那个
+    /// 实例的 host 拼 key,与 `parent_links` 报的合在一起——这类关系不用另外枚举目录(每批监听都要
+    /// 同步一次关系);有它也就是这家管父子关系。这样的子会话停在它的父会话上、不往上压平(父会话
+    /// 本身是分支或分叉也一样,删它时目录连同子代理一起走),也不是能单独恢复的会话
+    /// (`adapters::resumable`)。默认 None。远程装饰器必须转发
+    fn parent_in_path(&self) -> Option<ParentInPath> {
+        None
     }
     /// `parent_links` 只记 agent 派出去的子会话(Grok 的 subagents 登记表)时为 true:关系同步
     /// 把挂上的子会话标成 `SessionMeta::spawned`。这类标记出自别的会话的边车,解析子会话时
@@ -607,11 +621,20 @@ pub fn adapter_for<'a>(
     adapter_ix_for(adapters, agent, file_path).map(|ix| adapters[ix].as_ref())
 }
 
-/// 这条会话所在的家,子会话是不是各自完整的对话(`AgentAdapter::children_outlive_parent`):
-/// 是的话删除与 Clean Up 都不带上它们。详情页删除问根会话、Clean Up 载入索引时问每条子
-/// 会话——关系只连同家会话,两种问法是同一个答案
-pub fn children_outlive_parent(adapters: &[Box<dyn AgentAdapter>], meta: &SessionMeta) -> bool {
-    adapter_for(adapters, meta.agent, &meta.file_path).is_some_and(|a| a.children_outlive_parent())
+/// 这条子会话是不是自己完整的对话(`AgentAdapter::child_outlives_parent`,按它的胜出文件问它所在
+/// 的实例):是的话删除父会话与 Clean Up 都不带上它
+pub fn child_outlives_parent(adapters: &[Box<dyn AgentAdapter>], child: &SessionMeta) -> bool {
+    adapter_for(adapters, child.agent, &child.file_path)
+        .is_some_and(|a| a.child_outlives_parent(&child.file_path))
+}
+
+/// 这条会话能不能单独恢复(详情页的 Open In):转录放在父会话目录里的子代理不能——它是父会话的
+/// 一部分,`claude --resume agent-…` 一类打不开。判据是它所在的实例按路径推得出父会话
+/// (`AgentAdapter::parent_in_path`),与关系同步同一个
+pub fn resumable(adapters: &[Box<dyn AgentAdapter>], meta: &SessionMeta) -> bool {
+    adapter_for(adapters, meta.agent, &meta.file_path)
+        .and_then(|a| a.parent_in_path())
+        .is_none_or(|parent| parent(std::path::Path::new(&meta.file_path)).is_none())
 }
 
 /// `parent_links` 的边:(子会话 id, 父会话 id) 拼成两个本地 key。指向自己的不要——scanner
@@ -1348,7 +1371,7 @@ mod tests {
             input: input.map(String::from),
             output: None,
             is_error: false,
-            sidechain_ref: None,
+            child_id: None,
         }
     }
 

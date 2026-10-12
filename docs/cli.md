@@ -64,7 +64,7 @@ wake-cli search -- --dry-run          # a query that starts with a dash
 
 ### `sessions`
 
-The most recently updated sessions. Sub-agents that their agent records as sessions of their own (Codex `spawn_agent`, Grok, OpenCode, DeepSeek Harness and others) are folded into their parents — `show` on the parent lists them by key; Claude Code and Cursor subagent transcripts live inside their session and are read with `show --subagent`; Codex's background threads (auto-review, `/review`, compaction, memory consolidation) are not indexed at all. Archived sessions are excluded. This is what to run when you want the key of "the session from yesterday".
+The most recently updated sessions. Sub-agents (Claude Code and Cursor subagents, Codex `spawn_agent`, Grok, OpenCode, DeepSeek Harness and others) are sessions of their own, folded into their parents — `show` on the parent lists them by key; Codex's background threads (auto-review, `/review`, compaction, memory consolidation) are not indexed at all. Archived sessions are excluded. This is what to run when you want the key of "the session from yesterday".
 
 Same options as `search`, plus `--starred` (only sessions you starred in Wake). `--limit` defaults to 20, max 100.
 
@@ -85,7 +85,7 @@ One session's transcript, parsed live from the agent's own files, as compact Mar
 | `--message-chars` | N | truncate each message, default 4000, range 100–50000 |
 | `--tools` | — | include tool inputs and outputs (verbose) |
 | `--thinking` | — | include the assistant's thinking where the agent recorded it |
-| `--subagent` | ID | read this subagent transcript instead of the main one; the main transcript lists the ids at its end (at most 30), and `'*'` lists them all |
+| `--subagent` | ID | read this subagent transcript instead of the main one; `'*'` lists the ids |
 
 `show` also accepts a bare native id (the one the agent's own `--resume` wants) and falls back to looking it up. When the same id exists on more than one host it lists the candidates instead of guessing.
 

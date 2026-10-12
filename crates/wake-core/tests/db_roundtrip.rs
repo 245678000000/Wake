@@ -543,6 +543,127 @@ fn since_on_root_lists_uses_aggregated_child_activity() {
     );
 }
 
+/// 分叉(或分支)下面还挂着它派的子代理:根会话的活动时间、消息数与 since 过滤连孙会话一起算,
+/// 子会话列表的 since 也连它下面的算。隐藏归档时,归档了的分叉下面的子代理自成一棵、不算进原件
+#[test]
+fn grandchildren_count_toward_their_root() {
+    let (_dir, store) = temp_store();
+    let session = |id: &str, updated_at: i64, message_count: i64| SessionMeta {
+        agent: AgentId::Kimi,
+        file_path: format!("/tmp/kimi/{id}/wire.jsonl"),
+        updated_at,
+        message_count,
+        ..meta(&format!("kimi:{id}"), id)
+    };
+    let original = session("a", 100, 2);
+    let fork = session("b", 200, 3);
+    let sub = session("b/agent-1", 900, 5);
+    store
+        .write_meta_only(&[
+            (original.clone(), 100),
+            (fork.clone(), 200),
+            (sub.clone(), 900),
+        ])
+        .unwrap();
+    store
+        .replace_parent_links(
+            AgentId::Kimi,
+            &[
+                (fork.key.clone(), original.key.clone()),
+                (sub.key.clone(), fork.key.clone()),
+            ],
+        )
+        .unwrap();
+
+    let recent = SessionFilter {
+        roots_only: true,
+        updated_since: Some(500),
+        limit: 20,
+        ..Default::default()
+    };
+    let (rows, total) = store.list_sessions(&recent).unwrap();
+    assert_eq!(total, 1, "只有孙会话是新的,整棵树也得留着");
+    assert_eq!(
+        (
+            rows[0].key.as_str(),
+            rows[0].updated_at,
+            rows[0].message_count
+        ),
+        (original.key.as_str(), 900, 10)
+    );
+    let children = store.list_children(&original.key, &recent).unwrap();
+    assert_eq!(
+        children.iter().map(|c| c.key.as_str()).collect::<Vec<_>>(),
+        [fork.key.as_str()],
+        "子会话的 since 同样连它下面的算"
+    );
+    assert_eq!(store.child_counts(&recent).unwrap()[&fork.key], 1);
+    assert_eq!(store.list_projects(false).unwrap()[0].last_active, 900);
+
+    store
+        .write_meta_only(&[(
+            SessionMeta {
+                archived: true,
+                ..fork.clone()
+            },
+            200,
+        )])
+        .unwrap();
+    let active = SessionFilter {
+        roots_only: true,
+        limit: 20,
+        ..Default::default()
+    };
+    let (rows, _) = store.list_sessions(&active).unwrap();
+    let summary: Vec<(&str, i64, i64)> = rows
+        .iter()
+        .map(|s| (s.key.as_str(), s.updated_at, s.message_count))
+        .collect();
+    assert_eq!(
+        summary,
+        [(sub.key.as_str(), 900, 5), (original.key.as_str(), 100, 2)]
+    );
+}
+
+/// 分叉这一轮才挂到别的项目的原件下:已经挂在分叉下的子代理同一轮跟着换成原件的项目,不等下一轮
+/// (只比父会话此刻的项目,子代理会被当成已经铺好)
+#[test]
+fn a_relinked_parent_carries_its_children_into_the_new_project() {
+    let (_dir, store) = temp_store();
+    let session = |id: &str, project: &str| SessionMeta {
+        agent: AgentId::Kimi,
+        project_path: format!("/w/{project}"),
+        project_name: project.to_string(),
+        file_path: format!("/tmp/kimi/{id}/wire.jsonl"),
+        ..meta(&format!("kimi:{id}"), id)
+    };
+    let original = session("a", "alpha");
+    let fork = session("b", "beta");
+    let sub = session("b/agent-1", "beta");
+    store
+        .write_meta_only(&[(original.clone(), 1), (fork.clone(), 1), (sub.clone(), 1)])
+        .unwrap();
+    store
+        .replace_parent_links(AgentId::Kimi, &[(sub.key.clone(), fork.key.clone())])
+        .unwrap();
+    store
+        .replace_parent_links(
+            AgentId::Kimi,
+            &[
+                (fork.key.clone(), original.key.clone()),
+                (sub.key.clone(), fork.key.clone()),
+            ],
+        )
+        .unwrap();
+    let project = |key: &str| {
+        let s = store.get_session(key).unwrap().unwrap();
+        (s.project_path, s.project_name)
+    };
+    let alpha = ("/w/alpha".to_string(), "alpha".to_string());
+    assert_eq!(project(&fork.key), alpha);
+    assert_eq!(project(&sub.key), alpha, "孙会话同一轮跟着换");
+}
+
 #[test]
 fn ignore_pins_gives_true_recency_order() {
     let (_dir, store) = temp_store();

@@ -108,6 +108,8 @@ icons!(
     "layers",
     "close",
     "git-branch",
+    "corner-left-up",
+    "corner-down-right",
     "refresh-cw",
     "inbox",
     "chevron-down",

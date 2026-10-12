@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 ///
 /// user/assistant/system 行以 `uuid` + `parentUuid` 组成可回退的消息树，尾部
 /// `active-leaf` 指向当前分支；标题、工作目录和运行配置则以独立元数据行追加。
-/// 会话同名目录还保存 state/subagents 等边车，主列表只枚举 project-key 目录
-/// 直属的 JSONL，不能把 `subagents/agent-*.jsonl` 当成顶层会话。
+/// 会话同名目录还保存 state/subagents 等边车：`subagents/agent-*.jsonl` 是派出去的
+/// 子代理(整份都是 `isSidechain: true` 的行),作为子会话挂在派它的会话下面。
 pub struct QoderAdapter {
     root: PathBuf,
 }
@@ -249,7 +249,9 @@ fn active_chain(
     out
 }
 
+/// 会话自己的转录跳过 sidechain 行;子代理的转录(`subagents/agent-*.jsonl`)整份都是 sidechain 行
 fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
+    let sidechain = subagent_session_dir(path).is_some();
     let _image_budget = transcript_image_decode_budget(decode_images);
     let file = fs::File::open(path)?;
     let reader = BufReader::with_capacity(1 << 20, file);
@@ -319,7 +321,7 @@ fn parse_qoder_jsonl(path: &Path, decode_images: bool) -> Result<QoderParse> {
             // attachment 本身不展示，但它有时会成为下一条消息的 parent，必须
             // 留在树里，否则 active-leaf 回溯会在这里提前断链。
             "user" | "assistant" | "system" | "attachment" => {
-                if row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+                if !sidechain && row.get("isSidechain").and_then(Value::as_bool) == Some(true) {
                     continue;
                 }
                 let Some(uuid) = optional_string(row.get("uuid")) else {
@@ -620,6 +622,15 @@ fn build_meta(r: &SessionFileRef, parsed: &QoderParse) -> SessionMeta {
     }
 }
 
+/// 会话或子代理(子代理是 agent 派出去的,标题取边车记的任务说明)
+fn parse(r: &SessionFileRef, decode_images: bool) -> Result<(SessionMeta, QoderParse)> {
+    let path = Path::new(&r.file_path);
+    let parsed = parse_qoder_jsonl(path, decode_images)?;
+    let mut meta = build_meta(r, &parsed);
+    mark_subagent(&mut meta, path);
+    Ok((meta, parsed))
+}
+
 impl AgentAdapter for QoderAdapter {
     fn agent(&self) -> AgentId {
         AgentId::Qoder
@@ -630,18 +641,11 @@ impl AgentAdapter for QoderAdapter {
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        let relative = path.strip_prefix(&self.root).ok()?;
-        // root/<session>.jsonl 或 root/<project-key>/<session>.jsonl；更深的
-        // state/subagents/memory 均是边车，不得成为顶层会话。
-        if relative.components().count() > 2 {
-            return None;
-        }
-        default_file_ref(self.agent(), path)
+        project_tree_file_ref(&self.root, AgentId::Qoder, path)
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let parsed = parse_qoder_jsonl(Path::new(&r.file_path), false)?;
-        let meta = build_meta(r, &parsed);
+        let (meta, parsed) = parse(r, false)?;
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,
@@ -650,16 +654,34 @@ impl AgentAdapter for QoderAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let parsed = parse_qoder_jsonl(Path::new(&r.file_path), true)?;
-        Ok(ParsedTranscript {
-            meta: build_meta(r, &parsed),
-            mainline: parsed.messages,
-            sidechains: Vec::new(),
-            unknown_line_count: parsed.unknown_lines,
+        let (meta, parsed) = parse(r, true)?;
+        Ok(transcript_with_subagents(
+            r,
+            meta,
+            parsed.messages,
+            parsed.unknown_lines,
+        ))
+    }
+
+    fn load_sidechain(
+        &self,
+        r: &SessionFileRef,
+        sidechain_id: &str,
+    ) -> Result<Vec<TranscriptMessage>> {
+        load_subagent(r, sidechain_id, |file| {
+            Ok(parse_qoder_jsonl(file, true)?.messages)
         })
     }
 
+    /// 子代理挂到派它的会话下面:所在会话目录的名字就是那个会话的 id
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        Some(subagent_parent)
+    }
+
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        if is_subagent_transcript(&meta.file_path) {
+            return subagent_paths(&meta.file_path);
+        }
         let mut paths = vec![meta.file_path.clone()];
         if let Some(parent) = Path::new(&meta.file_path).parent() {
             let sidecar = parent.join(&meta.id);

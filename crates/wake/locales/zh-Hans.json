@@ -201,6 +201,8 @@
   "Not found next to the Wake app — reinstall Wake": "没在 Wake 应用旁边找到 —— 重装 Wake",
   "Not started": "未开始",
   "Only the local file is removed — Codex's own records stay intact.": "只会删除本地文件 —— Codex 自己的记录不受影响。",
+  "Open parent session": "打开父会话",
+  "Open subagent session": "打开子代理会话",
   "Open system trash": "打开系统废纸篓",
   "Open this session": "打开此会话",
   "Open this session in {}": "在 {} 中打开此会话",

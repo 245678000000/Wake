@@ -230,8 +230,11 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 /// "14" = ZCode 的分叉折掉从父任务复制来的一段、辅助对话的固定标题退回首条提问,两者的
 ///       token / 模型只算复制边界之后的,时间线分隔条不再计未知行,老行靠这轮重解析回填;
 /// "15" = 各家把 agent 派出去的子会话标出来(sessions.spawned,Insights 的提问数与会话数不算
-///       它),老行靠这轮重解析写对。
-pub const FTS_FORMAT: &str = "15";
+///       它),老行靠这轮重解析写对;
+/// "16" = 会话目录里的子代理转录(Claude Code 含 Workflow、Cursor CLI、CodeBuddy / WorkBuddy、
+///       Qoder、Kimi)作为子会话入库、标 spawned,`<git-context>` 不进标题;旧版监听当顶层会话收进来
+///       的 Workflow 转录(sidechain 行被滤掉、零消息)文件没变、引用也没变,靠这轮重解析写对。
+pub const FTS_FORMAT: &str = "16";
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把
@@ -1027,95 +1030,43 @@ impl Store {
     /// 用某家 adapter 的全量快照原子替换父子关系。只接受库内存在、同 agent、
     /// 非自指的父子键；陈旧关系会被清空。返回是否真的改变了任何行。
     pub fn replace_parent_links(&self, agent: AgentId, links: &[(String, String)]) -> Result<bool> {
-        // Claude 的分支关系每批 watcher 事件都会对账一遍,绝大多数时候什么都没变:在读连接
-        // 上比一眼即回,不开写事务(replace_claims 同款早退)
-        if self.parent_links_settled(agent, links)? {
+        // 关系每批 watcher 事件都会对账一遍,绝大多数时候什么都没变:在读连接上比一眼即回,
+        // 不开写事务(replace_claims 同款早退)。有要改的也只改那几行——Claude 的子代理一挂就是
+        // 上千条关系,整组清掉重写一次要持写锁十几毫秒
+        if parent_link_changes(&self.read.lock().unwrap(), agent, links)?.is_empty() {
             return Ok(false);
         }
         let mut conn = self.write.lock().unwrap();
         let tx = conn.transaction()?;
-        let before: Vec<(String, String)> = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT key, parent_key FROM sessions
-                 WHERE agent_id = ?1 AND parent_key != '' ORDER BY key",
+        // 写事务里再算一遍:读连接那一眼之后可能有别的写入
+        let changes = parent_link_changes(&tx, agent, links)?;
+        let mut changed = false;
+        {
+            let mut clear =
+                tx.prepare_cached("UPDATE sessions SET parent_key = '' WHERE key = ?1")?;
+            // 项目在 parent_link_changes 里按这一轮的关系算好:逐行照父会话此刻的抄,结果就看
+            // 先写父还是先写子
+            let mut set = tx.prepare_cached(
+                "UPDATE sessions AS child SET parent_key = ?1, project_path = ?2, project_name = ?3
+                 WHERE child.key = ?4 AND child.agent_id = ?5 AND child.key != ?1
+                   AND EXISTS (
+                     SELECT 1 FROM sessions parent
+                     WHERE parent.key = ?1 AND parent.agent_id = child.agent_id
+                   )",
             )?;
-            let rows = stmt.query_map(params![agent.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
-        tx.execute(
-            "UPDATE sessions SET parent_key = '' WHERE agent_id = ?1 AND parent_key != ''",
-            params![agent.as_str()],
-        )?;
-        let mut update = tx.prepare_cached(
-            "UPDATE sessions AS child SET
-               parent_key = ?1,
-               project_path = COALESCE((
-                 SELECT NULLIF(parent.project_path, '') FROM sessions parent WHERE parent.key = ?1
-               ), child.project_path),
-               project_name = COALESCE((
-                 SELECT NULLIF(parent.project_name, '') FROM sessions parent WHERE parent.key = ?1
-               ), child.project_name)
-             WHERE child.key = ?2 AND child.agent_id = ?3 AND child.key != ?1
-               AND EXISTS (
-                 SELECT 1 FROM sessions parent
-                 WHERE parent.key = ?1 AND parent.agent_id = child.agent_id
-               )",
-        )?;
-        let mut unique = std::collections::HashSet::new();
-        for (child, parent) in links {
-            if unique.insert(child.as_str()) {
-                update.execute(params![parent, child, agent.as_str()])?;
+            // 只铺项目、父会话没换的不算关系变了(与整组重写时的口径一样,不惊动列表)
+            for change in &changes {
+                let written = match &change.parent {
+                    Some((parent, path, name)) => {
+                        set.execute(params![parent, path, name, change.child, agent.as_str()])?
+                    }
+                    None => clear.execute(params![change.child])?,
+                };
+                changed |= written > 0 && change.relinks;
             }
         }
-        drop(update);
-        let after: Vec<(String, String)> = {
-            let mut stmt = tx.prepare_cached(
-                "SELECT key, parent_key FROM sessions
-                 WHERE agent_id = ?1 AND parent_key != '' ORDER BY key",
-            )?;
-            let rows = stmt.query_map(params![agent.as_str()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            rows.collect::<rusqlite::Result<_>>()?
-        };
         tx.commit()?;
-        Ok(before != after)
-    }
-
-    /// `replace_parent_links` 写下去会不会什么都不变:每个子会话挂的父会话与写入路径算的
-    /// 一致(每个子会话取第一条边;父会话不在库里、或就是自己的不挂),而且挂着的子会话
-    /// 已经是父会话的项目(写入路径会把父会话的项目再铺一遍——子会话重解析后自己的项目
-    /// 会盖回来,这时必须写)
-    fn parent_links_settled(&self, agent: AgentId, links: &[(String, String)]) -> Result<bool> {
-        let conn = self.read.lock().unwrap();
-        let mut stmt = conn.prepare_cached(
-            "SELECT key, parent_key, project_path, project_name FROM sessions WHERE agent_id = ?1",
-        )?;
-        let rows: HashMap<String, (String, String, String)> = stmt
-            .query_map(params![agent.as_str()], |r| {
-                Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        let mut first: HashMap<&str, &str> = HashMap::new();
-        for (child, parent) in links {
-            first.entry(child.as_str()).or_insert(parent.as_str());
-        }
-        Ok(rows.iter().all(|(key, (parent_key, path, name))| {
-            let wanted = first
-                .get(key.as_str())
-                .filter(|parent| **parent != key.as_str())
-                .and_then(|parent| rows.get(*parent).map(|row| (*parent, row)));
-            match wanted {
-                None => parent_key.is_empty(),
-                Some((parent, (_, parent_path, parent_name))) => {
-                    parent_key == parent
-                        && (parent_path.is_empty() || path == parent_path)
-                        && (parent_name.is_empty() || name == parent_name)
-                }
-            }
-        }))
+        Ok(changed)
     }
 
     /// 把这些会话标成 agent 派出去的(sessions.spawned;`AgentAdapter::linked_children_are_spawned`
@@ -1389,12 +1340,7 @@ impl Store {
         let conn = self.read.lock().unwrap();
         let sql = format!("SELECT {SESSION_COLS}, s.parent_key FROM sessions s LEFT JOIN user_data u ON u.session_key = s.key");
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| {
-            Ok(crate::cleanup::IndexedSession {
-                meta: row_to_meta(r)?,
-                parent: r.get(19)?,
-            })
-        })?;
+        let rows = stmt.query_map([], row_to_indexed)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -1879,8 +1825,8 @@ impl Store {
         // 根会话的"活动时间"是连子会话一起聚合的(排序、返回值都如此),since
         // 过滤必须用同一口径——只看父行会把"父旧子新"的整棵树滤掉
         let updated_col = match (f.roots_only, f.include_archived) {
-            (true, false) => ROOT_UPDATED_ACTIVE,
-            (true, true) => ROOT_UPDATED_ALL,
+            (true, false) => TREE_UPDATED_ACTIVE,
+            (true, true) => TREE_UPDATED_ALL,
             _ => "s.updated_at",
         };
         push_session_filters(f, updated_col, &mut wheres, &mut args);
@@ -1897,10 +1843,10 @@ impl Store {
             format!("WHERE {}", wheres.join(" AND "))
         };
         let order_col = match (f.roots_only, f.sort, f.include_archived) {
-            (true, SortKey::Updated, false) => ROOT_UPDATED_ACTIVE,
-            (true, SortKey::Updated, true) => ROOT_UPDATED_ALL,
-            (true, SortKey::Messages, false) => ROOT_MESSAGES_ACTIVE,
-            (true, SortKey::Messages, true) => ROOT_MESSAGES_ALL,
+            (true, SortKey::Updated, false) => TREE_UPDATED_ACTIVE,
+            (true, SortKey::Updated, true) => TREE_UPDATED_ALL,
+            (true, SortKey::Messages, false) => TREE_MESSAGES_ACTIVE,
+            (true, SortKey::Messages, true) => TREE_MESSAGES_ALL,
             (_, SortKey::Updated, _) => "s.updated_at",
             (_, SortKey::Created, _) => "s.created_at",
             (_, SortKey::Messages, _) => "s.message_count",
@@ -1946,8 +1892,8 @@ impl Store {
         Ok((out, total))
     }
 
-    /// 当前筛选下各根会话可见的直接子会话数。Grok 关系在入库时已扁平到
-    /// root，因此一次 GROUP BY 足够覆盖任意原始嵌套深度。
+    /// 当前筛选下各会话可见的直接子会话数,一次 GROUP BY parent_key:关系入库时已压平(树最多
+    /// 两层),分支下面的子代理算在分支名下
     pub fn child_counts(&self, f: &SessionFilter) -> Result<HashMap<String, i64>> {
         let (where_sql, args) = child_filter_sql(f, None);
         let conn = self.read.lock().unwrap();
@@ -2006,7 +1952,8 @@ impl Store {
     }
 
     /// 删除确认使用：不受当前列表筛选和 archived 状态影响，递归取完整子树。
-    pub fn all_descendants(&self, key: &str) -> Result<Vec<SessionMeta>> {
+    /// 一条会话下面的全部子孙,各带它的直接父会话(删除时按它判哪些挂在留下的分支下面)
+    pub fn all_descendants(&self, key: &str) -> Result<Vec<crate::cleanup::IndexedSession>> {
         let conn = self.read.lock().unwrap();
         let sql = format!(
             "WITH RECURSIVE descendants(key) AS (
@@ -2015,15 +1962,31 @@ impl Store {
                SELECT child.key FROM sessions child
                JOIN descendants parent ON child.parent_key = parent.key
              )
-             SELECT {SESSION_COLS}
+             SELECT {SESSION_COLS}, s.parent_key
              FROM sessions s
              JOIN descendants d ON d.key = s.key
              LEFT JOIN user_data u ON u.session_key = s.key
              ORDER BY s.created_at, s.key"
         );
         let mut stmt = conn.prepare_cached(&sql)?;
-        let rows = stmt.query_map(params![key], row_to_meta)?;
+        let rows = stmt.query_map(params![key], row_to_indexed)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 这些 key 里库里有的(详情页只给索引里真有的子会话画跳转按钮)
+    pub fn indexed_keys<'a>(
+        &self,
+        keys: impl IntoIterator<Item = &'a str>,
+    ) -> Result<std::collections::HashSet<String>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare_cached("SELECT 1 FROM sessions WHERE key = ?1")?;
+        let mut found = std::collections::HashSet::new();
+        for key in keys {
+            if stmt.exists(params![key])? {
+                found.insert(key.to_string());
+            }
+        }
+        Ok(found)
     }
 
     pub fn get_session(&self, key: &str) -> Result<Option<SessionMeta>> {
@@ -2052,10 +2015,10 @@ impl Store {
     /// 归档会话,只剩归档会话的项目不能在解析这一步就被挡掉
     pub fn list_projects(&self, include_archived: bool) -> Result<Vec<ProjectInfo>> {
         let (root_updated, root_cond, archived) = if include_archived {
-            (ROOT_UPDATED_ALL, ROOT_IGNORING_ARCHIVED, "")
+            (TREE_UPDATED_ALL, ROOT_IGNORING_ARCHIVED, "")
         } else {
             (
-                ROOT_UPDATED_ACTIVE,
+                TREE_UPDATED_ACTIVE,
                 ROOT_WHEN_HIDING_ARCHIVED,
                 "s.archived = 0 AND ",
             )
@@ -3016,36 +2979,59 @@ const ROOT_WHEN_HIDING_ARCHIVED: &str = "(s.parent_key = '' OR NOT EXISTS (
      ))";
 const ROOT_IGNORING_ARCHIVED: &str =
     "(s.parent_key = '' OR NOT EXISTS (SELECT 1 FROM sessions p WHERE p.key = s.parent_key))";
-const ROOT_UPDATED_ACTIVE: &str =
-    "MAX(s.updated_at, COALESCE((SELECT MAX(c.updated_at) FROM sessions c
-      WHERE c.parent_key = s.key AND c.archived = 0), 0))";
-const ROOT_UPDATED_ALL: &str =
-    "MAX(s.updated_at, COALESCE((SELECT MAX(c.updated_at) FROM sessions c
-      WHERE c.parent_key = s.key), 0))";
-const ROOT_MESSAGES_ACTIVE: &str =
-    "s.message_count + COALESCE((SELECT SUM(c.message_count) FROM sessions c
-      WHERE c.parent_key = s.key AND c.archived = 0), 0)";
-const ROOT_MESSAGES_ALL: &str =
-    "s.message_count + COALESCE((SELECT SUM(c.message_count) FROM sessions c
-      WHERE c.parent_key = s.key), 0)";
-const ROOT_SESSION_COLS_ACTIVE: &str =
-    "s.key, s.agent_id, s.native_id, s.title, s.project_path, s.project_name,
-     s.git_branch, s.created_at,
-     MAX(s.updated_at, COALESCE((SELECT MAX(c.updated_at) FROM sessions c
-       WHERE c.parent_key = s.key AND c.archived = 0), 0)),
-     s.message_count + COALESCE((SELECT SUM(c.message_count) FROM sessions c
-       WHERE c.parent_key = s.key AND c.archived = 0), 0),
-     s.tokens_used, s.model, s.source, s.archived, s.file_path, s.file_size,
-     COALESCE(u.favorite,0), COALESCE(u.pinned,0), s.host";
-const ROOT_SESSION_COLS_ALL: &str =
-    "s.key, s.agent_id, s.native_id, s.title, s.project_path, s.project_name,
-     s.git_branch, s.created_at,
-     MAX(s.updated_at, COALESCE((SELECT MAX(c.updated_at) FROM sessions c
-       WHERE c.parent_key = s.key), 0)),
-     s.message_count + COALESCE((SELECT SUM(c.message_count) FROM sessions c
-       WHERE c.parent_key = s.key), 0),
-     s.tokens_used, s.model, s.source, s.archived, s.file_path, s.file_size,
-     COALESCE(u.favorite,0), COALESCE(u.pinned,0), s.host";
+/// 会话 `s` 下面的子孙 `c`:子会话与孙会话——分支、分叉下面还挂着它们派的子代理,树最多两层
+/// (scanner 的 `flattened_parent`)。`active` 不算归档的,也不算归档了的子会话下面的:隐藏归档
+/// 时那些自成一棵(`ROOT_WHEN_HIDING_ARCHIVED`)
+macro_rules! in_tree {
+    (active) => {
+        "c.archived = 0 AND (c.parent_key = s.key OR c.parent_key IN (
+           SELECT m.key FROM sessions m WHERE m.parent_key = s.key AND m.archived = 0))"
+    };
+    (all) => {
+        "(c.parent_key = s.key OR c.parent_key IN (
+           SELECT m.key FROM sessions m WHERE m.parent_key = s.key))"
+    };
+}
+/// 连子孙一起的活动时间:根会话排序、返回值与 since 过滤同一口径——只算一层的话,原件与分支
+/// 都旧、只有分支派的子代理刚跑过的整棵树会被 since 滤掉(Codex review 2026-10-12)
+macro_rules! tree_updated {
+    ($tree:ident) => {
+        concat!(
+            "MAX(s.updated_at, COALESCE((SELECT MAX(c.updated_at) FROM sessions c WHERE ",
+            in_tree!($tree),
+            "), 0))"
+        )
+    };
+}
+macro_rules! tree_messages {
+    ($tree:ident) => {
+        concat!(
+            "s.message_count + COALESCE((SELECT SUM(c.message_count) FROM sessions c WHERE ",
+            in_tree!($tree),
+            "), 0)"
+        )
+    };
+}
+/// `SESSION_COLS` 的根会话版:活动时间与消息数连子孙一起算
+macro_rules! root_session_cols {
+    ($tree:ident) => {
+        concat!(
+            "s.key, s.agent_id, s.native_id, s.title, s.project_path, s.project_name,
+     s.git_branch, s.created_at, ",
+            tree_updated!($tree),
+            ", ",
+            tree_messages!($tree),
+            ", s.tokens_used, s.model, s.source, s.archived, s.file_path, s.file_size,
+     COALESCE(u.favorite,0), COALESCE(u.pinned,0), s.host"
+        )
+    };
+}
+const TREE_UPDATED_ACTIVE: &str = tree_updated!(active);
+const TREE_UPDATED_ALL: &str = tree_updated!(all);
+const TREE_MESSAGES_ACTIVE: &str = tree_messages!(active);
+const TREE_MESSAGES_ALL: &str = tree_messages!(all);
+const ROOT_SESSION_COLS_ACTIVE: &str = root_session_cols!(active);
+const ROOT_SESSION_COLS_ALL: &str = root_session_cols!(all);
 
 /// 主线上某个角色最近的单元里,第一个 `decode` 读得出话的(往回最多看 `limit` 条)。按 id
 /// 倒着走 idx_messages_session:同一会话的单元按 seq 顺序写入、追加只加在后面
@@ -3083,7 +3069,13 @@ fn child_filter_sql(
         }
         None => wheres.push("s.parent_key != ''".to_string()),
     }
-    push_session_filters(filter, "s.updated_at", &mut wheres, &mut args);
+    // 子会话下面也可能挂着子会话(分支派的子代理):since 与根会话同一口径,连它下面的一起算
+    let updated_col = if filter.include_archived {
+        TREE_UPDATED_ALL
+    } else {
+        TREE_UPDATED_ACTIVE
+    };
+    push_session_filters(filter, updated_col, &mut wheres, &mut args);
     (format!("WHERE {}", wheres.join(" AND ")), args)
 }
 
@@ -3306,6 +3298,95 @@ fn upsert_memory(tx: &rusqlite::Transaction<'_>, d: &MemoryDoc) -> Result<()> {
     tx.prepare_cached("INSERT INTO memories_fts(rowid, title, body) VALUES (?1, ?2, ?3)")?
         .execute(params![id, d.title, d.body])?;
     Ok(())
+}
+
+/// `replace_parent_links` 要改的一行
+struct LinkChange {
+    child: String,
+    /// Some = 挂上它、铺上这个项目(路径, 名字);None = 解挂
+    parent: Option<(String, String, String)>,
+    /// 父会话换了(解挂也算);只是重铺项目的为 false
+    relinks: bool,
+}
+
+/// `replace_parent_links` 要改的行。每个子会话按它的第一条边;父会话不在库里、或就是自己的不挂;
+/// 挂着的子会话还得已经是它该有的项目(挂上时把祖先的项目铺下来——子会话重解析后自己的项目会
+/// 盖回来,那时要再铺一遍)。该有的项目按**这一轮的关系**一路往上找:从根往下第一个有项目的祖先
+/// 的,都没有就是它自己的。只看父会话此刻的项目会漏掉孙会话——分支这一轮才挂到别的项目的原件下,
+/// 它派的子代理还比着分支的旧项目,算成已经铺好(Codex review 2026-10-12)
+fn parent_link_changes(
+    conn: &Connection,
+    agent: AgentId,
+    links: &[(String, String)],
+) -> Result<Vec<LinkChange>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT key, parent_key, project_path, project_name FROM sessions WHERE agent_id = ?1",
+    )?;
+    let rows: HashMap<String, (String, String, String)> = stmt
+        .query_map(params![agent.as_str()], |r| {
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?)))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut first: HashMap<&str, &str> = HashMap::new();
+    for (child, parent) in links {
+        first.entry(child.as_str()).or_insert(parent.as_str());
+    }
+    let wanted = |key: &str| {
+        first
+            .get(key)
+            .copied()
+            .filter(|parent| *parent != key && rows.contains_key(*parent))
+    };
+    let mut changes = Vec::new();
+    for (key, (parent_key, path, name)) in &rows {
+        let Some(parent) = wanted(key) else {
+            if !parent_key.is_empty() {
+                changes.push(LinkChange {
+                    child: key.clone(),
+                    parent: None,
+                    relinks: true,
+                });
+            }
+            continue;
+        };
+        let mut ancestors = vec![parent];
+        while let Some(next) = wanted(ancestors[ancestors.len() - 1]) {
+            if next == key.as_str() || ancestors.contains(&next) {
+                break;
+            }
+            ancestors.push(next);
+        }
+        let inherited = |field: fn(&(String, String, String)) -> &String, own: &String| {
+            ancestors
+                .iter()
+                .rev()
+                .map(|ancestor| field(&rows[*ancestor]))
+                .find(|value| !value.is_empty())
+                .unwrap_or(own)
+                .clone()
+        };
+        let project_path = inherited(|row| &row.1, path);
+        let project_name = inherited(|row| &row.2, name);
+        let relinks = parent_key != parent;
+        if relinks || *path != project_path || *name != project_name {
+            changes.push(LinkChange {
+                child: key.clone(),
+                parent: Some((parent.to_string(), project_path, project_name)),
+                relinks,
+            });
+        }
+    }
+    // 先解挂再挂上,按 key 排:两次计算给出同一个次序
+    changes.sort_by(|a, b| (a.parent.is_some(), &a.child).cmp(&(b.parent.is_some(), &b.child)));
+    Ok(changes)
+}
+
+/// `SESSION_COLS` 后面再跟一列 parent_key 的行
+fn row_to_indexed(r: &rusqlite::Row<'_>) -> rusqlite::Result<crate::cleanup::IndexedSession> {
+    Ok(crate::cleanup::IndexedSession {
+        meta: row_to_meta(r)?,
+        parent: r.get(19)?,
+    })
 }
 
 fn row_to_meta(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMeta> {

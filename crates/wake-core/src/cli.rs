@@ -204,7 +204,7 @@ const F_SUBAGENT: FlagSpec = FlagSpec::new(
     "subagent",
     Arity::Value,
     "ID",
-    "read this subagent transcript instead of the main one (ids are listed at the end of the main transcript)",
+    "read this subagent transcript instead of the main one ('*' lists the ids)",
 );
 
 const SEARCH_FLAGS: &[FlagSpec] = &[F_PROJECT, F_AGENT, F_SINCE, F_LIMIT];

@@ -9,6 +9,9 @@
 - Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
 - Update: Insights no longer counts subagent sessions, or the prompts in them, as yours; their tokens still count
 - New: You can have agents use Wake only when you ask, not on their own; "Only when you ask" in the MCP guide shows how (#64, thanks @ItsRyanWu)
+- New: Subagents started by Claude Code, Cursor, CodeBuddy, WorkBuddy, Qoder and Kimi Code are sessions of their own, listed under the session that started them, so you can search and open them like any other
+- New: A tool call that started a subagent has a button that opens the subagent's session, and a subagent's session links back to the one that started it
+- Fix: Claude Code workflow steps no longer show up as separate sessions while they run and vanish on the next refresh
 
 ## [0.9.1] — 2026-10-10
 

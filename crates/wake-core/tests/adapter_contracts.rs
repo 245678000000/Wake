@@ -173,6 +173,32 @@ fn sorted_links(adapter: &dyn AgentAdapter) -> Vec<(String, String)> {
     links
 }
 
+/// 列出来的会话里父会话写在路径里的(`parent_in_path`):(子会话 key, 父会话 key),按 key 排序
+fn path_links(adapter: &dyn AgentAdapter) -> Vec<(String, String)> {
+    let Some(parent_in_path) = adapter.parent_in_path() else {
+        return Vec::new();
+    };
+    let mut links: Vec<(String, String)> = adapter
+        .list_session_files()
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            let parent = parent_in_path(Path::new(&r.file_path))?;
+            Some((
+                session_key(r.agent, "", &r.native_id),
+                session_key(r.agent, "", &parent),
+            ))
+        })
+        .collect();
+    links.sort();
+    links
+}
+
+/// 这条会话在 `adapter` 里能不能单独恢复(`adapters::resumable`)
+fn resumable(adapter: &Box<dyn AgentAdapter>, meta: &SessionMeta) -> bool {
+    wake_core::adapters::resumable(std::slice::from_ref(adapter), meta)
+}
+
 /// 列出来的会话里哪些标成了 agent 派出去的(`SessionMeta.spawned`),按 id 排序
 fn spawned_ids(adapter: &dyn AgentAdapter) -> Vec<String> {
     let mut refs = adapter.list_session_files().unwrap();
@@ -540,6 +566,343 @@ fn claude_parse_contract() {
     assert_eq!(s2.meta.message_count, 1);
 }
 
+/// Claude Code 的子代理转录作为子会话:Task / Agent 派的与 Workflow 跑出来的都列出、挂到派它
+/// 的会话下,标题取边车里的任务说明(没有就是派活那句话),算 agent 派出去的;Workflow 的运行
+/// 日志 journal.jsonl 不是转录。边车的事件换成它的转录;派活的工具调用指向那条子会话;子代理
+/// 不随原件留下(分支才留下),删除带走转录与边车。在私有临时目录里搭(共用的假 HOME 只读)
+#[test]
+fn claude_subagents_become_child_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let dir = projects.join("-Users-tester-Github-subfx");
+    let parent = "5ab0a6e0-0000-4000-8000-000000000001";
+    let (task, step) = common::stage_claude_subagents(&dir, parent, "p", "toolu_task_1");
+    let parent_path = dir.join(format!("{parent}.jsonl"));
+    let line = |value: serde_json::Value| format!("{value}\n");
+    fs::write(
+        &parent_path,
+        [
+            line(serde_json::json!({
+                "parentUuid": null, "isSidechain": false, "cwd": "/Users/tester/Github/subfx",
+                "sessionId": parent, "type": "user", "uuid": "p-u1",
+                "timestamp": "2026-10-01T10:00:00.000Z",
+                "message": { "role": "user", "content": "Review the parser" },
+            })),
+            line(serde_json::json!({
+                "parentUuid": "p-u1", "isSidechain": false, "cwd": "/Users/tester/Github/subfx",
+                "sessionId": parent, "type": "assistant", "uuid": "p-a1",
+                "timestamp": "2026-10-01T10:00:05.000Z",
+                "message": { "id": "msg_p_1", "role": "assistant", "model": "claude-opus-5-5",
+                    "content": [{ "type": "tool_use", "id": "toolu_task_1", "name": "Agent",
+                        "input": { "description": "Check the parser", "prompt": "Look at src/parser.rs" } }] },
+            })),
+            line(serde_json::json!({
+                "parentUuid": "p-a1", "isSidechain": false, "cwd": "/Users/tester/Github/subfx",
+                "sessionId": parent, "type": "user", "uuid": "p-u2",
+                "timestamp": "2026-10-01T10:00:30.000Z",
+                "message": { "role": "user", "content": [{ "type": "tool_result",
+                    "tool_use_id": "toolu_task_1", "content": "The parser handles every case." }] },
+            })),
+        ]
+        .concat(),
+    )
+    .unwrap();
+    let adapter = ClaudeAdapter::new().with_custom_root(projects.clone());
+
+    let listed = adapter.list_session_files().unwrap();
+    let mut ids: Vec<&str> = listed.iter().map(|r| r.native_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        [parent, step.as_str(), task.as_str()],
+        "journal.jsonl 不是转录"
+    );
+
+    let subagents = dir.join(parent).join("subagents");
+    let transcript = subagents.join(format!("{task}.jsonl"));
+    let sidecar = subagents.join(format!("{task}.meta.json"));
+    let by_sidecar = adapter.file_ref(&sidecar).expect("边车换成转录的引用");
+    let listed_task = listed.iter().find(|r| r.native_id == task).unwrap();
+    assert_eq!(by_sidecar.file_path, transcript.to_string_lossy());
+    assert_eq!(
+        (by_sidecar.mtime_ms, by_sidecar.size),
+        (listed_task.mtime_ms, listed_task.size),
+        "边车并进引用,watcher 与列表一致"
+    );
+    let run = subagents.join("workflows").join("wf_p-run");
+    assert!(adapter.file_ref(&run.join("journal.jsonl")).is_none());
+
+    let child = adapter.parse_session(&by_sidecar).unwrap();
+    assert_eq!(child.meta.key, format!("claude-code:{task}"));
+    assert_eq!(child.meta.title, "Check the parser");
+    assert!(child.meta.spawned, "子代理是 agent 派出去的");
+    assert_eq!(child.meta.message_count, 2);
+    assert_eq!(child.meta.tokens_used, Some(15));
+    assert_seq_contract(adapter.as_ref(), &by_sidecar);
+    let workflow = listed.iter().find(|r| r.native_id == step).unwrap();
+    let step_meta = adapter.parse_session(workflow).unwrap().meta;
+    assert_eq!(
+        step_meta.title, "Workflow step: run the tests",
+        "没有任务说明就取派活那句话"
+    );
+    assert!(step_meta.spawned);
+
+    let parent_key = format!("claude-code:{parent}");
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![
+            edge(&format!("claude-code:{step}"), &parent_key),
+            edge(&format!("claude-code:{task}"), &parent_key),
+        ]
+    );
+    assert!(
+        sorted_links(adapter.as_ref()).is_empty(),
+        "子代理的关系按路径推,不另外枚举"
+    );
+
+    // 父会话:自己的消息里没有子代理的行;派活的调用指向子会话
+    let parent_ref = listed.iter().find(|r| r.native_id == parent).unwrap();
+    assert!(!adapter.parse_session(parent_ref).unwrap().meta.spawned);
+    let t = adapter.parse_transcript(parent_ref).unwrap();
+    let call = t
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .find(|c| c.id == "toolu_task_1")
+        .expect("派活的调用");
+    assert_eq!(call.child_id.as_deref(), Some(task.as_str()));
+
+    // 子代理不能单独恢复(`claude --resume agent-…` 打不开),它的父会话照常
+    assert!(!resumable(&adapter, &child.meta));
+    assert!(resumable(
+        &adapter,
+        &adapter.parse_session(parent_ref).unwrap().meta
+    ));
+
+    // 删除:子代理随父会话走(分支才留下),自己删时带走转录与边车
+    assert!(adapter.child_outlives_parent(&parent_ref.file_path));
+    assert!(!adapter.child_outlives_parent(&by_sidecar.file_path));
+    assert_eq!(
+        adapter.session_paths(&child.meta),
+        [
+            transcript.to_string_lossy().to_string(),
+            sidecar.to_string_lossy().to_string()
+        ]
+    );
+}
+
+/// Cursor 的子代理(Task 派出去的,转录在父会话目录的 subagents/ 里)作为子会话入库:按路径挂到
+/// 父会话下、标成派出去的;父会话里派活的调用指向它——头一回派的按子代理收到的第一句对上,
+/// 接着派的按 `resume` 点名。对不上派活调用的照样列出、挂在父会话下。在私有临时目录里搭
+#[test]
+fn cursor_subagents_become_child_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let parent = "c0a6e0aa-0000-4000-8000-000000000001";
+    let (sub, orphan) = (
+        "c0a6e0aa-0000-4000-8000-0000000000a1",
+        "c0a6e0aa-0000-4000-8000-0000000000a2",
+    );
+    let session = projects
+        .join("-Users-tester-Github-cursub")
+        .join("agent-transcripts")
+        .join(parent);
+    let subagents = session.join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let lines = |rows: &[serde_json::Value]| -> String {
+        rows.iter().map(|row| format!("{row}\n")).collect()
+    };
+    let user = |text: &str| {
+        serde_json::json!({ "role": "user", "message": { "content": [
+            { "type": "text", "text": format!("<user_query>\n{text}\n</user_query>") }] } })
+    };
+    let reply = |content: serde_json::Value| serde_json::json!({ "role": "assistant", "message": { "content": content } });
+    let parent_path = session.join(format!("{parent}.jsonl"));
+    fs::write(
+        &parent_path,
+        lines(&[
+            user("Review the parser"),
+            reply(serde_json::json!([
+                { "type": "text", "text": "Sending a reviewer." },
+                { "type": "tool_use", "name": "Task", "input": {
+                    "description": "Check the parser", "subagent_type": "explore",
+                    "prompt": "Look at src/parser.rs and report problems" } }
+            ])),
+            serde_json::json!({ "type": "turn_ended" }),
+            user("Ask it again"),
+            reply(serde_json::json!([
+                { "type": "tool_use", "name": "Task", "input": {
+                    "description": "Check the parser", "prompt": "Repeat the findings",
+                    "resume": sub } }
+            ])),
+        ]),
+    )
+    .unwrap();
+    let sub_path = subagents.join(format!("{sub}.jsonl"));
+    fs::write(
+        &sub_path,
+        lines(&[
+            user("Look at src/parser.rs and report problems"),
+            reply(serde_json::json!([{ "type": "text", "text": "Two problems found." }])),
+            user("Repeat the findings"),
+            reply(serde_json::json!([{ "type": "text", "text": "Same two problems." }])),
+        ]),
+    )
+    .unwrap();
+    // 派它的调用没留在主线里;第一句恰好与接着派的那句相同——点了 resume 的调用只认它点名的
+    fs::write(
+        subagents.join(format!("{orphan}.jsonl")),
+        lines(&[
+            user("Repeat the findings"),
+            reply(serde_json::json!([{ "type": "text", "text": "Done." }])),
+        ]),
+    )
+    .unwrap();
+    let adapter = CursorAdapter::new().with_custom_root(projects.clone());
+
+    let listed = adapter.list_session_files().unwrap();
+    let mut ids: Vec<&str> = listed.iter().map(|r| r.native_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, [parent, sub, orphan]);
+    let sub_ref = adapter.file_ref(&sub_path).expect("监听认子代理的转录");
+    assert_eq!(sub_ref.native_id, sub);
+
+    let child = adapter.parse_session(&sub_ref).unwrap().meta;
+    let parent_ref = listed.iter().find(|r| r.native_id == parent).unwrap();
+    let parent_meta = adapter.parse_session(parent_ref).unwrap().meta;
+    assert_eq!(child.key, format!("cursor:{sub}"));
+    assert!(child.spawned && !parent_meta.spawned);
+    assert_eq!(
+        child.title, "Look at src/parser.rs and report problems",
+        "没有 IDE 库就取派活那句话"
+    );
+    assert_eq!(child.message_count, 4);
+    assert_eq!(
+        child.project_path, parent_meta.project_path,
+        "项目按子代理所在的 slug 目录还原"
+    );
+    assert_seq_contract(adapter.as_ref(), &sub_ref);
+
+    let parent_key = format!("cursor:{parent}");
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![
+            edge(&format!("cursor:{sub}"), &parent_key),
+            edge(&format!("cursor:{orphan}"), &parent_key),
+        ]
+    );
+
+    let t = adapter.parse_transcript(parent_ref).unwrap();
+    let opened: Vec<Option<String>> = t
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|c| c.child_id.clone())
+        .collect();
+    assert_eq!(
+        opened,
+        [Some(sub.to_string()), Some(sub.to_string())],
+        "头一回派的按第一句对上,接着派的按 resume"
+    );
+    let mut sidechains = t.sidechains.clone();
+    sidechains.sort_by(|a, b| a.id.cmp(&b.id));
+    let described: Vec<(&str, Option<&str>, Option<&str>, Option<String>)> = sidechains
+        .iter()
+        .map(|s| {
+            (
+                s.id.as_str(),
+                s.description.as_deref(),
+                s.agent_type.as_deref(),
+                s.session_id.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        described,
+        [
+            (
+                sub,
+                Some("Check the parser"),
+                Some("explore"),
+                Some(sub.to_string())
+            ),
+            (orphan, None, None, Some(orphan.to_string())),
+        ]
+    );
+    assert!(adapter
+        .parse_transcript(&sub_ref)
+        .unwrap()
+        .sidechains
+        .is_empty());
+
+    // 删除:子代理只带走自己那份转录,父会话整个目录(含 subagents/)
+    assert_eq!(
+        adapter.session_paths(&child),
+        [sub_path.to_string_lossy().to_string()]
+    );
+    assert_eq!(
+        adapter.session_paths(&parent_meta),
+        [session.to_string_lossy().to_string()]
+    );
+    assert!(!adapter.child_outlives_parent(&sub_ref.file_path));
+    assert!(!resumable(&adapter, &child), "子代理不能单独恢复");
+}
+
+/// 同一句话头一回派了两次(两个子代理收到的第一句一样):分不清哪个调用派的是哪个,两个都不挂
+/// 跳转——挂了就是两个按钮都指向枚举到的最后一个
+#[test]
+fn cursor_identical_dispatches_open_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let parent = "c0a6e0aa-0000-4000-8000-000000000002";
+    let session = projects
+        .join("-Users-tester-Github-cursub")
+        .join("agent-transcripts")
+        .join(parent);
+    let subagents = session.join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let line = |row: serde_json::Value| format!("{row}\n");
+    let user = |text: &str| {
+        line(
+            serde_json::json!({ "role": "user", "message": { "content": [
+            { "type": "text", "text": format!("<user_query>\n{text}\n</user_query>") }] } }),
+        )
+    };
+    let task = serde_json::json!({ "type": "tool_use", "name": "Task", "input": {
+        "description": "Run the suite", "prompt": "Run the tests" } });
+    fs::write(
+        session.join(format!("{parent}.jsonl")),
+        user("Run the tests twice")
+            + &line(serde_json::json!({ "role": "assistant", "message": { "content": [task.clone(), task] } })),
+    )
+    .unwrap();
+    for sub in [
+        "c0a6e0aa-0000-4000-8000-0000000000b1",
+        "c0a6e0aa-0000-4000-8000-0000000000b2",
+    ] {
+        fs::write(
+            subagents.join(format!("{sub}.jsonl")),
+            user("Run the tests"),
+        )
+        .unwrap();
+    }
+    let adapter = CursorAdapter::new().with_custom_root(projects);
+    let parent_ref = adapter
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.native_id == parent)
+        .unwrap();
+    let t = adapter.parse_transcript(&parent_ref).unwrap();
+    let opened: Vec<Option<String>> = t
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|c| c.child_id.clone())
+        .collect();
+    assert_eq!(opened, [None, None]);
+}
+
 /// Claude Code 的分支会话(开头原样复制了原对话的一段):复制来的一段折成一条 Meta、分支
 /// 挂到原件下;标题、token、创建时间只算分支自己的行;自定义标题照抄原件的不当标题用。
 /// 列表与 file_ref 的引用都把"更早的同根文件有几份"计进 size,原件没了引用随之变化、
@@ -867,6 +1230,17 @@ fn codex_spawned_subagent_keeps_only_its_own_turns() {
         adapter.parent_links().unwrap(),
         vec![(format!("codex:{child_id}"), format!("codex:{parent_id}"))]
     );
+
+    // 父线程里的 spawn_agent 调用指向它起的子线程(输出的 agent_path 对 state DB)
+    let calls: Vec<(String, Option<String>)> = adapter
+        .parse_transcript(parent)
+        .unwrap()
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|c| (c.name.clone(), c.child_id.clone()))
+        .collect();
+    assert_eq!(calls, [("spawn_agent".to_string(), Some(child_id.clone()))]);
 }
 
 /// 首行没写 `subagent_history_start_ordinal`(老写端)时退回派活信封,并且
@@ -1161,16 +1535,32 @@ fn qoder_parse_contract() {
         vec![1, 2, 3, 4]
     );
 
-    // 默认 projects 根只枚举 project-key 直属会话，不能吸入会话边车。
+    // projects 根枚举 project-key 直属会话,与会话同名目录里派出去的子代理(整份都是
+    // sidechain 行,作为子会话按路径挂到父会话下)
     let rooted = QoderAdapter::new().with_custom_root(fixture("qoder/projects"));
     let refs = rooted.list_session_files().expect("qoder list sessions");
-    assert_eq!(refs.len(), 2);
+    assert_eq!(refs.len(), 3);
     assert!(refs.iter().any(|session| session.native_id == r.native_id));
     assert_eq!(rooted.session_paths(&s.meta).len(), 2);
-    let sideagent = fixture(
+    let subagent = fixture(
         "qoder/projects/-Users-tester-Github-wakefx/abababab-aaaa-bbbb-cccc-000000000014/subagents/agent-child.jsonl",
     );
-    assert!(rooted.file_ref(&sideagent).is_none());
+    let sub_ref = rooted.file_ref(&subagent).expect("子代理转录作为子会话");
+    let child = rooted.parse_session(&sub_ref).unwrap().meta;
+    assert_eq!(child.key, "qoder:agent-child");
+    assert!(child.spawned);
+    assert_eq!(
+        child.title, "子代理任务：检查清理回调",
+        "sidechain 行照常读"
+    );
+    assert_eq!(
+        path_links(rooted.as_ref()),
+        vec![edge(
+            "qoder:agent-child",
+            "qoder:abababab-aaaa-bbbb-cccc-000000000014"
+        )]
+    );
+    assert_seq_contract(rooted.as_ref(), &sub_ref);
 }
 
 #[test]
@@ -1714,6 +2104,42 @@ fn gemini_parse_contract() {
     );
 }
 
+/// OpenCode / Kilo 的 task 工具派出去的子会话:调用 state 里的 `metadata.sessionId` 就是它,
+/// 详情页按它跳
+#[test]
+fn opencode_task_calls_open_the_session_they_spawned() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    common::build_opencode_db(&db);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            r#"
+            INSERT INTO message VALUES
+                ('msg-d','oc-0001','{"id":"msg-d","role":"assistant","time":{"created":1786000300000}}',1786000300000);
+            INSERT INTO part VALUES
+                ('prt-d-01','oc-0001','msg-d','{"type":"tool","callID":"oc_call_task","tool":"task","state":{"status":"completed","input":{"description":"Check the parser","prompt":"Look at src/parser.rs","subagent_type":"explore"},"output":"Two problems.","metadata":{"sessionId":"oc-child"}}}');
+            "#,
+        )
+        .unwrap();
+    for adapter in [OpencodeAdapter::new(), OpencodeAdapter::kilo()] {
+        let adapter = adapter.with_custom_root(db.clone());
+        let r = db_ref(adapter.agent(), &db, "oc-0001");
+        let t = adapter.parse_transcript(&r).unwrap();
+        let calls: Vec<(&str, Option<&str>)> = t
+            .mainline
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .map(|c| (c.id.as_str(), c.child_id.as_deref()))
+            .collect();
+        assert_eq!(
+            calls,
+            [("oc_call_1", None), ("oc_call_task", Some("oc-child"))],
+            "只有派了子会话的调用能跳"
+        );
+    }
+}
+
 #[test]
 fn opencode_v2_parse_contract() {
     let env = setup();
@@ -2165,18 +2591,23 @@ fn kimi_desktop_wire_contract() {
     let session_id = "session_77777777-aaaa-bbbb-cccc-000000000007";
     let adapter = KimiAdapter::new().with_custom_root(fixture("kimi-desktop"));
     let refs = adapter.list_session_files().expect("kimi list");
-    assert_eq!(
-        refs.iter()
-            .map(|r| r.native_id.as_str())
-            .collect::<Vec<_>>(),
-        vec![session_id]
-    );
-    let r = &refs[0];
-    // 子代理的 wire.jsonl(文件确实在)按路径分段拒掉
+    let sub_id = format!("{session_id}/sub-1");
+    let mut ids: Vec<&str> = refs.iter().map(|r| r.native_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![session_id, sub_id.as_str()]);
+    let r = refs.iter().find(|r| r.native_id == session_id).unwrap();
+    // 子代理的 wire.jsonl 作为子会话,按路径分段认
     let agents = Path::new(&r.file_path).parent().unwrap().parent().unwrap();
     let sub = agents.join("sub-1").join("wire.jsonl");
-    assert!(sub.is_file());
-    assert!(adapter.file_ref(&sub).is_none());
+    let sub_ref = adapter.file_ref(&sub).expect("子代理作为子会话");
+    assert_eq!(sub_ref.native_id, sub_id);
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![edge(
+            &format!("kimi:{sub_id}"),
+            &format!("kimi:{session_id}")
+        )]
+    );
 
     let t = adapter
         .parse_transcript(r)
@@ -2218,6 +2649,145 @@ fn kimi_desktop_wire_contract() {
     assert_eq!(s.meta.project_name, "wakefx");
     assert_eq!(s.meta.message_count, 5);
     assert_seq_contract(adapter.as_ref(), r);
+}
+
+/// Kimi 派出去的子代理(`agents/<id>/wire.jsonl`,state.json 里 `type: "sub"`)作为子会话入库:
+/// native id 带上所在会话、按路径挂到会话下、标成派出去的;它收到的任务(origin
+/// `system_trigger` / `subagent`)是它的"用户"那句,垫在前面的 `<git-context>` 不进标题。会话
+/// 里派活的 Agent 调用按输出里的 `agent_id:` 指向子会话。在私有临时目录里搭
+#[test]
+fn kimi_subagents_become_child_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let session_id = "session_d1111111-aaaa-bbbb-cccc-000000000001";
+    let session = tmp
+        .path()
+        .join("sessions")
+        .join("wd_subfx_1")
+        .join(session_id);
+    let main = session.join("agents").join("main");
+    let sub = session.join("agents").join("agent-1");
+    fs::create_dir_all(&main).unwrap();
+    fs::create_dir_all(&sub).unwrap();
+    let lines = |rows: &[serde_json::Value]| -> String {
+        rows.iter().map(|row| format!("{row}\n")).collect()
+    };
+    let event = |time: i64, event: serde_json::Value| serde_json::json!({ "type": "context.append_loop_event", "time": time, "event": event });
+    fs::write(
+        session.join("state.json"),
+        serde_json::json!({ "title": "Review the parser", "agents": {
+            "main": { "type": "main", "parentAgentId": null },
+            "agent-1": { "type": "sub", "parentAgentId": "main" } } })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        main.join("wire.jsonl"),
+        lines(&[
+            serde_json::json!({ "type": "turn.prompt", "time": 1791417601000i64,
+                "input": [{ "type": "text", "text": "Review the parser" }],
+                "origin": { "kind": "user" } }),
+            event(1791417602000, serde_json::json!({ "type": "tool.call", "toolCallId": "call-1",
+                "name": "Agent", "args": { "description": "Check the parser",
+                    "prompt": "Look at src/parser.rs", "subagent_type": "explore" } })),
+            event(1791417609000, serde_json::json!({ "type": "tool.result", "toolCallId": "call-1",
+                "result": { "isError": false, "output":
+                    "agent_id: agent-1\nactual_subagent_type: explore\nstatus: completed\n\n[summary]\nTwo problems." } })),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        sub.join("wire.jsonl"),
+        lines(&[
+            serde_json::json!({ "type": "turn.prompt", "time": 1791417603000i64,
+                "input": [{ "type": "text",
+                    "text": "<git-context>\nWorking directory: /w\n</git-context>\n\nLook at src/parser.rs" }],
+                "origin": { "kind": "system_trigger", "name": "subagent" } }),
+            event(1791417605000, serde_json::json!({ "type": "content.part",
+                "part": { "type": "text", "text": "Two problems." } })),
+        ]),
+    )
+    .unwrap();
+    let adapter = KimiAdapter::new().with_custom_root(tmp.path().to_path_buf());
+
+    let sub_id = format!("{session_id}/agent-1");
+    let refs = adapter.list_session_files().unwrap();
+    let mut ids: Vec<&str> = refs.iter().map(|r| r.native_id.as_str()).collect();
+    ids.sort();
+    assert_eq!(ids, [session_id, sub_id.as_str()]);
+    let sub_ref = refs.iter().find(|r| r.native_id == sub_id).unwrap();
+    let child = adapter.parse_session(sub_ref).unwrap().meta;
+    assert_eq!(child.key, format!("kimi:{sub_id}"));
+    assert!(child.spawned);
+    assert_eq!(
+        child.title, "Look at src/parser.rs",
+        "任务前面垫的仓库现状不进标题"
+    );
+    assert_eq!(child.message_count, 2, "它收到的任务是它的用户消息");
+    assert_eq!(
+        (child.created_at, child.updated_at),
+        (1791417603000, 1791417605000),
+        "时间按它自己的消息算,不用会话的 state.json"
+    );
+    assert_seq_contract(adapter.as_ref(), sub_ref);
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![edge(
+            &format!("kimi:{sub_id}"),
+            &format!("kimi:{session_id}")
+        )]
+    );
+    assert_eq!(
+        adapter.session_paths(&child),
+        [sub.to_string_lossy().to_string()],
+        "子代理只带走它自己的 agent 目录"
+    );
+    assert!(!resumable(&adapter, &child), "子代理不是能单独恢复的会话");
+
+    let main_ref = refs.iter().find(|r| r.native_id == session_id).unwrap();
+    let t = adapter.parse_transcript(main_ref).unwrap();
+    let call = t
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .find(|c| c.id == "call-1")
+        .expect("派活的调用");
+    assert_eq!(call.child_id, Some(sub_id.clone()));
+    let sidechains: Vec<(&str, Option<&str>, Option<&str>)> = t
+        .sidechains
+        .iter()
+        .map(|s| {
+            (
+                s.id.as_str(),
+                s.description.as_deref(),
+                s.agent_type.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        sidechains,
+        [("agent-1", Some("Check the parser"), Some("explore"))]
+    );
+    assert_eq!(
+        adapter.load_sidechain(main_ref, "agent-1").unwrap().len(),
+        2,
+        "MCP 的 subagent 参数读得到"
+    );
+
+    // 在 Kimi 里归档会话只改 state.json:子代理跟着归档。它的转录没动、收不到事件——引用里
+    // 并着归档那一位,state.json 的事件经 ref_dependents 交出它
+    assert!(!child.archived);
+    let state = session.join("state.json");
+    fs::write(&state, r#"{"title":"Review the parser","archived":true}"#).unwrap();
+    let wire = sub.join("wire.jsonl");
+    assert_eq!(adapter.ref_dependents(&state), [wire.clone()]);
+    assert!(adapter.ref_dependents(&main.join("wire.jsonl")).is_empty());
+    let archived = adapter.file_ref(&wire).unwrap();
+    assert_ne!(
+        (archived.mtime_ms, archived.size),
+        (sub_ref.mtime_ms, sub_ref.size),
+        "全量扫描认得出它变了"
+    );
+    assert!(adapter.parse_session(&archived).unwrap().meta.archived);
 }
 
 /// Kimi Code CLI(agent-core 0.29)的真实记录流(合成 fixture,形状照 Kimi 自己的
@@ -2973,6 +3543,52 @@ fn dsh_subagent_keeps_only_its_own_turns() {
     assert_eq!(
         s.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
         vec![1, 2]
+    );
+}
+
+/// dsh 后台续跑的子代理:派它的调用只回一句 `started subagent <子会话 id>`,详情页按它跳到
+/// 子会话;前台跑的结果只有最终文字,挂不上
+#[test]
+fn dsh_background_subagent_calls_open_the_child_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("sessions").join("--w--").join("dsh-par-1");
+    fs::create_dir_all(&dir).unwrap();
+    let call = |seq: u32, id: &str| {
+        format!(
+            r#"{{"type":"assistant/message","seq":{seq},"time":1788000002000,"data":{{"turn":1,"step":1,"message":{{"id":"m-{id}","role":"assistant","content":[{{"type":"tool-call","id":"{id}","name":"subagent","arguments":"{{}}"}}],"source":{{"kind":"model","provider":"deepseek","model":"deepseek-v4-pro"}}}},"stream":[]}},"surfaceOp":"append"}}"#
+        )
+    };
+    let result = |seq: u32, id: &str, text: &str| {
+        format!(
+            r#"{{"type":"tool/result","seq":{seq},"time":1788000002100,"data":{{"turn":1,"step":1,"message":{{"id":"r-{id}","role":"tool","source":{{"kind":"tool","callId":"{id}"}},"toolCallId":"{id}","content":[{{"type":"text","text":"{text}"}}]}}}},"surfaceOp":"append"}}"#
+        )
+    };
+    let lines = [
+        r#"{"type":"session","version":4,"id":"dsh-par-1","createdAt":1788000000000,"cwd":"/w","isSeeded":false,"delegationDepth":0}"#.to_string(),
+        r#"{"type":"user/message","seq":1,"time":1788000001000,"data":{"id":"m-u1","role":"user","content":[{"type":"text","text":"Audit the scanner"}],"source":{"kind":"user"}},"surfaceOp":"append"}"#.to_string(),
+        call(2, "call-bg"),
+        result(3, "call-bg", "started subagent dsh-child-1"),
+        call(4, "call-fg"),
+        result(5, "call-fg", "Two effects never clean up."),
+    ];
+    fs::write(dir.join("session.v4.jsonl"), lines.join("\n") + "\n").unwrap();
+    let adapter = DshAdapter::new().with_custom_root(tmp.path().to_path_buf());
+    let refs = adapter.list_session_files().unwrap();
+    assert_eq!(refs.len(), 1);
+    let calls: Vec<(String, Option<String>)> = adapter
+        .parse_transcript(&refs[0])
+        .unwrap()
+        .mainline
+        .iter()
+        .flat_map(|m| &m.tool_calls)
+        .map(|c| (c.id.clone(), c.child_id.clone()))
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("call-bg".to_string(), Some("dsh-child-1".to_string())),
+            ("call-fg".to_string(), None),
+        ]
     );
 }
 
@@ -6077,26 +6693,56 @@ fn codebuddy_topic_title_and_model_id_fallback() {
         .is_some_and(|x| x.contains("merged PRs")));
 }
 
-/// 枚举只认 slug 目录直属的转录:`<session>/subagents/agent-*.jsonl` 既不进列表、
-/// watcher 事件也被 file_ref 拒掉;自定义 location 选 `~/.codebuddy` 或 projects
-/// 目录都认;删除把 `<id>.meta.json` 与 `<id>/` 边车一并带走
+/// 枚举收 slug 目录直属的转录,与会话同名目录里派出去的子代理(`<session>/subagents/
+/// agent-*.jsonl`,作为子会话按路径挂到父会话下);别的边车不收。自定义 location 选
+/// `~/.codebuddy` 或 projects 目录都认;删除把 `<id>.meta.json` 与 `<id>/` 边车一并带走
 #[test]
-fn codebuddy_lists_only_top_level_transcripts() {
+fn codebuddy_lists_transcripts_and_their_subagents() {
     let _env = setup();
     // 契约测试的假 home 不摆目录型 fixture(那是 cli / mcp / remote_sync 的活),
     // 直接把检入的 fixture 树当自定义 location
     let adapter = CodebuddyAdapter::new().with_custom_root(fixture("codebuddy"));
     let root = adapter.data_roots()[0].clone();
     let refs = adapter.list_session_files().unwrap();
-    assert_eq!(refs.len(), 2, "两条顶层会话");
-    assert!(refs.iter().all(|r| !r.file_path.contains("subagents")));
+    assert_eq!(refs.len(), 3, "两条会话与一个子代理");
 
     let main = root.join("Users-fixture-src-wakefx/cb000001-aaaa-bbbb-cccc-000000000001.jsonl");
     let sub = root
         .join("Users-fixture-src-wakefx/cb000001-aaaa-bbbb-cccc-000000000001/subagents/agent-deadbeef.jsonl");
     assert!(sub.is_file(), "fixture 应带子代理转录");
-    assert!(adapter.file_ref(&main).is_some());
-    assert!(adapter.file_ref(&sub).is_none(), "子代理转录不是顶层会话");
+    let main_ref = adapter.file_ref(&main).unwrap();
+    let sub_ref = adapter.file_ref(&sub).expect("子代理转录作为子会话");
+    let child = adapter.parse_session(&sub_ref).unwrap().meta;
+    assert_eq!(child.key, "codebuddy:agent-deadbeef");
+    assert!(child.spawned, "子代理是 agent 派出去的");
+    assert_eq!(
+        child.title,
+        "Sub-agent task: list the files under src/components"
+    );
+    assert_eq!(
+        path_links(adapter.as_ref()),
+        vec![edge(
+            "codebuddy:agent-deadbeef",
+            "codebuddy:cb000001-aaaa-bbbb-cccc-000000000001"
+        )]
+    );
+    assert_seq_contract(adapter.as_ref(), &sub_ref);
+    assert_eq!(adapter.session_paths(&child), [sub_ref.file_path.clone()]);
+    let t = adapter.parse_transcript(&main_ref).unwrap();
+    let ids: Vec<(&str, Option<&str>)> = t
+        .sidechains
+        .iter()
+        .map(|s| (s.id.as_str(), s.session_id.as_deref()))
+        .collect();
+    assert_eq!(ids, [("agent-deadbeef", Some("agent-deadbeef"))]);
+    assert_eq!(
+        adapter
+            .load_sidechain(&main_ref, "agent-deadbeef")
+            .unwrap()
+            .len(),
+        2,
+        "MCP 的 subagent 参数照旧读得到"
+    );
 
     let meta = adapter.parse_session(&refs[0]).unwrap().meta;
     let paths = adapter.session_paths(&meta);
@@ -6113,7 +6759,7 @@ fn codebuddy_lists_only_top_level_transcripts() {
 
     for dir in ["codebuddy", "codebuddy/projects"] {
         let rooted = CodebuddyAdapter::new().with_custom_root(fixture(dir));
-        assert_eq!(rooted.list_session_files().unwrap().len(), 2, "{dir}");
+        assert_eq!(rooted.list_session_files().unwrap().len(), 3, "{dir}");
     }
 }
 
@@ -6128,7 +6774,7 @@ fn workbuddy_is_a_codebuddy_twin() {
 
     let rooted = twin.with_custom_root(fixture("codebuddy"));
     let refs = rooted.list_session_files().unwrap();
-    assert_eq!(refs.len(), 2);
+    assert_eq!(refs.len(), 3);
     assert!(refs.iter().all(|r| r.agent == AgentId::Workbuddy));
     let meta = rooted.parse_session(&refs[0]).unwrap().meta;
     assert_eq!(meta.agent, AgentId::Workbuddy);

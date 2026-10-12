@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 /// CodeBuddy Code(腾讯 CodeBuddy 的 CLI,issue #27):`~/.codebuddy/projects/
 /// <cwd 转义>/<sessionId>.jsonl`。文件布局借自 Claude Code——同名目录
-/// `<sessionId>/subagents/agent-*.jsonl` 是子代理转录、`<sessionId>.meta.json`
-/// 是边车,主列表只枚举 slug 目录直属的 JSONL;**行格式却是 OpenAI Responses
+/// `<sessionId>/subagents/agent-*.jsonl` 是子代理转录(作为子会话挂在派它的会话
+/// 下面)、`<sessionId>.meta.json` 是边车;**行格式却是 OpenAI Responses
 /// 形**:`message`(role 挂在信封上,content 块是 input_text / output_text)、
 /// `reasoning`(rawContent[].reasoning_text)、`function_call`(callId / name /
 /// arguments 是 JSON 字符串)、`function_call_result`(callId / output.text /
@@ -408,6 +408,17 @@ fn build_meta(agent: AgentId, r: &SessionFileRef, parsed: &ParseResult) -> Sessi
     }
 }
 
+impl CodebuddyAdapter {
+    /// 会话或子代理(子代理是 agent 派出去的,标题取边车记的任务说明)
+    fn parse(&self, r: &SessionFileRef, decode_images: bool) -> Result<(SessionMeta, ParseResult)> {
+        let path = Path::new(&r.file_path);
+        let parsed = parse_codebuddy_jsonl(path, decode_images)?;
+        let mut meta = build_meta(self.agent, r, &parsed);
+        mark_subagent(&mut meta, path);
+        Ok((meta, parsed))
+    }
+}
+
 impl AgentAdapter for CodebuddyAdapter {
     fn agent(&self) -> AgentId {
         self.agent
@@ -418,18 +429,11 @@ impl AgentAdapter for CodebuddyAdapter {
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        let relative = path.strip_prefix(&self.root).ok()?;
-        // root/<session>.jsonl 或 root/<slug>/<session>.jsonl;更深的
-        // <session>/subagents/agent-*.jsonl 是子代理转录,不得成为顶层会话
-        if relative.components().count() > 2 {
-            return None;
-        }
-        default_file_ref(self.agent(), path)
+        project_tree_file_ref(&self.root, self.agent, path)
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let parsed = parse_codebuddy_jsonl(Path::new(&r.file_path), false)?;
-        let meta = build_meta(self.agent, r, &parsed);
+        let (meta, parsed) = self.parse(r, false)?;
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,
@@ -438,16 +442,34 @@ impl AgentAdapter for CodebuddyAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let parsed = parse_codebuddy_jsonl(Path::new(&r.file_path), true)?;
-        Ok(ParsedTranscript {
-            meta: build_meta(self.agent, r, &parsed),
-            mainline: parsed.messages,
-            sidechains: Vec::new(),
-            unknown_line_count: parsed.unknown_lines,
+        let (meta, parsed) = self.parse(r, true)?;
+        Ok(transcript_with_subagents(
+            r,
+            meta,
+            parsed.messages,
+            parsed.unknown_lines,
+        ))
+    }
+
+    fn load_sidechain(
+        &self,
+        r: &SessionFileRef,
+        sidechain_id: &str,
+    ) -> Result<Vec<TranscriptMessage>> {
+        load_subagent(r, sidechain_id, |file| {
+            Ok(parse_codebuddy_jsonl(file, true)?.messages)
         })
     }
 
+    /// 子代理挂到派它的会话下面:所在会话目录的名字就是那个会话的 id
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        Some(subagent_parent)
+    }
+
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        if is_subagent_transcript(&meta.file_path) {
+            return subagent_paths(&meta.file_path);
+        }
         let mut paths = vec![meta.file_path.clone()];
         if let Some(parent) = Path::new(&meta.file_path).parent() {
             // <id>.meta.json 边车与 <id>/(subagents 等)随会话一并进废纸篓

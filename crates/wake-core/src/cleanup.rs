@@ -1,7 +1,7 @@
 //! Local session cleanup: immutable review plans, conservative ownership checks,
 //! per-target Trash results and a durable journal. No source database writes.
 use crate::{
-    adapters::{adapter_for, children_outlive_parent, AgentAdapter},
+    adapters::{adapter_for, child_outlives_parent, AgentAdapter},
     db::{put_back_fingerprint, Store},
     models::*,
     services::terminal,
@@ -423,17 +423,86 @@ struct CleanupPlan {
     targets: Vec<CleanupTarget>,
 }
 
-/// 清理用的会话索引。分支——所在的家声明子会话是自己完整的对话(`children_outlive_parent`,
+/// 清理用的会话索引。分支——所在的家声明子会话是自己完整的对话(`child_outlives_parent`,
 /// Claude Code 的 fork)——在这里就摘掉父会话:它自成一棵清理树,单独列、单独清,也不随父
 /// 会话一起清;子代理、子任务照旧是父会话树的一部分
 fn cleanup_index(store: &Store, adapters: &[Box<dyn AgentAdapter>]) -> Result<Vec<IndexedSession>> {
     let mut index = store.cleanup_index()?;
     for s in &mut index {
-        if !s.parent.is_empty() && children_outlive_parent(adapters, &s.meta) {
+        if !s.parent.is_empty() && child_outlives_parent(adapters, &s.meta) {
             s.parent.clear();
         }
     }
     Ok(index)
+}
+
+/// 套在别的路径里的不单列、重复的只留一份(父会话的目录里装着它派出去的子代理的转录:先移走
+/// 外层,再移里面那份就找不着了)。详情页删除与 Clean Up 共用
+pub fn outermost(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = paths.into_iter().collect();
+    paths.sort();
+    paths.dedup();
+    let mut roots: Vec<PathBuf> = vec![];
+    for path in paths {
+        if !roots.iter().any(|p| path.starts_with(p)) {
+            roots.push(path);
+        }
+    }
+    roots
+}
+
+/// 详情页删一条会话:随它一起删的子会话与要移进废纸篓的路径
+pub struct DeletePlan {
+    /// 第一条是要删的那条会话
+    pub sessions: Vec<SessionMeta>,
+    /// `session_paths` 的并集,套在别的目标里的不单列(`outermost`)
+    pub targets: Vec<String>,
+    /// 留下来的分支有几条
+    pub kept_branches: usize,
+}
+
+/// 删一条会话时一起删什么:子代理、子任务随父会话走;分支(`child_outlives_parent`)连同挂在它
+/// 下面的会话留下——它是自己完整的对话,原件没了变回顶层会话(Clean Up 的 `cleanup_index` 同一条
+/// 规矩)。每条子会话按自己的胜出文件找实例:多 location 下不能沿用根会话所属的那个
+pub fn delete_plan(
+    store: &Store,
+    adapters: &[Box<dyn AgentAdapter>],
+    root: &SessionMeta,
+) -> Result<DeletePlan> {
+    let tree = store.all_descendants(&root.key)?;
+    let mut children: HashMap<&str, Vec<&IndexedSession>> = HashMap::new();
+    for s in &tree {
+        children.entry(s.parent.as_str()).or_default().push(s);
+    }
+    let mut sessions = vec![root.clone()];
+    let mut seen = HashSet::from([root.key.clone()]);
+    let mut kept_branches = 0;
+    let mut cursor = 0;
+    while cursor < sessions.len() {
+        let parent = sessions[cursor].key.clone();
+        for child in children.get(parent.as_str()).into_iter().flatten() {
+            if child_outlives_parent(adapters, &child.meta) {
+                kept_branches += 1;
+            } else if seen.insert(child.meta.key.clone()) {
+                sessions.push(child.meta.clone());
+            }
+        }
+        cursor += 1;
+    }
+    let paths = sessions.iter().flat_map(|s| {
+        adapter_for(adapters, s.agent, &s.file_path)
+            .map(|adapter| adapter.session_paths(s))
+            .unwrap_or_else(|| vec![s.file_path.clone()])
+    });
+    let targets = outermost(paths.map(PathBuf::from))
+        .into_iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect();
+    Ok(DeletePlan {
+        sessions,
+        targets,
+        kept_branches,
+    })
 }
 
 fn build_plan(
@@ -479,14 +548,7 @@ fn build_plan(
             paths.push(p);
         }
     }
-    paths.sort();
-    paths.dedup();
-    let mut roots: Vec<PathBuf> = vec![];
-    for path in paths {
-        if !roots.iter().any(|p| path.starts_with(p)) {
-            roots.push(path);
-        }
-    }
+    let roots = outermost(paths);
     for other in index.iter().filter(|s| !keys.contains(s.meta.key.as_str())) {
         ensure!(
             !roots
@@ -1083,7 +1145,7 @@ mod tests {
     struct FilesAdapter {
         root: PathBuf,
         supported: bool,
-        /// 子会话是不是分支(`children_outlive_parent`)
+        /// 子会话是不是分支(`child_outlives_parent`)
         branches: bool,
     }
     impl AgentAdapter for FilesAdapter {
@@ -1132,7 +1194,7 @@ mod tests {
         fn cleanup_paths(&self, m: &SessionMeta) -> Option<Vec<String>> {
             self.supported.then(|| self.session_paths(m))
         }
-        fn children_outlive_parent(&self) -> bool {
+        fn child_outlives_parent(&self, _child_path: &str) -> bool {
             self.branches
         }
     }
@@ -1223,6 +1285,26 @@ mod tests {
             .unwrap();
         m
     }
+    /// 父会话的目录里装着子代理的转录:一起删时只移外层,不然第二下找不着文件、整批报错
+    #[test]
+    fn nested_targets_collapse_into_the_outer_one() {
+        let p = |s: &str| PathBuf::from(s);
+        assert_eq!(
+            outermost([
+                p("/h/projects/-w/5ab0.jsonl"),
+                p("/h/projects/-w/5ab0"),
+                p("/h/projects/-w/5ab0/subagents/agent-a1.jsonl"),
+                p("/h/projects/-w/5ab0-other"),
+                p("/h/projects/-w/5ab0"),
+            ]),
+            [
+                p("/h/projects/-w/5ab0"),
+                p("/h/projects/-w/5ab0-other"),
+                p("/h/projects/-w/5ab0.jsonl"),
+            ]
+        );
+    }
+
     /// 分支(所在的家声明子会话是自己完整的对话)自成一棵清理树:原件的清理计划不带上它,
     /// 它自己也是一个候选、过得了复核;默认(子代理一类)照旧随父会话
     #[test]

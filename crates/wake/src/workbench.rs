@@ -47,8 +47,8 @@ use gpui_component::{
 };
 
 use wake_core::adapters::{
-    adapter_for, children_outlive_parent, create_adapter_roster_for, path_owns,
-    session_source_path, AdapterLocation, AgentAdapter,
+    adapter_for, create_adapter_roster_for, path_owns, session_source_path, AdapterLocation,
+    AgentAdapter,
 };
 use wake_core::db::Store;
 use wake_core::models::Role as MessageRole;
@@ -491,41 +491,50 @@ impl SessionsDelegate {
     }
 
     fn rebuild_rows_at(&mut self, today: NaiveDate) {
-        let tree_mode = self.tree_mode();
         let mut rows = Vec::new();
+        let mut listed = HashSet::new();
         for root in &self.sessions {
-            let child_count = if tree_mode {
-                self.child_counts.get(&root.key).copied().unwrap_or(0)
-            } else {
-                0
-            };
-            let expanded = child_count > 0 && self.expanded.contains(&root.key);
-            let group_timestamp = session_group_timestamp(root, self.sort);
-            let group_pinned = root.pinned;
-            rows.push(SessionListRow {
-                meta: root.clone(),
-                depth: 0,
-                child_count,
-                expanded,
-                group_timestamp,
-                group_pinned,
-            });
-            if expanded {
-                if let Some(children) = self.children.get(&root.key) {
-                    rows.extend(children.iter().cloned().map(|child| SessionListRow {
-                        meta: child,
-                        depth: 1,
-                        child_count: 0,
-                        expanded: false,
-                        group_timestamp,
-                        group_pinned,
-                    }));
-                }
-            }
+            let group = (session_group_timestamp(root, self.sort), root.pinned);
+            self.push_row(&mut rows, &mut listed, root, 0, group);
         }
         self.rows = rows;
         self.groups = build_row_groups_at(&self.rows, self.sort, self.ascending, today);
         self.grouped_on = today;
+    }
+
+    /// 一行会话;它展开着就接着列它的子会话(分支下面还挂着它派的子代理)。子行跟着根行的分组
+    /// 时间,留在根所在的日期段里。一条会话只列一次:关系万一成环也不会一直往下走
+    fn push_row<'a>(
+        &'a self,
+        rows: &mut Vec<SessionListRow>,
+        listed: &mut HashSet<&'a str>,
+        meta: &'a SessionMeta,
+        depth: u8,
+        (group_timestamp, group_pinned): (i64, bool),
+    ) {
+        if !listed.insert(meta.key.as_str()) {
+            return;
+        }
+        let child_count = if self.tree_mode() {
+            self.child_counts.get(&meta.key).copied().unwrap_or(0)
+        } else {
+            0
+        };
+        let expanded = child_count > 0 && self.expanded.contains(&meta.key);
+        rows.push(SessionListRow {
+            meta: meta.clone(),
+            depth,
+            child_count,
+            expanded,
+            group_timestamp,
+            group_pinned,
+        });
+        if expanded {
+            for child in self.children.get(&meta.key).into_iter().flatten() {
+                let group = (group_timestamp, group_pinned);
+                self.push_row(rows, listed, child, depth.saturating_add(1), group);
+            }
+        }
     }
 
     fn rebuild_groups_at(&mut self, today: NaiveDate) -> bool {
@@ -566,14 +575,11 @@ impl SessionsDelegate {
         if !self.tree_mode() {
             return;
         }
-        let root_keys: HashSet<&str> = self.sessions.iter().map(|root| root.key.as_str()).collect();
-        self.expanded = expanded
-            .into_iter()
-            .filter(|key| root_keys.contains(key.as_str()))
-            .collect();
+        self.expanded = expanded;
         self.reload_expanded();
     }
 
+    /// 从这一页的根往下重取展开过的子会话;不在这一页里的展开记录丢掉
     fn reload_expanded(&mut self) {
         let Some(pagination) = &self.pagination else {
             return;
@@ -581,11 +587,28 @@ impl SessionsDelegate {
         let store = pagination.store.clone();
         let filter = pagination.filter.clone();
         self.children.clear();
-        for key in &self.expanded {
-            if let Ok(children) = store.list_children(key, &filter) {
-                self.children.insert(key.clone(), children);
+        let mut pending: Vec<String> = self
+            .sessions
+            .iter()
+            .map(|root| root.key.clone())
+            .filter(|key| self.expanded.contains(key))
+            .collect();
+        while let Some(key) = pending.pop() {
+            if self.children.contains_key(&key) {
+                continue;
+            }
+            if let Ok(children) = store.list_children(&key, &filter) {
+                pending.extend(
+                    children
+                        .iter()
+                        .map(|child| child.key.clone())
+                        .filter(|child| self.expanded.contains(child)),
+                );
+                self.children.insert(key, children);
             }
         }
+        let loaded = &self.children;
+        self.expanded.retain(|key| loaded.contains_key(key));
         self.rebuild_rows();
     }
 
@@ -687,8 +710,9 @@ impl ListDelegate for SessionsDelegate {
         let expanded = row.expanded;
         let depth = row.depth;
         let child_line_color = theme.muted_foreground.opacity(0.38);
-        // 2px 线的中心与父行 15px Grok 图标的 11.5px 中轴一致。
-        let child_line_left = SPACE_XS + zpx(6.5);
+        // 2px 线的中心与上一层行 15px 图标的 11.5px 中轴一致;每深一层右移一级缩进
+        let indent = zpx(20.) * f32::from(depth);
+        let child_line_left = SPACE_XS + zpx(6.5) + (indent - zpx(20.));
 
         Some(
             // 稳定元素身份必须是 session key：展开插入孩子后，IndexPath 会整体
@@ -705,7 +729,7 @@ impl ListDelegate for SessionsDelegate {
                         .py(SPACE_SM)
                         .gap(SPACE_XS)
                         .when(depth > 0, |this| {
-                            this.pl(zpx(20.)).child(
+                            this.pl(indent).child(
                                 div()
                                     .absolute()
                                     .left(child_line_left)
@@ -1085,7 +1109,7 @@ mod session_group_tests {
             input: Some(input_preview.to_string()),
             output: None,
             is_error: false,
-            sidechain_ref: None,
+            child_id: None,
         }
     }
 
@@ -1679,6 +1703,8 @@ struct DetailState {
     /// 放大预览操作的短暂就地反馈。绑定具体图片，避免切换预览后把上一张的
     /// 成功状态带过来；generation 让较早的复位计时器不能清掉较新的反馈。
     image_action_feedback: [Option<ImageActionFeedback>; 2],
+    /// 挂在哪条会话下面(key, 标题):头部那行"回到父会话"。打开时查一次,不在 render 里查库
+    parent: Option<(String, SharedString)>,
 }
 
 impl DetailState {
@@ -1700,6 +1726,7 @@ impl DetailState {
             images: Vec::new(),
             zoom: None,
             image_action_feedback: [None; 2],
+            parent: None,
         }
     }
 }
@@ -4873,7 +4900,10 @@ impl Workbench {
         let Ok(Some(meta)) = self.store.get_session(key) else {
             return;
         };
-        let detail = DetailState::loading(meta.clone(), jump_seq);
+        let mut detail = DetailState::loading(meta.clone(), jump_seq);
+        detail.parent = self
+            .visible_parent(key)
+            .map(|parent| (parent.key, parent.title.into()));
         let load_id = detail.load_id;
         self.detail = Some(detail);
         // 搜索路径:中栏列表同步选中并滚到该会话。
@@ -4907,8 +4937,31 @@ impl Workbench {
         .detach();
 
         let adapters = self.adapters.clone();
+        let store = self.store.clone();
         let task = cx.background_spawn(async move {
             let result = load_visible_transcript(&adapters, &meta).map(|mut messages| {
+                // 跳转按钮只给索引里真有的子会话:子会话可能删掉了,有的家是按工具输出认的。
+                // 子会话与这一条同一家、同一台机器
+                let child_key = |id: &str| session_key(meta.agent, &meta.host, id);
+                let keys: Vec<String> = messages
+                    .iter()
+                    .flat_map(|m| &m.tool_calls)
+                    .filter_map(|call| call.child_id.as_deref().map(child_key))
+                    .collect();
+                if !keys.is_empty() {
+                    let indexed = store
+                        .indexed_keys(keys.iter().map(String::as_str))
+                        .unwrap_or_default();
+                    for call in messages.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
+                        if call
+                            .child_id
+                            .as_deref()
+                            .is_some_and(|id| !indexed.contains(&child_key(id)))
+                        {
+                            call.child_id = None;
+                        }
+                    }
+                }
                 let images = take_image_slots(&mut messages);
                 (messages, images)
             });
@@ -4991,6 +5044,29 @@ impl Workbench {
         self.set_scope(None, None, false, cx);
     }
 
+    /// 从详情页跳到相关的会话(派活的工具调用 → 子会话,子会话 → 父会话):打开它,中栏列表
+    /// 同步选中。父子会话一般在同一个侧栏筛选里,选得上就不动筛选;选不上再走搜索命中那条路
+    fn open_related_session(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_cleanup(cx);
+        self.open_detail(key, None, window, cx);
+        self.pending_list_selection = None;
+        if !self.select_list_key(key, true, window, cx) {
+            self.sync_list_selection(key, window, cx);
+        }
+    }
+
+    /// 打开正在看的这条会话派出去的子会话:它与这一条同一家、同一台机器,key 按原生 id 拼
+    fn open_child_session(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(key) = self
+            .detail
+            .as_ref()
+            .map(|detail| session_key(detail.meta.agent, &detail.meta.host, id))
+        else {
+            return;
+        };
+        self.open_related_session(&key, window, cx);
+    }
+
     /// 搜索命中打开:侧栏切回 All Sessions(搜索是全库范围,过滤视图下
     /// 命中可能不在列表里),中栏定位选中该会话并滚到可见
     fn sync_list_selection(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -5040,7 +5116,8 @@ impl Workbench {
         };
         let (generation, mut filter, mut offset, mut total) = request;
         let root_key = if filter.roots_only {
-            self.visible_parent_key(key)
+            self.visible_ancestors(key)
+                .pop()
                 .unwrap_or_else(|| key.to_string())
         } else {
             key.to_string()
@@ -5116,19 +5193,20 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let parent_key = self
-            .list_state
-            .read(cx)
-            .delegate()
-            .tree_mode()
-            .then(|| self.visible_parent_key(key))
-            .flatten();
+        // 行还没列出来(子会话所在的那一支收着)才去找它的祖先
+        let ancestors = {
+            let delegate = self.list_state.read(cx).delegate();
+            if delegate.tree_mode() && delegate.row_index(key).is_none() {
+                self.visible_ancestors(key)
+            } else {
+                Vec::new()
+            }
+        };
         self.list_state.update(cx, |state, cx| {
-            if state.delegate().row_index(key).is_none() {
-                if let Some(parent) = parent_key.as_deref() {
-                    if state.delegate().row_index(parent).is_some() {
-                        state.delegate_mut().ensure_expanded(parent);
-                    }
+            // 从根往下逐层展开:上一层展开了,下一层的行才出现
+            for ancestor in ancestors.iter().rev() {
+                if state.delegate().row_index(ancestor).is_some() {
+                    state.delegate_mut().ensure_expanded(ancestor);
                 }
             }
             let path = state
@@ -5152,14 +5230,28 @@ impl Workbench {
         })
     }
 
-    fn visible_parent_key(&self, key: &str) -> Option<String> {
+    /// 一条会话往上的可见祖先,近的在前(子代理 → 分支 → 原件),一直到根;关系万一成环就停
+    fn visible_ancestors(&self, key: &str) -> Vec<String> {
+        let mut ancestors: Vec<String> = Vec::new();
+        let mut current = key.to_string();
+        while let Some(parent) = self.visible_parent(&current) {
+            if parent.key == key || ancestors.contains(&parent.key) {
+                break;
+            }
+            current = parent.key.clone();
+            ancestors.push(parent.key);
+        }
+        ancestors
+    }
+
+    /// 列表里看得见的父会话(归档的不算)
+    fn visible_parent(&self, key: &str) -> Option<SessionMeta> {
         let parent_key = self.store.parent_key_of(key).ok().flatten()?;
         self.store
             .get_session(&parent_key)
             .ok()
             .flatten()
             .filter(|parent| !parent.archived)
-            .map(|_| parent_key)
     }
 
     /// 展开/收起后按 session key 恢复选择，避免插入的子行让 IndexPath 漂到
@@ -5367,18 +5459,21 @@ impl Workbench {
     /// 否则界面在授权框弹出的整段时间里完全冻结。
     fn do_delete(
         &mut self,
-        sessions: Vec<SessionMeta>,
-        targets: Vec<String>,
+        plan: Arc<wake_core::cleanup::DeletePlan>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let store = self.store.clone();
-        let keys: Vec<String> = sessions.iter().map(|session| session.key.clone()).collect();
+        let keys: Vec<String> = plan
+            .sessions
+            .iter()
+            .map(|session| session.key.clone())
+            .collect();
         let count = keys.len();
         let lock = self.index_lock.clone();
         let task = cx.background_spawn(async move {
             let _lock = lock;
-            wake_core::cleanup::trash_sessions(&store, &sessions, &targets)
+            wake_core::cleanup::trash_sessions(&store, &plan.sessions, &plan.targets)
         });
         cx.spawn_in(window, async move |this, cx| {
             let result = task.await;
@@ -5428,50 +5523,29 @@ impl Workbench {
             return;
         }
         let meta = detail.meta.clone();
-        // 子会话查不出来就别删:只删根会把子代理一类留成孤儿
-        let descendants = match self.store.all_descendants(&meta.key) {
-            Ok(descendants) => descendants,
+        // 子会话查不出来就别删:只删根会把子代理一类留成孤儿。分支(Claude Code 的 fork)不随
+        // 原件删:原件没了分支变回顶层会话,watcher 随即把它重解析出完整历史(`ref_dependents`)
+        let plan = match wake_core::cleanup::delete_plan(&self.store, &self.adapters, &meta) {
+            Ok(plan) => Arc::new(plan),
             Err(e) => {
                 window
                     .push_notification(Notification::error(crate::tf!("Delete failed: {}", e)), cx);
                 return;
             }
         };
-        // 分支(Claude Code 的 fork)是自己完整的对话,不随原件一起删:原件没了它们变回顶层
-        // 会话,watcher 随即把它们重解析出完整历史(`ref_dependents`)
-        let mut sessions = vec![meta.clone()];
-        let kept_branches = if children_outlive_parent(&self.adapters, &meta) {
-            descendants.len()
-        } else {
-            sessions.extend(descendants);
-            0
-        };
-        let nested_count = sessions.len().saturating_sub(1);
-        // 每个子会话按自己的胜出 file_path 找 adapter；多 location 下不能沿用
-        // 根会话所属实例。磁盘目标保持稳定顺序并去重。
-        let mut seen_targets = HashSet::new();
-        let mut targets = Vec::new();
-        for session in &sessions {
-            let paths = adapter_for(&self.adapters, session.agent, &session.file_path)
-                .map(|adapter| adapter.session_paths(session))
-                .unwrap_or_else(|| vec![session.file_path.clone()]);
-            for path in paths {
-                if seen_targets.insert(path.clone()) {
-                    targets.push(path);
-                }
-            }
-        }
+        let nested_count = plan.sessions.len().saturating_sub(1);
+        let kept_branches = plan.kept_branches;
         // 没有一个目标真在磁盘上 = 会话只活在 agent 自己的库里(OpenCode、Copilot、
         // Cursor IDE…的虚拟路径 `<db>#<id>`):Wake 不改别家的库,能做的只是不再列出它。
         // 先前这里照样说"移到废纸篓、随时可还原",两句都不成立
-        let hide_only = !targets
+        let hide_only = !plan
+            .targets
             .iter()
             .any(|path| std::path::Path::new(path).exists());
         let entity = cx.entity();
         open_alert(window, cx, 440., move |dialog, _, cx| {
             let meta = meta.clone();
-            let sessions = sessions.clone();
-            let targets = targets.clone();
+            let plan = plan.clone();
             let entity = entity.clone();
             let theme = cx.theme();
             // 文件型:说清怎么找回——从废纸篓放回原处,扫描认出它就重新列出
@@ -5566,9 +5640,7 @@ impl Workbench {
                         }),
                 )
                 .on_ok(move |_, window, cx| {
-                    entity.update(cx, |this, cx| {
-                        this.do_delete(sessions.clone(), targets.clone(), window, cx);
-                    });
+                    entity.update(cx, |this, cx| this.do_delete(plan.clone(), window, cx));
                     true
                 })
         });
@@ -6616,6 +6688,7 @@ impl Workbench {
                                 }
                                 cx.notify();
                             }),
+                            cx.entity(),
                             cx,
                         ));
                     }
@@ -7274,13 +7347,17 @@ impl Workbench {
                     .into_any_element(),
             );
         }
-        let open_in: AnyElement = if terminal::resume_targets(meta).is_empty() {
+        // 放在父会话目录里的子代理不能单独恢复(`resumable`)
+        let resume_targets = if wake_core::adapters::resumable(&self.adapters, meta) {
+            terminal::resume_targets(meta)
+        } else {
+            Vec::new()
+        };
+        let open_in: AnyElement = if resume_targets.is_empty() {
             // 没有 resume 形制的 agent(OpenClaw 的 TUI 只按 session
             // key 开会话):不画 Open In,别给一组点了才报错的死按钮
             div().into_any_element()
-        } else if let [terminal::ResumeTarget::CopySshCommand] =
-            terminal::resume_targets(meta).as_slice()
-        {
+        } else if let [terminal::ResumeTarget::CopySshCommand] = resume_targets.as_slice() {
             // 远程会话(阶段 1 只有 Copy SSH command):单段控件用
             // 现成 Button,无 chevron 无记忆(split 按钮手搓只因它
             // 要双段共壳)。本地会话即便只剩一个终端也走 split
@@ -7301,7 +7378,7 @@ impl Workbench {
             // 目标的应用图标,点击直开;右段 chevron 展开列表。
             // 目标列表按 agent 过滤(Kooky 深链不认 dsh);
             // 偏好目标不在列表时(如 dsh 会话 + 偏好 Kooky)回退首项
-            let terms: Vec<terminal::TerminalApp> = terminal::resume_targets(meta)
+            let terms: Vec<terminal::TerminalApp> = resume_targets
                 .into_iter()
                 .filter_map(|t| match t {
                     terminal::ResumeTarget::App(app) => Some(app),
@@ -7492,6 +7569,37 @@ impl Workbench {
                 .child(div().min_w_0().truncate().child(detail_path))
                 .into_any_element(),
         ];
+        // 子会话:回到派它的(或它分出来的)那条会话
+        if let Some((parent_key, parent_title)) = self
+            .detail
+            .as_ref()
+            .and_then(|detail| detail.parent.clone())
+        {
+            meta_rows.push(
+                h_flex()
+                    .id("detail-parent")
+                    .w_full()
+                    .min_w_0()
+                    .gap(ICON_TEXT_GAP)
+                    .items_center()
+                    .cursor_pointer()
+                    .hover(|style| style.text_colored(theme.foreground, FONT_LABEL))
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(t("Open parent session"))
+                            .build(window, cx)
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.open_related_session(&parent_key, window, cx);
+                    }))
+                    .child(
+                        icon("icons/corner-left-up.svg")
+                            .with_size(zpx(12.))
+                            .flex_shrink_0(),
+                    )
+                    .child(div().min_w_0().truncate().child(parent_title))
+                    .into_any_element(),
+            );
+        }
         if self.cleanup.open {
             meta_rows.push(self.render_cleanup_detail_facts(cx));
         }
@@ -9157,10 +9265,17 @@ fn tool_cluster(
     arg_cells: usize,
     expanded: bool,
     on_toggle: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    workbench: Entity<Workbench>,
     cx: &App,
 ) -> Div {
     let theme = cx.theme();
     let failed = calls.iter().filter(|c| c.is_error).count();
+    // 收起时标题行上也给一个入口——只在这一簇恰好派了一个子会话时(派了几个就展开了挑)
+    let mut children = calls.iter().filter_map(|c| c.child_id.as_deref());
+    let only_child = match (expanded, children.next(), children.next()) {
+        (false, Some(id), None) => Some(id.to_string()),
+        _ => None,
+    };
     let (head_name, head_arg) = tool_cluster_heading(calls, arg_cells);
     let mono = theme.mono_font_family.clone();
     let panel_border = theme.border;
@@ -9211,6 +9326,15 @@ fn tool_cluster(
                     )
                 })
                 .child(div().flex_1())
+                .when_some(only_child, |header, child| {
+                    header.child(open_child_button(
+                        ("tool-open-child", ix),
+                        child,
+                        workbench.clone(),
+                        false,
+                        theme,
+                    ))
+                })
                 .when(failed > 0, |header| {
                     header.child(
                         div()
@@ -9274,6 +9398,16 @@ fn tool_cluster(
                 );
             }
 
+            if let Some(id) = call.child_id.clone() {
+                item = item.child(h_flex().child(open_child_button(
+                    SharedString::from(format!("tool-open-child-{ix}-{call_ix}")),
+                    id,
+                    workbench.clone(),
+                    true,
+                    theme,
+                )));
+            }
+
             let input = call.input.as_deref().and_then(non_blank_tool_text);
             if let Some(input) = input {
                 item = item.child(tool_section(
@@ -9316,6 +9450,43 @@ fn tool_cluster(
 /// 空白只参与“是否有内容”的判断；展示与复制必须保留工具原始输出的边界空白。
 fn non_blank_tool_text(text: &str) -> Option<&str> {
     (!text.trim().is_empty()).then_some(text)
+}
+
+/// 派活的工具调用 → 它派出去的子会话:详情页打开那条会话,列表同步选中。`with_label` 给展开后
+/// 每个调用里那一行;标题行上只放图标(在折叠钮的点击区里,点它不能顺带展开收起)
+/// "打开子代理会话":`child` 是子会话的原生 id(与正在看的会话同一家、同一台机器)
+fn open_child_button(
+    id: impl Into<ElementId>,
+    child: String,
+    workbench: Entity<Workbench>,
+    with_label: bool,
+    theme: &gpui_component::Theme,
+) -> Stateful<Div> {
+    h_flex()
+        .id(id)
+        .flex_shrink_0()
+        .items_center()
+        .gap(ICON_TEXT_GAP)
+        .h(zpx(20.))
+        .px(if with_label { SPACE_SM } else { SPACE_XS })
+        .rounded(RADIUS_BADGE)
+        .cursor_pointer()
+        .text_size(FONT_MSG_THINKING)
+        .text_color(theme.muted_foreground)
+        .hover(|style| {
+            style
+                .bg(theme.secondary_hover)
+                .text_colored(theme.foreground, FONT_MSG_THINKING)
+        })
+        .tooltip(|window, cx| {
+            gpui_component::tooltip::Tooltip::new(t("Open subagent session")).build(window, cx)
+        })
+        .on_click(move |_, window, cx| {
+            cx.stop_propagation();
+            workbench.update(cx, |this, cx| this.open_child_session(&child, window, cx));
+        })
+        .child(icon("icons/corner-down-right.svg").with_size(zpx(12.)))
+        .when(with_label, |this| this.child(t("Open subagent session")))
 }
 
 fn tool_section(

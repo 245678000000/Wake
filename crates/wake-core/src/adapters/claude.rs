@@ -361,11 +361,20 @@ impl ClaudeAdapter {
         }))
     }
 
-    /// 主会话的解析(parse_session 与 parse_transcript 共用):分支先拿继承段
-    fn parse_main(&self, r: &SessionFileRef, decode_images: bool) -> Result<ParseResult> {
+    /// 会话的解析(parse_session 与 parse_transcript 共用):分支先拿继承段;子代理的转录整份
+    /// 都是 sidechain 行(`isSidechain: true`),是 agent 派出去的,标题取派活时的任务说明
+    fn parse(&self, r: &SessionFileRef, decode_images: bool) -> Result<(SessionMeta, ParseResult)> {
         let path = Path::new(&r.file_path);
-        let inherited = self.inherited_for(path)?;
-        parse_claude_jsonl(path, false, decode_images, inherited.as_ref())
+        let subagent = is_subagent_transcript(&r.file_path);
+        let inherited = if subagent {
+            None
+        } else {
+            self.inherited_for(path)?
+        };
+        let parsed = parse_claude_jsonl(path, subagent, decode_images, inherited.as_ref())?;
+        let mut meta = build_meta(r, &parsed);
+        mark_subagent(&mut meta, path);
+        Ok((meta, parsed))
     }
 
     /// auto-memory 树 `projects/<dir>/memory/*.md` 展开成读取单元:每个项目目录的记忆
@@ -893,53 +902,6 @@ fn build_meta(r: &SessionFileRef, p: &ParseResult) -> SessionMeta {
     }
 }
 
-fn subagents_dir(r: &SessionFileRef) -> PathBuf {
-    Path::new(&r.file_path)
-        .parent()
-        .unwrap_or(Path::new("."))
-        .join(&r.native_id)
-        .join("subagents")
-}
-
-fn list_sidechains(r: &SessionFileRef) -> Vec<SidechainInfo> {
-    let dir = subagents_dir(r);
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.ends_with(".jsonl") {
-            continue;
-        }
-        let id = name.trim_end_matches(".jsonl").to_string();
-        let mut info = SidechainInfo {
-            id: id.clone(),
-            agent_type: None,
-            description: None,
-            tool_use_id: None,
-        };
-        if let Ok(meta_raw) = fs::read_to_string(dir.join(format!("{id}.meta.json"))) {
-            if let Ok(meta) = serde_json::from_str::<Value>(&meta_raw) {
-                info.agent_type = meta
-                    .get("agentType")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                info.description = meta
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                info.tool_use_id = meta
-                    .get("toolUseId")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-            }
-        }
-        out.push(info);
-    }
-    out
-}
-
 /// projects/<有损编码目录>/ 里最新的一份会话(按 mtime,平局取 id 字典序靠后的)
 /// 的 key:目录名反推不了项目路径,而目录里的会话都是同一个 cwd 起的——记忆挂到
 /// 这条会话上,项目路径读库时按它从 sessions 表解析(索引已经算过,不再翻文件)。
@@ -975,18 +937,21 @@ impl AgentAdapter for ClaudeAdapter {
             let Ok(entries) = fs::read_dir(&dir) else {
                 continue;
             };
-            refs.extend(
-                entries
-                    .flatten()
-                    .filter_map(|entry| self.session_ref(&entry.path(), &branches)),
-            );
+            for entry in entries.flatten() {
+                let path = entry.path();
+                // 会话目录(`<id>/`)里是它派的子代理,各自作为子会话
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    refs.extend(subagent_refs(AgentId::ClaudeCode, &path));
+                } else if let Some(r) = self.session_ref(&path, &branches) {
+                    refs.push(r);
+                }
+            }
         }
         Ok(refs)
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
-        let parsed = self.parse_main(r, false)?;
-        let meta = build_meta(r, &parsed);
+        let (meta, parsed) = self.parse(r, false)?;
         Ok(ParsedSession::derive(
             meta,
             &parsed.messages,
@@ -995,27 +960,13 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let parsed = self.parse_main(r, true)?;
-        let sidechains = list_sidechains(r);
-        let mut mainline = parsed.messages.clone();
-        // 把 sidechain 挂到主线对应 Task tool call
-        let by_tool_use: HashMap<&str, &SidechainInfo> = sidechains
-            .iter()
-            .filter_map(|s| s.tool_use_id.as_deref().map(|t| (t, s)))
-            .collect();
-        for m in &mut mainline {
-            for tc in &mut m.tool_calls {
-                if let Some(sc) = by_tool_use.get(tc.id.as_str()) {
-                    tc.sidechain_ref = Some(sc.id.clone());
-                }
-            }
-        }
-        Ok(ParsedTranscript {
-            meta: build_meta(r, &parsed),
-            mainline,
-            sidechains,
-            unknown_line_count: parsed.unknown_lines,
-        })
+        let (meta, parsed) = self.parse(r, true)?;
+        Ok(transcript_with_subagents(
+            r,
+            meta,
+            parsed.messages,
+            parsed.unknown_lines,
+        ))
     }
 
     fn load_sidechain(
@@ -1023,12 +974,9 @@ impl AgentAdapter for ClaudeAdapter {
         r: &SessionFileRef,
         sidechain_id: &str,
     ) -> Result<Vec<TranscriptMessage>> {
-        let file = subagents_dir(r).join(format!("{sidechain_id}.jsonl"));
-        if !file.is_file() {
-            return Ok(Vec::new());
-        }
-        let parsed = parse_claude_jsonl(&file, true, true, None)?;
-        Ok(parsed.messages)
+        load_subagent(r, sidechain_id, |file| {
+            Ok(parse_claude_jsonl(file, true, true, None)?.messages)
+        })
     }
 
     /// 项目目录里的会话文件进出(原件被删、被放回)会改变同目录分支的引用(`session_ref`
@@ -1055,19 +1003,24 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        // subagents 转录与 memory 边车不是主会话。按所在目录的名字判:按路径分段,Windows 的
-        // 反斜杠路径一样认(原先拿带 `/` 的字符串去比,watcher 报来的路径一条都对不上);只看
-        // 直接所在的目录,数据根上层恰好有叫 memory / subagents 的目录也不误伤
+        // 子代理转录与它的边车。会话目录得在数据根下的项目目录里
+        let in_project =
+            |session: &Path| session.parent().and_then(Path::parent) == Some(self.root.as_path());
+        if let Some(r) = subagent_event_ref(AgentId::ClaudeCode, path, in_project) {
+            return Some(r);
+        }
+        // 会话主文件只在 `<projects>/<项目目录>/` 这一层:更深的(memory 边车、Workflow 的
+        // 运行日志 journal.jsonl)都不是。按路径分段比,Windows 的反斜杠路径一样认
         let dir = path.parent()?;
-        let parent = dir.file_name()?;
-        if parent == "subagents" || parent == "memory" {
+        if dir.parent() != Some(self.root.as_path()) {
             return None;
         }
         self.session_ref(path, &self.branches_in(dir))
     }
 
-    /// 分支挂到原件下面(见本文件「分支识别」)。关系由分支自己的文件头与同目录里更早的
-    /// 同根文件推出,所以算"写在子会话里"(多 location 下按子会话的胜出副本认边)
+    /// 分支挂到原件下面(见本文件「分支识别」),子代理挂到派它的会话下面(`parent_in_path`)。
+    /// 分支的关系由它自己的文件头与同目录里更早的同根文件推出,所以算"写在子会话里"(多
+    /// location 下按子会话的胜出副本认边)
     fn manages_parent_links(&self) -> bool {
         true
     }
@@ -1077,9 +1030,9 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     /// 分支是自己完整的一段对话:删原件不带上它们,原件没了它们变回顶层会话、露出完整历史
-    /// (重解析由 watcher 经 `ref_dependents` 触发)
-    fn children_outlive_parent(&self) -> bool {
-        true
+    /// (重解析由 watcher 经 `ref_dependents` 触发)。子代理不是——它的文件就在派它的会话目录里
+    fn child_outlives_parent(&self, child_path: &str) -> bool {
+        !is_subagent_transcript(child_path)
     }
 
     /// 全量快照只用文件头(不读 uuid 集合):每个分支 → 它所在同根组里最早的那份。分支
@@ -1107,7 +1060,15 @@ impl AgentAdapter for ClaudeAdapter {
         Some(links)
     }
 
+    /// 子代理挂到派它的会话:所在会话目录的名字就是那个会话的 id
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        Some(subagent_parent)
+    }
+
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        if is_subagent_transcript(&meta.file_path) {
+            return subagent_paths(&meta.file_path);
+        }
         let mut v = vec![meta.file_path.clone()];
         // <projects>/<dir>/<id>/ 边车目录(subagents 等)随会话一并删
         if let Some(dir) = Path::new(&meta.file_path).parent() {
@@ -1326,9 +1287,9 @@ mod tests {
         if fs::File::open(&original).is_ok() {
             return; // root 读得动任何文件,这条测不了
         }
-        assert!(adapter.parse_main(&r, false).is_err());
+        assert!(adapter.parse(&r, false).is_err());
         fs::set_permissions(&original, fs::Permissions::from_mode(0o644)).unwrap();
-        let parsed = adapter.parse_main(&r, false).unwrap();
+        let (_, parsed) = adapter.parse(&r, false).unwrap();
         assert_eq!(
             parsed.messages[0].kind,
             MessageKind::Meta,

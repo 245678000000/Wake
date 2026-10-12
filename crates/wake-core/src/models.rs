@@ -301,7 +301,10 @@ pub struct ToolCallView {
     pub input: Option<String>,
     pub output: Option<String>,
     pub is_error: bool,
-    pub sidechain_ref: Option<String>,
+    /// 这次调用派出去的子会话的原生 id(Claude 的 Task / Agent、OpenCode 的 task…):子会话与这份
+    /// 转录同一家、同一台机器,key 由用的地方按这份转录的 agent 与 host 拼。详情页的"打开子代理
+    /// 会话"按它跳。对不上的家给 None
+    pub child_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,12 +372,14 @@ pub struct TranscriptMessage {
     pub images: Vec<ImageAttachment>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SidechainInfo {
     pub id: String,
     pub agent_type: Option<String>,
     pub description: Option<String>,
     pub tool_use_id: Option<String>,
+    /// 这份转录同时作为子会话入库时,那条子会话的原生 id(MCP 的页脚列子会话时就不再重复列它)
+    pub session_id: Option<String>,
 }
 
 impl SidechainInfo {

@@ -159,6 +159,26 @@ pub fn stage_codex_spawn_pair(home: &Path) -> (String, String, PathBuf) {
             parent_head.clone(),
             message("user", "inherited parent turn about the qr login bug"),
             message("assistant", "inherited parent answer"),
+            // 派活:输出是子线程的 agent_path,详情页按它跳到子线程
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:29:00.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "spawn_agent",
+                    "call_id": "call_spawn_1",
+                    "arguments": "{\"task_name\":\"review_issue17\",\"message\":\"Review issue 17\"}"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-09-16T09:29:01.000Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_spawn_1",
+                    "output": "{\"task_name\":\"/root/review_issue17\"}"
+                }
+            }),
         ],
     );
 
@@ -219,28 +239,30 @@ pub fn stage_codex_spawn_pair(home: &Path) -> (String, String, PathBuf) {
     conn.execute_batch(
         "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, title TEXT, name TEXT,
          tokens_used INTEGER, archived INTEGER, git_branch TEXT, model TEXT, source TEXT,
-         created_at_ms INTEGER, updated_at_ms INTEGER);
+         created_at_ms INTEGER, updated_at_ms INTEGER, agent_path TEXT);
          CREATE TABLE thread_spawn_edges (parent_thread_id TEXT NOT NULL,
          child_thread_id TEXT NOT NULL PRIMARY KEY, status TEXT NOT NULL);",
     )
     .unwrap();
-    for (id, file, source) in [
+    for (id, file, source, agent_path) in [
         (
             &parent_id,
             format!("rollout-2026-09-16T09-00-00-{parent_id}.jsonl"),
             "cli",
+            None,
         ),
         (
             &child_id,
             format!("rollout-2026-09-16T09-30-00-{child_id}.jsonl"),
             // 真机把整个结构化来源原样存进 source 列
             "{\"subagent\":{\"thread_spawn\":{}}}",
+            Some("/root/review_issue17"),
         ),
     ] {
         conn.execute(
             "INSERT INTO threads VALUES (?1, ?2, '/work/wake', '', NULL, 0, 0,
-             NULL, NULL, ?3, 1789000000000, 1789000000000)",
-            rusqlite::params![id, day.join(file).to_string_lossy(), source],
+             NULL, NULL, ?3, 1789000000000, 1789000000000, ?4)",
+            rusqlite::params![id, day.join(file).to_string_lossy(), source, agent_path],
         )
         .unwrap();
     }
@@ -1423,6 +1445,100 @@ pub fn lock_as(db: &Path, kind: &str) -> IndexLock {
             Ownership::Held(who) => panic!("a fresh lock should not be held by {who}"),
         }
     }
+}
+
+/// Claude Code 的子代理:在会话目录 `<项目目录>/<parent>/subagents/` 下放一份 Task / Agent 派的
+/// 转录(边车写着任务说明与派它的 tool_use id)和一份 Workflow 跑出来的(边车只有 agentType),
+/// 外加 Workflow 的运行日志 journal.jsonl(不是转录)。`prefix` 让同一测试里的几组 id 不撞。
+/// 返回 (Task 那份的 id, Workflow 那份的 id)
+pub fn stage_claude_subagents(
+    project: &Path,
+    parent: &str,
+    prefix: &str,
+    tool_use_id: &str,
+) -> (String, String) {
+    let subagents = project.join(parent).join("subagents");
+    let run = subagents.join("workflows").join(format!("wf_{prefix}-run"));
+    fs::create_dir_all(&run).unwrap();
+    let rows = |lines: &[(&str, &str, &str)]| -> String {
+        lines
+            .iter()
+            .enumerate()
+            .map(|(ix, (typ, ts, text))| {
+                let message = if *typ == "user" {
+                    serde_json::json!({ "role": "user", "content": text })
+                } else {
+                    serde_json::json!({
+                        "id": format!("msg_{prefix}_{ix}"),
+                        "role": "assistant",
+                        "model": "claude-opus-5-5",
+                        "content": [{ "type": "text", "text": text }],
+                        "usage": { "input_tokens": 10, "output_tokens": 5 },
+                    })
+                };
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "parentUuid": null,
+                        "isSidechain": true,
+                        "cwd": "/Users/tester/Github/subfx",
+                        "sessionId": parent,
+                        "type": typ,
+                        "message": message,
+                        "uuid": format!("{prefix}-{ix}"),
+                        "timestamp": ts,
+                    })
+                )
+            })
+            .collect()
+    };
+    let task = format!("agent-{prefix}task");
+    let step = format!("agent-{prefix}step");
+    fs::write(
+        subagents.join(format!("{task}.jsonl")),
+        rows(&[
+            (
+                "user",
+                "2026-10-01T10:00:10.000Z",
+                "Look at src/parser.rs and report problems",
+            ),
+            (
+                "assistant",
+                "2026-10-01T10:00:20.000Z",
+                "The parser handles every case.",
+            ),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        subagents.join(format!("{task}.meta.json")),
+        serde_json::json!({
+            "agentType": "Explore",
+            "description": "Check the parser",
+            "toolUseId": tool_use_id,
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        run.join(format!("{step}.jsonl")),
+        rows(&[
+            (
+                "user",
+                "2026-10-01T10:01:00.000Z",
+                "Workflow step: run the tests",
+            ),
+            ("assistant", "2026-10-01T10:01:30.000Z", "All tests pass."),
+        ]),
+    )
+    .unwrap();
+    fs::write(
+        run.join(format!("{step}.meta.json")),
+        r#"{"agentType":"workflow-subagent","spawnDepth":1}"#,
+    )
+    .unwrap();
+    fs::write(run.join("journal.jsonl"), "{\"type\":\"workflow-start\"}\n").unwrap();
+    (task, step)
 }
 
 /// Claude Code 的分支会话:原件 A 问了两轮;B 是从 A 第一轮之后分出来的——Claude 把 A 到

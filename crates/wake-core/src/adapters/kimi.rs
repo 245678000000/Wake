@@ -22,7 +22,8 @@ use std::sync::{Arc, Mutex};
 ///
 /// `state.json` 边车给标题 / 时间 / 归档 / 分叉来源("New Session" 是占位标题),cwd 靠
 /// home 下 `session_index.jsonl` 的 sessionId→workDir(目录名 hash 不可反推)。
-/// `agents/<非main>/` 是子代理,不进列表。
+/// `agents/<非main>/` 是派出去的子代理(state.json 的 `agents` 里记着 `type: "sub"` 与
+/// `parentAgentId`),作为子会话挂在所在会话下面,native id 是 `<会话>/<agent id>`。
 pub struct KimiAdapter {
     /// 会话根:`<home>/sessions`(下面两级 `wd_*/<会话>`),或单个工作目录桶 `wd_*`(会话就在
     /// 它下面一级)
@@ -110,15 +111,37 @@ impl KimiAdapter {
         decode_images: bool,
     ) -> Result<(SessionMeta, Vec<TranscriptMessage>, u32)> {
         let path = Path::new(&r.file_path);
+        let subagent = subagent_of(path);
         // state.json 在却读不出(又没读到过)就让这次解析失败,先读它、省得白解析整份转录:
         // 按默认值入库,标题、归档都是错的,而引用里记着它此刻的 mtime / size,文件不再变就
-        // 一直错着
-        let state = match session_dir_of(path) {
-            Some(dir) => self.states.get(dir)?,
-            None => KimiState::default(),
+        // 一直错着。子代理没有自己的 state.json,只跟着所在会话归档——不跟的话会话归档了它还
+        // 在,父会话被藏起来,它就成了顶层会话(Codex review 2026-10-12)
+        let state = match (session_dir_of(path), subagent) {
+            (Some(dir), _) => self.states.get(dir)?,
+            (None, Some((session, _))) => KimiState {
+                archived: self.states.get(session)?.archived,
+                ..KimiState::default()
+            },
+            (None, None) => KimiState::default(),
         };
         let (messages, unknown) = parse_kimi_wire(path, decode_images)?;
-        let meta = build_meta(r, &state, &self.cwd_for(&r.native_id), &messages);
+        // 子代理的工作目录跟着所在会话(索引按会话记)
+        let session = subagent_session_id(path).unwrap_or_else(|| r.native_id.clone());
+        let mut meta = build_meta(r, &state, &self.cwd_for(&session), &messages);
+        if subagent.is_some() {
+            // 时间按它自己的消息算
+            meta.spawned = true;
+            let times = || {
+                messages
+                    .iter()
+                    .filter_map(|m| m.timestamp)
+                    .filter(|t| *t > 0)
+            };
+            if let (Some(first), Some(last)) = (times().min(), times().max()) {
+                meta.created_at = first;
+                meta.updated_at = last;
+            }
+        }
         Ok((meta, messages, unknown))
     }
 }
@@ -164,6 +187,47 @@ fn session_dir_of(wire_path: &Path) -> Option<&Path> {
         .ancestors()
         .nth(MAIN_WIRE.len())
         .filter(|dir| is_session_dir(dir))
+}
+
+/// 子代理的转录 `…/<会话>/agents/<id>/wire.jsonl`(id 不是 main):返回会话目录与 agent id
+fn subagent_of(wire_path: &Path) -> Option<(&Path, &str)> {
+    if wire_path.file_name()? != MAIN_WIRE[2] {
+        return None;
+    }
+    let agent_dir = wire_path.parent()?;
+    let id = agent_dir.file_name()?.to_str()?;
+    let agents = agent_dir.parent()?;
+    if id == MAIN_WIRE[1] || agents.file_name()? != MAIN_WIRE[0] {
+        return None;
+    }
+    let session = agents.parent().filter(|dir| is_session_dir(dir))?;
+    Some((session, id))
+}
+
+/// 子代理的原生 id `<会话>/<agent id>`:带 `/`,不会被当成能恢复的会话 id
+fn subagent_native_id(session_dir: &Path, id: &str) -> Option<String> {
+    Some(format!(
+        "{}/{id}",
+        session_dir.file_name()?.to_string_lossy()
+    ))
+}
+
+/// 子代理所在会话的原生 id(`AgentAdapter::parent_in_path`)
+fn subagent_session_id(wire_path: &Path) -> Option<String> {
+    let (session, _) = subagent_of(wire_path)?;
+    Some(session.file_name()?.to_string_lossy().into_owned())
+}
+
+/// 会话目录里派出去的子代理的转录,读不出的目录跳过
+fn subagent_wires(session_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(session_dir.join(MAIN_WIRE[0])) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|entry| entry.path().join(MAIN_WIRE[2]))
+        .filter(|wire| subagent_of(wire).is_some())
+        .collect()
 }
 
 /// 会话目录下的边车:标题 / 时间 / 归档 / 分叉来源
@@ -347,6 +411,9 @@ struct WireReader {
     tool_slots: HashMap<String, (usize, usize)>,
     /// 最后一个 `forked` 标记之前的消息数:那一段是从父会话复制来的
     inherited: usize,
+    /// 读的是子代理的转录(`subagent_of`):派它的 Agent 调用写的任务(`system_trigger` /
+    /// `subagent`)是它的"用户"那句
+    subagent: bool,
 }
 
 impl WireReader {
@@ -407,6 +474,13 @@ impl WireReader {
     }
 
     fn visible(&mut self, origin: Option<&Value>) -> bool {
+        let field = |key: &str| origin.and_then(|o| o.get(key)).and_then(Value::as_str);
+        if self.subagent
+            && field("kind") == Some("system_trigger")
+            && field("name") == Some("subagent")
+        {
+            return true;
+        }
         user_visible(origin).unwrap_or_else(|| {
             self.unknown += 1;
             false
@@ -553,6 +627,7 @@ fn parse_kimi_wire(path: &Path, decode_images: bool) -> Result<(Vec<TranscriptMe
     let reader = BufReader::with_capacity(1 << 20, fs::File::open(path)?);
     let mut wire = WireReader {
         decode_images,
+        subagent: subagent_of(path).is_some(),
         ..Default::default()
     };
     for row in jsonl_values(reader) {
@@ -562,6 +637,52 @@ fn parse_kimi_wire(path: &Path, decode_images: bool) -> Result<(Vec<TranscriptMe
         }
     }
     Ok(wire.finish())
+}
+
+/// 会话派出去的子代理(各自作为子会话入库)。派它的 Agent 调用按输出里那行 `agent_id: <id>`
+/// 对上——头一回派的与接着派的(`resume`)都写这一行;任务说明与类型从调用的参数取
+fn link_agent_calls(session_dir: &Path, mainline: &mut [TranscriptMessage]) -> Vec<SidechainInfo> {
+    let mut sidechains: Vec<SidechainInfo> = subagent_wires(session_dir)
+        .iter()
+        .filter_map(|wire| {
+            let (_, id) = subagent_of(wire)?;
+            Some(SidechainInfo {
+                id: id.to_string(),
+                session_id: subagent_native_id(session_dir, id),
+                ..SidechainInfo::default()
+            })
+        })
+        .collect();
+    for call in mainline.iter_mut().flat_map(|m| m.tool_calls.iter_mut()) {
+        let Some(id) = call
+            .output
+            .as_deref()
+            .and_then(|out| out.lines().find_map(|line| line.strip_prefix("agent_id: ")))
+        else {
+            continue;
+        };
+        let Some(sidechain) = sidechains.iter_mut().find(|s| s.id == id.trim()) else {
+            continue;
+        };
+        call.child_id = sidechain.session_id.clone();
+        let input: Option<Value> = call
+            .input
+            .as_deref()
+            .and_then(|i| serde_json::from_str(i).ok());
+        let arg = |key: &str| {
+            input
+                .as_ref()
+                .and_then(|v| text_at(v, key))
+                .map(String::from)
+        };
+        sidechain.description = sidechain.description.take().or_else(|| arg("description"));
+        sidechain.agent_type = sidechain.agent_type.take().or_else(|| arg("subagent_type"));
+        sidechain.tool_use_id = sidechain
+            .tool_use_id
+            .take()
+            .or_else(|| Some(call.id.clone()));
+    }
+    sidechains
 }
 
 fn session_key_of(native_id: &str) -> String {
@@ -631,12 +752,24 @@ impl AgentAdapter for KimiAdapter {
         Ok(self
             .session_dirs()
             .iter()
-            .filter_map(|dir| self.file_ref(&dir.join(&rel)))
+            .flat_map(|dir| std::iter::once(dir.join(&rel)).chain(subagent_wires(dir)))
+            .filter_map(|wire| self.file_ref(&wire))
             .collect())
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        // 只认主代理的 wire.jsonl(形状判定在 session_dir_of;agents/<其他>/ 是子代理)。
+        // 子代理(`agents/<非main>/wire.jsonl`):native id 带上所在会话。它跟着会话归档,
+        // 归档与否并进引用(只这一位:state.json 每一轮都重写,整份并进来子代理就跟着轮轮
+        // 重解析),在 Kimi 里归档 / 取消归档时全量扫描认得出它变了
+        if let Some((session, id)) = subagent_of(path) {
+            let mut r = default_file_ref(self.agent(), path)?;
+            r.native_id = subagent_native_id(session, id)?;
+            if self.states.get(session).is_ok_and(|state| state.archived) {
+                r.size += 1;
+            }
+            return Some(r);
+        }
+        // 主代理的 wire.jsonl(形状判定在 session_dir_of)。
         // state.json 单独改了(在 Kimi 里归档、改名)也要重新解析:监听到它就换成同会话的
         // 主转录,它的 mtime / size 并进引用——全量扫描按引用判脏
         let wire = if path.file_name()? == STATE_FILE {
@@ -655,7 +788,27 @@ impl AgentAdapter for KimiAdapter {
         Some(r)
     }
 
+    /// 会话的 state.json 变了(在 Kimi 里归档、取消归档):子代理的引用里并着归档那一位,
+    /// 它们自己的转录没动、收不到事件,交给 watcher 按引用重比
+    fn ref_dependents(&self, path: &Path) -> Vec<PathBuf> {
+        match path.parent() {
+            Some(dir)
+                if path.file_name().is_some_and(|name| name == STATE_FILE)
+                    && is_session_dir(dir) =>
+            {
+                subagent_wires(dir)
+            }
+            _ => Vec::new(),
+        }
+    }
+
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        // 子代理是它自己的 agent 目录
+        if subagent_of(Path::new(&meta.file_path)).is_some() {
+            if let Some(dir) = Path::new(&meta.file_path).parent() {
+                return vec![dir.to_string_lossy().to_string()];
+            }
+        }
         // 会话是整个会话目录(state.json + agents/),整目录进废纸篓
         session_dir_of(Path::new(&meta.file_path))
             .map(|d| vec![d.to_string_lossy().to_string()])
@@ -668,13 +821,37 @@ impl AgentAdapter for KimiAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let (meta, messages, unknown) = self.parse(r, true)?;
+        let (meta, mut messages, unknown) = self.parse(r, true)?;
+        let sidechains = match session_dir_of(Path::new(&r.file_path)) {
+            Some(dir) => link_agent_calls(dir, &mut messages),
+            None => Vec::new(),
+        };
         Ok(ParsedTranscript {
             meta,
             mainline: messages,
-            sidechains: Vec::new(),
+            sidechains,
             unknown_line_count: unknown,
         })
+    }
+
+    fn load_sidechain(
+        &self,
+        r: &SessionFileRef,
+        sidechain_id: &str,
+    ) -> Result<Vec<TranscriptMessage>> {
+        let Some(dir) = session_dir_of(Path::new(&r.file_path)) else {
+            return Ok(Vec::new());
+        };
+        let wire = dir.join(MAIN_WIRE[0]).join(sidechain_id).join(MAIN_WIRE[2]);
+        if subagent_of(&wire).is_none() || !wire.is_file() {
+            return Ok(Vec::new());
+        }
+        Ok(parse_kimi_wire(&wire, true)?.0)
+    }
+
+    /// 子代理挂到所在会话下面(它的转录就在会话目录的 agents/ 里)
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        Some(subagent_session_id)
     }
 
     fn cleanup_paths(&self, meta: &SessionMeta) -> Option<Vec<String>> {

@@ -104,6 +104,8 @@ pub(super) struct ComposerFacts {
     /// actual workspace, or be one of several repos inside it.
     pub project: Option<ProjectMetadata>,
     pub model: Option<String>,
+    /// composer 的名字。子代理的 composer 名字就是派它时写的任务说明
+    pub name: Option<String>,
 }
 
 /// 批量读,一次连接、一条缓存的语句(转录解析读一个,每轮扫描的侧档刷新读全部)。库打不开
@@ -119,6 +121,7 @@ pub(super) fn composer_facts<'a>(
             let facts = ComposerFacts {
                 project: ProjectMetadata::from_data(&data),
                 model: composer_model(&data),
+                name: optional_string(data.get("name")),
             };
             Some((id.to_string(), facts))
         })
@@ -642,6 +645,13 @@ impl AgentAdapter for CursorIdeAdapter {
     }
 
     fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// 关系记在子代理自己的 composer 那一行里:按子会话的胜出副本认边。父会话多半是转录那份
+    /// 胜出(cursor.rs),照"报边者拥有父会话"认的话这条边会被丢掉,子代理成了顶层会话;子代理
+    /// 自己也是转录胜出时,转录那一路按路径挂(`parent_in_path`)
+    fn parent_links_in_child(&self) -> bool {
         true
     }
 

@@ -452,7 +452,7 @@ mod compact_tests {
             input: Some("{\"path\":\"src/db.rs\"}".into()),
             output: Some("ok, 3 lines changed".into()),
             is_error: false,
-            sidechain_ref: None,
+            child_id: None,
         });
         tool.thinking = Some("私下想一想".into());
         vec![
@@ -574,7 +574,7 @@ mod compact_tests {
                 input: Some(format!("cargo test --test case_{i:03}")),
                 output: Some("ok. 12 passed; 0 failed\n".repeat(40)),
                 is_error: false,
-                sidechain_ref: None,
+                child_id: None,
             });
         }
         let o = CompactOptions {

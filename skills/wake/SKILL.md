@@ -65,12 +65,10 @@ wake-cli show 'claude-code:1b2c3d4e-…'
 ```
 
 Add `--tools` for tool inputs and outputs, `--thinking` for recorded reasoning. Both are
-verbose — start without them. Work done by subagents (Claude Code sidechains, Cursor
-subagents) is not in the main transcript; its ids are listed at the end of the output —
-read one with `--subagent ID`, or `--subagent '*'` to list them all. Sub-agents that run
-as sessions of their own (Codex `spawn_agent`, Grok, OpenCode, DeepSeek Harness and others)
-are listed at the end too, by key; `sessions` only lists parents, so this is where to find
-them.
+verbose — start without them. Work done by subagents is not in the main transcript: each
+subagent is a session of its own, listed at the end of the output by key — `sessions` only
+lists parents, so this is where to find them. Claude Code and Cursor subagents can also be
+read through the parent with `--subagent ID`, or `--subagent '*'` to list their ids.
 
 **Which projects have history**
 

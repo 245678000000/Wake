@@ -682,7 +682,7 @@ impl BlockAcc {
             }
             self.content.images.extend(images);
         }
-        self.tools.push(tool_call_view(
+        let mut call = tool_call_view(
             b.get("callID")
                 .or_else(|| b.get("id"))
                 .and_then(|v| v.as_str())
@@ -695,7 +695,10 @@ impl BlockAcc {
             &input,
             output,
             state.get("status").and_then(|v| v.as_str()) == Some("error"),
-        ));
+        );
+        // task 工具派出去的子会话:它的 id 记在调用的 metadata 里
+        call.child_id = optional_string(state.pointer("/metadata/sessionId"));
+        self.tools.push(call);
     }
 
     fn push_image(&mut self, block: &Value, decode_images: bool) {

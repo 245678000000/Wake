@@ -226,7 +226,7 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
                     "max_message_chars": { "type": "integer", "minimum": 100, "maximum": 50000, "default": 4000, "description": "Longer messages are truncated to this many characters." },
                     "include_tools": { "type": "boolean", "default": false, "description": "Include tool-call inputs and outputs (verbose)." },
                     "include_thinking": { "type": "boolean", "default": false, "description": "Include the assistant's thinking/reasoning text where the agent recorded it." },
-                    "subagent": { "type": "string", "description": "Read this subagent transcript instead of the session's main transcript. The main transcript lists the ids at its end; paging works the same way." },
+                    "subagent": { "type": "string", "description": "Read this subagent transcript (one kept in the session's folder) instead of the session's main transcript; `*` lists their ids. Paging works the same way. Each subagent is also a session of its own, listed by key at the end of the main transcript." },
                 },
                 "required": ["key"],
             },
@@ -1365,9 +1365,7 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
                 .cloned()
                 .unwrap_or_else(|| SidechainInfo {
                     id: id.to_string(),
-                    agent_type: None,
-                    description: None,
-                    tool_use_id: None,
+                    ..SidechainInfo::default()
                 });
             Some((info, messages))
         }
@@ -1498,15 +1496,28 @@ fn get_session(ctx: &ToolContext, args: &Value) -> ToolResult {
     out.push_str(&summary);
     out.push_str(".\n");
     // 主线页脚两张清单:挂在这条会话下面的子会话(有自己的 key,按 key 读),
-    // 与侧边的子代理转录(不并进主线、各有自己的 seq,按 id 读)
+    // 与侧边的子代理转录(不并进主线、各有自己的 seq,按 id 读)。已经作为子会话列出来的
+    // 子代理(Claude Code、Cursor 的)不再列第二遍;`subagent` 参数照样认它们的 id
     children_footer(&mut out);
     if sub_id.is_none() {
-        if !transcript.sidechains.is_empty() {
+        // 子会话与这条会话同一家、同一台机器:按原生 id 比
+        let listed: HashSet<&str> = children.iter().map(|c| c.id.as_str()).collect();
+        let unlisted: Vec<SidechainInfo> = transcript
+            .sidechains
+            .iter()
+            .filter(|sc| {
+                sc.session_id
+                    .as_deref()
+                    .is_none_or(|id| !listed.contains(id))
+            })
+            .cloned()
+            .collect();
+        if !unlisted.is_empty() {
             out.push_str(&format!(
                 "{} subagent transcript{} (pass an id as `subagent` to read one):\n{}",
-                transcript.sidechains.len(),
-                plural(transcript.sidechains.len() as i64),
-                subagent_lines(&transcript.sidechains, Some(MAX_SUBAGENTS_LISTED))
+                unlisted.len(),
+                plural(unlisted.len() as i64),
+                subagent_lines(&unlisted, Some(MAX_SUBAGENTS_LISTED))
             ));
         }
     }

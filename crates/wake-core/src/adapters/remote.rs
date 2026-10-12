@@ -234,8 +234,12 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.parent_links_in_child()
     }
 
-    fn children_outlive_parent(&self) -> bool {
-        self.inner.children_outlive_parent()
+    fn child_outlives_parent(&self, child_path: &str) -> bool {
+        self.inner.child_outlives_parent(child_path)
+    }
+
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        self.inner.parent_in_path()
     }
 
     fn linked_children_are_spawned(&self) -> bool {

@@ -19,6 +19,8 @@ pub struct CodexAdapter {
     scan_sessions: bool,
     scan_archived: bool,
     links_cache: MtimeCache<Vec<(String, String)>>,
+    /// 每条线程派出去的子线程:父线程 id → (agent_path, 子线程 id),按起的先后(`spawned_threads`)
+    spawned_cache: MtimeCache<std::sync::Arc<SpawnedThreads>>,
     /// CODEX_HOME(memories/ 与 memories_1.sqlite 的所在);自定义根选的是独立的
     /// sessions 目录或裸 rollout 拷贝时没有 home——侧档绝不越界摸父目录(不变量 8⑨)
     home: Option<PathBuf>,
@@ -43,6 +45,7 @@ impl CodexAdapter {
             scan_sessions: true,
             scan_archived: true,
             links_cache: MtimeCache::new(),
+            spawned_cache: MtimeCache::new(),
             home: Some(root),
             memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),
@@ -291,6 +294,65 @@ fn read_spawn_edges(state_db: &Path) -> Option<HashMap<String, String>> {
     // 逐行 Err(列类型变了、读到一半 SQLITE_BUSY)不能 flatten 掉:少几条边
     // 与"这几条边被删了"在下游无法区分,同样会解挂那几条子会话
     rows.collect::<rusqlite::Result<HashMap<_, _>>>().ok()
+}
+
+/// 父线程 id → 它派出去的子线程 (agent_path, 子线程 id),按起的先后
+type SpawnedThreads = HashMap<String, Vec<(String, String)>>;
+
+/// state DB 里每条线程派出去的子线程与它们的 agent_path。`None` 与 `Some(空)` 同 `read_spawn_edges`:
+/// 没有库、老库没这些表或列 = 确定没有;库在却打不开、逐行读出错 = 不知道(不缓存,下次再读)
+fn read_spawned_threads(state_db: &Path) -> Option<std::sync::Arc<SpawnedThreads>> {
+    let mut spawned = SpawnedThreads::new();
+    if !state_db.is_file() {
+        return Some(spawned.into());
+    }
+    let ro = open_sqlite_ro(state_db, "codex")?;
+    let Ok(mut stmt) = ro.conn.prepare(
+        "SELECT e.parent_thread_id, t.agent_path, e.child_thread_id FROM thread_spawn_edges e
+         JOIN threads t ON t.id = e.child_thread_id
+         WHERE t.agent_path IS NOT NULL
+         ORDER BY t.created_at_ms, t.id",
+    ) else {
+        return Some(spawned.into());
+    };
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .ok()?;
+    for row in rows {
+        let (parent, path, child) = row.ok()?;
+        spawned.entry(parent).or_default().push((path, child));
+    }
+    Some(spawned.into())
+}
+
+/// `spawn_agent` 调用指向它起的子线程。调用的输出是子线程的 `agent_path`(`{"task_name":
+/// "/root/<任务名>"}`),对上这条线程派出去的子线程各自记着的 agent_path;同一个任务名派两次时
+/// 按起的先后依次对上
+fn link_spawned_threads(children: &[(String, String)], mainline: &mut [TranscriptMessage]) {
+    let mut by_path: HashMap<&str, std::collections::VecDeque<&str>> = HashMap::new();
+    for (path, child) in children {
+        by_path.entry(path).or_default().push_back(child);
+    }
+    for call in mainline
+        .iter_mut()
+        .flat_map(|m| m.tool_calls.iter_mut())
+        .filter(|call| call.name == "spawn_agent")
+    {
+        let path = call
+            .output
+            .as_deref()
+            .and_then(|out| serde_json::from_str::<Value>(out).ok())
+            .and_then(|out| optional_string(out.get("task_name")));
+        if let Some(child) = path.and_then(|path| by_path.get_mut(path.as_str())?.pop_front()) {
+            call.child_id = Some(child.to_string());
+        }
+    }
 }
 
 struct CodexParse {
@@ -669,7 +731,7 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                             },
                             output: None,
                             is_error: false,
-                            sidechain_ref: None,
+                            child_id: None,
                         };
                         // 末条消息落在 fork 段里(下标 < cut)时必须另起宿主:
                         // collapse_inherited 会把那段整段 splice 掉,挂上去的
@@ -1212,9 +1274,25 @@ impl AgentAdapter for CodexAdapter {
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
         let parsed = parse_rollout(Path::new(&r.file_path), true)?;
+        let meta = build_meta(r, &parsed, &self.archived_dir);
+        let mut mainline = parsed.messages;
+        // 有派活的调用才去问 state DB(按库戳缓存,parent_links 同款);读不出就不挂跳转
+        if mainline
+            .iter()
+            .flat_map(|m| &m.tool_calls)
+            .any(|call| call.name == "spawn_agent")
+        {
+            let stamp = super::sqlite_ro::db_cache_stamp(&self.state_db);
+            let spawned = self
+                .spawned_cache
+                .get_or_try_build(stamp, || read_spawned_threads(&self.state_db));
+            if let Some(children) = spawned.as_deref().and_then(|map| map.get(&meta.id)) {
+                link_spawned_threads(children, &mut mainline);
+            }
+        }
         Ok(ParsedTranscript {
-            meta: build_meta(r, &parsed, &self.archived_dir),
-            mainline: parsed.messages,
+            meta,
+            mainline,
             sidechains: Vec::new(),
             unknown_line_count: parsed.unknown_lines,
         })
@@ -1289,6 +1367,7 @@ impl AgentAdapter for CodexAdapter {
             scan_sessions: true,
             scan_archived: true,
             links_cache: MtimeCache::new(),
+            spawned_cache: MtimeCache::new(),
             home,
             memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),
@@ -1314,6 +1393,7 @@ impl AgentAdapter for CodexAdapter {
             scan_sessions: self.scan_sessions && !roots.contains(&self.sessions_dir),
             scan_archived: self.scan_archived && !roots.contains(&self.archived_dir),
             links_cache: MtimeCache::new(),
+            spawned_cache: MtimeCache::new(),
             home: self.home.clone(),
             memories: super::MemoryCache::new(),
             thread_memories: MtimeCache::new(),

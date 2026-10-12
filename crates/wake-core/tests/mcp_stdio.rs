@@ -323,14 +323,26 @@ fn stdio_contract_end_to_end() {
         "tool calls fold to one line by default"
     );
 
-    // 4b. 子代理转录:主线页脚列出 id,按 id 读、同一套分页;未知 id 是给 LLM 看
-    // 的失败结果并附上有哪些
+    // 4b. 子代理转录:作为子会话列在主线页脚(标题是派活时的任务说明),按它自己的 key 读,
+    // 头部指回父会话;不再在 subagent transcripts 里列第二遍。`subagent` 参数照样按 id 读、
+    // 同一套分页;未知 id 是给 LLM 看的失败结果并附上有哪些
     assert!(
         plain_page.contains(
-            "1 subagent transcript (pass an id as `subagent` to read one):\n- agent-fixture01 — Explore: find the QR scanner code\n"
+            "1 child session (read one with wake_get_session using its key):\n- `claude-code:agent-fixture01` — \"find the QR scanner code\" · 3 messages\n"
         ),
         "{plain_page}"
     );
+    assert!(!plain_page.contains("subagent transcript"), "{plain_page}");
+    let (child, is_err) = c.call(
+        "wake_get_session",
+        json!({ "key": "claude-code:agent-fixture01" }),
+    );
+    assert!(!is_err, "{child}");
+    assert!(
+        child.contains(&format!("parent: `{CLAUDE_KEY}`")),
+        "{child}"
+    );
+    assert!(child.contains("QR scanner is wired up"), "{child}");
     let (sub, is_err) = c.call(
         "wake_get_session",
         json!({ "key": CLAUDE_KEY, "subagent": "agent-fixture01", "max_messages": 1 }),

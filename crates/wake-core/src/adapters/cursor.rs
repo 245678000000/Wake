@@ -3,6 +3,7 @@ use super::{cursor_ide, AgentAdapter};
 use crate::models::*;
 use anyhow::Result;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::fs;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
@@ -50,7 +51,13 @@ impl CursorAdapter {
     fn build_meta(&self, r: &SessionFileRef, p: &CursorParse) -> SessionMeta {
         let facts = self.composer_facts(r);
         let cwd = resolve_project_path(r, facts.project.as_ref());
-        let title = title_from_messages(&p.messages).unwrap_or_else(|| UNTITLED.to_string());
+        let spawned = subagent_parent_dir(Path::new(&r.file_path)).is_some();
+        // 子代理的 composer 名字是派它时写的任务说明(IDE 里跑的才有),比它收到的整段提示好认
+        let title = facts
+            .name
+            .filter(|_| spawned)
+            .or_else(|| title_from_messages(&p.messages))
+            .unwrap_or_else(|| UNTITLED.to_string());
         SessionMeta {
             key: format!("cursor:{}", r.native_id),
             host: String::new(),
@@ -81,8 +88,7 @@ impl CursorAdapter {
             tokens_used: None,
             archived: false,
             source: None,
-            // 子代理的转录在父会话目录的 subagents/ 里,不作为顶层转录列出;子代理会话由 IDE 库那一路标
-            spawned: false,
+            spawned,
             favorite: false,
             pinned: false,
         }
@@ -190,6 +196,20 @@ struct CursorParse {
     created_at: i64,
     updated_at: i64,
     unknown_lines: u32,
+    dispatches: Vec<Dispatch>,
+}
+
+/// 主线里派子代理的调用(Task)。转录里的工具调用没有 id,详情页的跳转靠这两样对上
+/// subagents/ 里的转录:头一回派的 `prompt` 就是子代理收到的第一句,接着派的 `resume` 直接
+/// 点名子代理
+struct Dispatch {
+    /// 调用所在的消息,与它在那条消息里的位置
+    message: usize,
+    call: usize,
+    prompt: Option<String>,
+    resume: Option<String>,
+    description: Option<String>,
+    agent_type: Option<String>,
 }
 
 #[derive(Default)]
@@ -232,6 +252,7 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
     let mut unknown_lines = 0u32;
     // 读不出/不是 JSON 的行(截断、损坏),与"认得出 JSON 但类型未知"分开计
     let mut malformed_lines = 0u32;
+    let mut dispatches = Vec::new();
 
     for row in jsonl_values(reader) {
         let Some(row) = row? else {
@@ -270,12 +291,7 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
                                     ts = parsed;
                                 }
                             }
-                            // 真实输入在 <user_query> 壳内;没有壳的行原样保留
-                            let body =
-                                extract_tag(raw, "user_query").unwrap_or_else(|| raw.to_string());
-                            if !body.trim().is_empty() {
-                                parsed_message.push_text(&body);
-                            }
+                            parsed_message.push_text(&user_query(raw));
                         }
                         _ if is_image_part(b) => {
                             let parsed = content_parts(b, decode_images);
@@ -313,6 +329,19 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
                         Some("tool_use") => {
                             let input = b.get("input").cloned().unwrap_or(Value::Null);
                             let name = b.get("name").and_then(|v| v.as_str()).unwrap_or("tool");
+                            let text = |key: &str| optional_string(input.get(key));
+                            let (prompt, resume) = (text("prompt"), text("resume"));
+                            if prompt.is_some() || resume.is_some() {
+                                // 这条助手消息还没落进 messages:flush 时它就排在这个位置
+                                dispatches.push(Dispatch {
+                                    message: messages.len(),
+                                    call: p.tool_calls.len(),
+                                    prompt,
+                                    resume,
+                                    description: text("description"),
+                                    agent_type: text("subagent_type"),
+                                });
+                            }
                             // transcript 不落盘工具结果,output 恒 None
                             p.tool_calls.push(tool_call_view(
                                 String::new(),
@@ -347,7 +376,124 @@ fn parse_cursor_jsonl(path: &Path, decode_images: bool) -> Result<CursorParse> {
         created_at,
         updated_at,
         unknown_lines,
+        dispatches,
     })
+}
+
+/// 用户文字块里人打的那句:`<user_query>` 壳里的话,没有壳的原样(解析与 `first_query` 共用,
+/// 对派活调用要逐字相同)
+fn user_query(raw: &str) -> String {
+    extract_tag(raw, "user_query").unwrap_or_else(|| raw.to_string())
+}
+
+/// 子代理收到的第一句:第一条用户行里人打的话,与解析出来的那条用户消息同一个取法
+fn first_query(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    for row in jsonl_values(BufReader::new(file)) {
+        let Ok(Some(row)) = row else { continue };
+        if row.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        let mut query = ParsedContent::default();
+        for b in row.pointer("/message/content")?.as_array()? {
+            if b.get("type").and_then(Value::as_str) == Some("text") {
+                if let Some(raw) = b.get("text").and_then(Value::as_str) {
+                    query.push_text(&user_query(raw));
+                }
+            }
+        }
+        return Some(query.text).filter(|q| !q.is_empty());
+    }
+    None
+}
+
+/// Task 派出去的子代理转录 `agent-transcripts/<父会话>/subagents/<id>.jsonl`(没有 Claude 那样的
+/// meta 边车),返回父会话的目录
+fn subagent_parent_dir(path: &Path) -> Option<&Path> {
+    let dir = path.parent()?;
+    if dir.file_name()? != "subagents" {
+        return None;
+    }
+    let session = dir.parent()?;
+    (session.parent()?.file_name()? == "agent-transcripts").then_some(session)
+}
+
+/// 子代理所在会话的原生 id:会话目录的名字(`AgentAdapter::parent_in_path`)
+fn subagent_parent(path: &Path) -> Option<String> {
+    Some(
+        subagent_parent_dir(path)?
+            .file_name()?
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
+/// 父会话的子代理(subagents/ 里的转录,各自也作为子会话入库)。派它的调用对上了(见
+/// `Dispatch`)就挂上跳转,任务说明与类型也从那次调用取;子代理自己下面没有 subagents/,给空
+fn link_dispatches(
+    r: &SessionFileRef,
+    mainline: &mut [TranscriptMessage],
+    dispatches: &[Dispatch],
+) -> Vec<SidechainInfo> {
+    let Ok(entries) = fs::read_dir(subagents_dir(r)) else {
+        return Vec::new();
+    };
+    let by_prompt = dispatches
+        .iter()
+        .any(|d| d.resume.is_none() && d.prompt.is_some());
+    let mut sidechains = Vec::new();
+    let mut firsts = Vec::new();
+    for path in entries.flatten().map(|entry| entry.path()) {
+        if path.extension().is_none_or(|ext| ext != "jsonl") {
+            continue;
+        }
+        if let Some(info) = sidechain_info(&path) {
+            firsts.push(by_prompt.then(|| first_query(&path)).flatten());
+            sidechains.push(info);
+        }
+    }
+    // 头一回派的按第一句对,只认一对一:同一句话派了两次、或两个子代理收到的第一句相同,分不清
+    // 谁是谁,不挂跳转——挂了就是几个按钮都指向枚举到的最后一个(Codex review 2026-10-12)
+    let mut fresh: HashMap<&str, usize> = HashMap::new();
+    for prompt in dispatches
+        .iter()
+        .filter(|d| d.resume.is_none())
+        .filter_map(|d| d.prompt.as_deref())
+    {
+        *fresh.entry(prompt).or_default() += 1;
+    }
+    let mut received: HashMap<&str, Option<usize>> = HashMap::new();
+    for (ix, first) in firsts.iter().enumerate() {
+        if let Some(first) = first.as_deref() {
+            received
+                .entry(first)
+                .and_modify(|only| *only = None)
+                .or_insert(Some(ix));
+        }
+    }
+    for d in dispatches {
+        // 接着派的按 resume 点名,只认它:它的 prompt 是接着说的话,恰好与另一个子代理的第一句
+        // 相同时会对上两个
+        let sent = match (&d.resume, d.prompt.as_deref()) {
+            (Some(resume), _) => sidechains.iter().position(|info| info.id == *resume),
+            (None, Some(prompt)) if fresh.get(prompt) == Some(&1) => {
+                received.get(prompt).copied().flatten()
+            }
+            _ => None,
+        };
+        let Some(info) = sent.map(|ix| &mut sidechains[ix]) else {
+            continue;
+        };
+        if let Some(call) = mainline
+            .get_mut(d.message)
+            .and_then(|m| m.tool_calls.get_mut(d.call))
+        {
+            call.child_id = info.session_id.clone();
+        }
+        info.description = info.description.take().or_else(|| d.description.clone());
+        info.agent_type = info.agent_type.take().or_else(|| d.agent_type.clone());
+    }
+    sidechains
 }
 
 fn subagents_dir(r: &SessionFileRef) -> PathBuf {
@@ -364,11 +510,14 @@ fn resolve_project_path(
     if let Some(workspace) = metadata.and_then(|m| m.workspace.as_ref()) {
         return workspace.clone();
     }
-    // …/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl → slug
+    // …/projects/<slug>/agent-transcripts/<uuid>/<uuid>.jsonl → slug(子代理的转录再深一层)
     let Some(slug) = Path::new(&r.file_path)
         .ancestors()
-        .nth(3)
-        .and_then(|d| d.file_name())
+        .find(|d| {
+            d.file_name()
+                .is_some_and(|name| name == "agent-transcripts")
+        })
+        .and_then(|d| d.parent()?.file_name())
     else {
         return String::new();
     };
@@ -451,40 +600,30 @@ impl AgentAdapter for CursorAdapter {
                 continue;
             };
             for session in sessions.flatten() {
-                let Ok(entries) = fs::read_dir(session.path()) else {
-                    continue;
+                // 会话自己的转录,与它派出去的子代理(子会话);判据与监听同一个 file_ref
+                let dir = session.path();
+                let files = |dir: &Path| -> Vec<PathBuf> {
+                    fs::read_dir(dir)
+                        .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
+                        .unwrap_or_default()
                 };
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if !name.ends_with(".jsonl") {
-                        continue;
-                    }
-                    let Ok(meta) = entry.metadata() else { continue };
-                    if !meta.is_file() || meta.len() == 0 {
-                        continue;
-                    }
-                    let size = meta.len() as i64;
-                    // 只有回合标记 = IDE 会话在本源的空壳,正文归 cursor_ide
-                    if is_turn_marker_only(&entry.path()) {
-                        continue;
-                    }
-                    refs.push(SessionFileRef {
-                        agent: AgentId::Cursor,
-                        native_id: name.trim_end_matches(".jsonl").to_string(),
-                        file_path: entry.path().to_string_lossy().to_string(),
-                        mtime_ms: mtime_ms(&meta),
-                        size,
-                    });
-                }
+                refs.extend(
+                    files(&dir)
+                        .iter()
+                        .chain(&files(&dir.join("subagents")))
+                        .filter_map(|path| self.file_ref(path)),
+                );
             }
         }
         Ok(refs)
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        // 只认 transcript 主文件 `agent-transcripts/<会话>/<会话>.jsonl`(subagents 转录多一层,
-        // 不是独立会话)。按路径分段判:Windows 的反斜杠路径一样认
-        if path.parent()?.parent()?.file_name()? != "agent-transcripts" {
+        // 会话转录 `agent-transcripts/<会话>/<会话>.jsonl` 与子代理转录 `…/<会话>/subagents/<id>.jsonl`。
+        // 按路径分段判:Windows 的反斜杠路径一样认
+        if path.parent()?.parent()?.file_name()? != "agent-transcripts"
+            && subagent_parent_dir(path).is_none()
+        {
             return None;
         }
         let r = default_file_ref(self.agent(), path)?;
@@ -497,6 +636,10 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        // 子代理只有它自己那份转录
+        if subagent_parent_dir(Path::new(&meta.file_path)).is_some() {
+            return vec![meta.file_path.clone()];
+        }
         // 会话是 <uuid>/ 整个目录(含 subagents/),删除时整目录进废纸篓
         Path::new(&meta.file_path)
             .parent()
@@ -515,27 +658,13 @@ impl AgentAdapter for CursorAdapter {
     }
 
     fn parse_transcript(&self, r: &SessionFileRef) -> Result<ParsedTranscript> {
-        let parsed = parse_cursor_jsonl(Path::new(&r.file_path), true)?;
-        // subagents/ 子目录与 Claude 同构,但无 meta 边车、主线 Task 调用无 id,
-        // 挂不上具体 tool_use——仅列出供导出携带
-        let mut sidechains = Vec::new();
-        let dir = subagents_dir(r);
-        if let Ok(entries) = fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Some(id) = name.strip_suffix(".jsonl") {
-                    sidechains.push(SidechainInfo {
-                        id: id.to_string(),
-                        agent_type: None,
-                        description: None,
-                        tool_use_id: None,
-                    });
-                }
-            }
-        }
+        let mut parsed = parse_cursor_jsonl(Path::new(&r.file_path), true)?;
+        let meta = self.build_meta(r, &parsed);
+        let mut mainline = std::mem::take(&mut parsed.messages);
+        let sidechains = link_dispatches(r, &mut mainline, &parsed.dispatches);
         Ok(ParsedTranscript {
-            meta: self.build_meta(r, &parsed),
-            mainline: parsed.messages,
+            meta,
+            mainline,
             sidechains,
             unknown_line_count: parsed.unknown_lines,
         })
@@ -555,6 +684,12 @@ impl AgentAdapter for CursorAdapter {
 
     fn cleanup_paths(&self, meta: &SessionMeta) -> Option<Vec<String>> {
         Some(self.session_paths(meta))
+    }
+
+    /// 子代理挂到派它的会话下面:转录在派它的会话目录里,目录名就是那个会话的 id。IDE 库那一路
+    /// 另报 composer 记的关系
+    fn parent_in_path(&self) -> Option<super::ParentInPath> {
+        Some(subagent_parent)
     }
 
     fn list_memories(

@@ -150,7 +150,7 @@ Everything above happens locally; Wake itself does not change and the other agen
 ### What it does not do
 
 - No write tools: nothing can delete, star, rename or resume a session. Resuming stays in Wake.
-- Subagent transcripts that live inside a session (Claude Code sidechains, Cursor subagents) are not merged into the main transcript: `wake_get_session` lists their ids at the end and reads one when it is passed as `subagent`. Sub-agents that their agent records as sessions of their own (Codex `spawn_agent`, Grok) are folded under their parent in `wake_list_sessions`; the parent's `wake_get_session` output lists them by key, and each reads like any other session.
+- Sub-agents are not merged into the main transcript. They are sessions of their own, folded under their parent in `wake_list_sessions`; the parent's `wake_get_session` output lists them by key, and each reads like any other session. A subagent transcript that lives in its parent's folder (Claude Code, Cursor, CodeBuddy, Qoder, Kimi Code) can also be read through the parent, by passing its id as `subagent`.
 - Antigravity conversations with no plain-text transcript on disk (older versions store the body encrypted) are metadata only, so an agent gets the same preview card Wake shows.
 - Archived Codex sessions appear in search results but not in `wake_list_sessions` or `wake_list_projects`.
 - Codex's own background threads — the guardian auto-review, `/review`, compaction and memory consolidation that Codex writes into the same `sessions` directory — are not indexed at all: they never show up in search, lists or project counts, and there is no key to read them by. Threads started by `spawn_agent` are the exception: they are work the user asked for, so they are indexed under the session that spawned them, titled with the task name. The turns Codex copies from the parent when it forks a sub-agent are dropped, so the parent's own conversation is only indexed once. After upgrading, rows an older Wake had indexed disappear once Wake itself has rescanned (launch it, or press Refresh); `wake-mcp` only reads the index and never rescans.
@@ -224,7 +224,7 @@ One transcript as compact Markdown, parsed live from the agent's files.
 | `max_message_chars` | integer 100–50000 | 4000 | budget per message, shared by its text, thinking and tool calls; longer content is truncated and marked |
 | `include_tools` | boolean | false | include tool inputs and outputs (verbose) |
 | `include_thinking` | boolean | false | include the assistant's recorded thinking |
-| `subagent` | string | | read this subagent transcript instead of the main one; the main transcript lists the ids at its end (at most 30), and `*` lists them all |
+| `subagent` | string | | read this subagent transcript instead of the main one; `*` lists the ids |
 
 The reply starts with a header (title, key, agent, host, project and branch, model, time range, message count), then one block per message:
 
@@ -238,9 +238,7 @@ inotify queues overflow when …
 - 🔧 Grep: need_rescan
 ```
 
-Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript with their ids; pass one as `subagent` to read it, with the same paging options. The footer lists at most 30; `subagent: "*"` returns the full list without a transcript.
-
-Child sessions (sub-agents kept as sessions of their own, such as Codex `spawn_agent`, Grok, OpenCode and DeepSeek Harness) are listed after it, by key — `wake_list_sessions` only returns roots, so the parent is where they are found. A child names its parent in the header line instead.
+Tool calls are folded to one line each (name plus input preview) unless `include_tools` is set; at most 40 tool calls are listed per message, the rest are counted. Injected context (system reminders, IDE context) is skipped and counted. Compaction summaries are kept as quotes. Images are noted, not included. Child sessions (sub-agents, such as Claude Code and Cursor subagents, Codex `spawn_agent`, Grok, OpenCode and DeepSeek Harness) are listed after it, by key — `wake_list_sessions` only returns roots, so the parent is where they are found. A child names its parent in the header line instead. Subagent transcripts that live in the parent's folder can also be read through the parent: pass the subagent's id as `subagent`, with the same paging options; `subagent: "*"` lists those ids without a transcript.
 
 The footer says which seqs were shown and either `End of transcript.` or a `from_seq=<n>` hint for the next page. Seq numbers are the same ones Wake's own search results and transcript view use.
 

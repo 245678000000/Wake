@@ -143,6 +143,108 @@ fn codex_spawned_subagents_nest_under_their_parent() {
     );
 }
 
+/// Claude Code 的子代理端到端:原件与分支各自派了子代理(一份 Task 派的、一份 Workflow 跑的)。
+/// 扫描后原件的子代理挂在原件下,分支的挂在分支下——子代理停在转录所在的那个会话上,它的文件在
+/// 分支的会话目录里,挂到原件上删除与清理都会把它弄丢。Insights 只算原件与分支两条会话;清理时
+/// 原件那棵树带走原件的子代理,分支自成一棵、带着分支的子代理,谁也不越界
+#[test]
+fn claude_subagents_nest_under_the_session_that_spawned_them() {
+    let home = tempfile::tempdir().unwrap();
+    // 清理要真实路径(macOS 的临时目录在 /var 这个别名后面)
+    let projects = home.path().canonicalize().unwrap().join("projects");
+    let (project, a, b) = common::stage_claude_branch(&projects);
+    let (a_task, a_step) = common::stage_claude_subagents(&project, &a, "o", "toolu_o");
+    let (b_task, b_step) = common::stage_claude_subagents(&project, &b, "b", "toolu_b");
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let key = |id: &str| format!("claude-code:{id}");
+    let parent = |id: &str| store.parent_key_of(&key(id)).unwrap();
+    assert_eq!(parent(&b), Some(key(&a)), "分支挂在原件下");
+    for child in [&a_task, &a_step] {
+        assert_eq!(parent(child), Some(key(&a)), "{child}");
+    }
+    for child in [&b_task, &b_step] {
+        assert_eq!(parent(child), Some(key(&b)), "{child} 挂在派它的分支下");
+    }
+    let today = chrono::NaiveDate::from_ymd_opt(2026, 10, 12).unwrap();
+    assert_eq!(store.insights(today).unwrap().sessions, 2, "子代理不算会话");
+
+    let inventory = wake_core::cleanup::inventory(&store, &adapters).unwrap();
+    let tree = |root: &str| -> std::collections::BTreeSet<String> {
+        inventory
+            .candidates
+            .iter()
+            .find(|c| c.root.key == key(root))
+            .unwrap_or_else(|| {
+                let why: Vec<(&str, &str)> = inventory
+                    .unavailable
+                    .iter()
+                    .map(|u| (u.session.key.as_str(), u.reason.as_str()))
+                    .collect();
+                panic!("{root} 没有自己的清理树: {why:?}")
+            })
+            .sessions
+            .iter()
+            .map(|s| s.key.clone())
+            .collect()
+    };
+    assert_eq!(tree(&a), [key(&a), key(&a_task), key(&a_step)].into());
+    assert_eq!(tree(&b), [key(&b), key(&b_task), key(&b_step)].into());
+}
+
+/// 旧版监听把 Claude Code Workflow 的子代理转录当顶层会话收进来过(sidechain 行被滤掉、零消息)。
+/// 文件没变、引用也没变,升级后的增量扫描本会跳过它——FTS_FORMAT "16" 那一轮重解析把它写对:
+/// 正文搜得到、挂到派它的会话下
+#[test]
+fn stale_workflow_rows_from_old_versions_are_reparsed() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    let (project, a, _) = common::stage_claude_branch(&projects);
+    let (_, step) = common::stage_claude_subagents(&project, &a, "o", "toolu_o");
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    let r = adapters[0]
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.native_id == step)
+        .unwrap();
+    let key = format!("claude-code:{step}");
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("wake.db");
+    {
+        let store = Store::open(&db_path).unwrap();
+        let stale = SessionMeta {
+            message_count: 0,
+            size_bytes: r.size,
+            file_path: r.file_path.clone(),
+            ..common::meta(&key, "Workflow step: run the tests")
+        };
+        store.write_meta_only(&[(stale, r.mtime_ms)]).unwrap();
+    }
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "UPDATE schema_meta SET value = '15' WHERE key = 'fts_format'",
+            [],
+        )
+        .unwrap();
+
+    let store = Arc::new(Store::open(&db_path).unwrap());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(store.get_session(&key).unwrap().unwrap().message_count, 2);
+    assert_eq!(
+        store.parent_key_of(&key).unwrap(),
+        Some(format!("claude-code:{a}"))
+    );
+    let (hits, _) = store.search("All tests pass", &[], None, 10).unwrap();
+    assert!(hits.iter().any(|h| h.session.key == key), "正文搜得到");
+}
+
 /// Claude Code 分支端到端:全量扫描后分支挂在原件下、顶层只列原件;两份共有的那一轮只在
 /// 原件里搜得到,分支自己的话在分支里;原件删掉后分支变回顶层、拿回完整历史
 #[test]
@@ -1557,6 +1659,70 @@ fn kimi_forks_nest_under_their_parent() {
     assert_eq!(store.parent_key_of(child).unwrap().as_deref(), Some(parent));
     assert!(store.get_session(child).unwrap().unwrap().archived);
     assert!(!store.get_session(parent).unwrap().unwrap().archived);
+}
+
+/// Kimi 的分叉 B 派了子代理 C:C 的转录在 B 的会话目录里,挂在 B 下、不往上压到原件——删 B 时
+/// 目录连同 C 一起进废纸篓,C 得在删除计划里(要记墓碑),否则另一个 location 里的副本会再冒
+/// 出来。C 跟着 B 归档:B 在 Kimi 里归档了,C 不能变成顶层会话(Codex review 2026-10-12)
+#[test]
+fn kimi_fork_subagents_stay_under_the_fork() {
+    use wake_core::adapters::kimi::KimiAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    common::copy_tree(&common::fixture("kimi-cli"), &home);
+    let fork_id = "session_c2222222-aaaa-bbbb-cccc-000000000002";
+    let mut fork_dir = home.clone();
+    fork_dir.extend(["sessions", "wd_wakefx_cli1", fork_id]);
+    let sub_dir = fork_dir.join("agents").join("agent-1");
+    std::fs::create_dir_all(&sub_dir).unwrap();
+    std::fs::write(
+        sub_dir.join("wire.jsonl"),
+        [
+            json!({ "type": "turn.prompt", "time": 1791417603000i64,
+                "input": [{ "type": "text", "text": "Look at src/parser.rs" }],
+                "origin": { "kind": "system_trigger", "name": "subagent" } }),
+            json!({ "type": "context.append_loop_event", "time": 1791417605000i64,
+                "event": { "type": "content.part", "part": { "type": "text", "text": "Two problems." } } }),
+        ]
+        .map(|row| format!("{row}\n"))
+        .concat(),
+    )
+    .unwrap();
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![KimiAdapter::new().with_custom_root(home.clone())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let original = "kimi:session_c1111111-aaaa-bbbb-cccc-000000000001";
+    let fork = format!("kimi:{fork_id}");
+    let sub = format!("kimi:{fork_id}/agent-1");
+    assert_eq!(
+        store.parent_key_of(&fork).unwrap().as_deref(),
+        Some(original)
+    );
+    assert_eq!(
+        store.parent_key_of(&sub).unwrap(),
+        Some(fork.clone()),
+        "子代理停在它所在的分叉上"
+    );
+    assert!(store.get_session(&sub).unwrap().unwrap().archived);
+    let active = SessionFilter {
+        roots_only: true,
+        limit: 10,
+        ..Default::default()
+    };
+    let (roots, _) = store.list_sessions(&active).unwrap();
+    assert!(
+        roots.iter().all(|s| s.key != sub),
+        "分叉归档了,子代理不冒成顶层会话"
+    );
+
+    let fork_meta = store.get_session(&fork).unwrap().unwrap();
+    let plan = wake_core::cleanup::delete_plan(&store, &adapters, &fork_meta).unwrap();
+    let doomed: Vec<&str> = plan.sessions.iter().map(|s| s.key.as_str()).collect();
+    assert_eq!(doomed, [fork.as_str(), sub.as_str()]);
+    assert_eq!(plan.targets, [fork_dir.to_string_lossy().into_owned()]);
 }
 
 /// Kimi 的归档、改名只写 state.json:增量扫描按引用判脏,state.json 的 mtime / size 并在
