@@ -18,6 +18,7 @@ use wake_core::adapters::{create_adapter_roster_for, create_adapters_for, AgentA
 use wake_core::cli;
 use wake_core::db::{self, Store};
 use wake_core::mcp::tools::{self, TranscriptCache};
+use wake_core::mcp::ON_REQUEST_ENV;
 use wake_core::models::{AgentId, Role, SessionFilter, SessionMeta};
 use wake_core::scanner::{run_scan, NullEvents};
 
@@ -832,10 +833,19 @@ fn context_shows_where_each_agent_left_off_or_nothing() {
         );
         write("claude-code:in-home", &home, 0, &[(Role::User, "hi")]);
     }
+    // 跑测试的环境里设了 WAKE_ON_REQUEST 也清掉,默认那套才是确定的
+    let context_with = |dir: &Path, on_request: Option<&str>| {
+        cli_raw_with(&["--db", db.to_str().unwrap(), "context"], |cmd| {
+            cmd.env("WAKE_HOME", &home)
+                .env_remove(ON_REQUEST_ENV)
+                .current_dir(dir);
+            if let Some(value) = on_request {
+                cmd.env(ON_REQUEST_ENV, value);
+            }
+        })
+    };
     let context = |dir: &Path| {
-        let (out, _, code) = cli_raw_with(&["--db", db.to_str().unwrap(), "context"], |cmd| {
-            cmd.env("WAKE_HOME", &home).current_dir(dir);
-        });
+        let (out, _, code) = context_with(dir, None);
         (out, code)
     };
     let (text, code) = context(&project.join("src"));
@@ -879,6 +889,12 @@ fn context_shows_where_each_agent_left_off_or_nothing() {
     for dir in [fresh.as_path(), elsewhere.path()] {
         assert_eq!(context(dir), (String::new(), Some(0)), "{}", dir.display());
     }
+
+    // 只在被要求时使用(#64):开会话什么都不加,stderr 那句只给在终端里自己跑的人看;写 0 是关
+    let (out, err, code) = context_with(&project, Some("1"));
+    assert_eq!((out.as_str(), code), ("", Some(0)));
+    assert!(err.contains(ON_REQUEST_ENV), "{err}");
+    assert_eq!(context_with(&project, Some("0")).0, text);
 }
 
 /// 插件只是一层壳:清单、钩子、MCP 配置都指向仓库里真实存在的脚本,钩子调的是 `wake-cli
@@ -926,7 +942,7 @@ fn the_plugins_point_at_real_files() {
     // Codex 不展开 MCP 参数里的变量(只展开钩子命令),写相对路径 + cwd "."(插件根,Codex
     // 自带的插件也这么写),直接放在清单里。Codex 只给 MCP 子进程几个默认环境变量(PATH、
     // HOME 这些),启动脚本认的 WAKE_BIN_DIR 要点名放行,不然 Wake 装在别处的人钩子能用、
-    // MCP 却找不到 wake-mcp
+    // MCP 却找不到 wake-mcp;WAKE_ON_REQUEST 同理,不放行 wake-mcp 就看不见它
     let mcp = json(plugin.join(".mcp.json"));
     let args = &mcp["mcpServers"]["wake"]["args"];
     assert_eq!(args[0], "${CLAUDE_PLUGIN_ROOT}/scripts/wake");
@@ -948,7 +964,7 @@ fn the_plugins_point_at_real_files() {
             "command": "sh",
             "args": ["./scripts/wake", "wake-mcp"],
             "cwd": ".",
-            "env_vars": ["WAKE_BIN_DIR"]
+            "env_vars": ["WAKE_BIN_DIR", ON_REQUEST_ENV]
         })
     );
     for field in ["logo", "composerIcon"] {

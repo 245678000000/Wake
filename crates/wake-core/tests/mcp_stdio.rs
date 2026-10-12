@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use wake_core::adapters::{adapter_for, create_adapter_roster_for};
 use wake_core::db::Store;
+use wake_core::mcp::{self, tools, Usage, ON_REQUEST_ENV};
 use wake_core::models::*;
 use wake_core::scanner::{run_scan, NullEvents};
 
@@ -31,14 +32,21 @@ struct Client {
 
 impl Client {
     fn spawn(db: &Path) -> Client {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_wake-mcp"))
-            .arg("--db")
+        Self::spawn_with(db, |_| {})
+    }
+
+    /// `with` 加参数、设环境变量。跑测试的环境里设了 WAKE_ON_REQUEST 也先清掉,默认那套说明
+    /// 才是确定的
+    fn spawn_with(db: &Path, with: impl FnOnce(&mut Command)) -> Client {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_wake-mcp"));
+        cmd.arg("--db")
             .arg(db)
+            .env_remove(ON_REQUEST_ENV)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn wake-mcp");
+            .stderr(Stdio::null());
+        with(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn wake-mcp");
         let stdin = child.stdin.take().unwrap();
         let stdout = BufReader::new(child.stdout.take().unwrap());
         Client {
@@ -73,6 +81,17 @@ impl Client {
         assert_eq!(reply["jsonrpc"], "2.0");
         assert_eq!(reply["id"], id, "reply id mismatch: {reply}");
         reply
+    }
+
+    fn initialize(&mut self) -> Value {
+        self.request(
+            "initialize",
+            json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "wake-test", "version": "0" }
+            }),
+        )
     }
 
     fn notify(&mut self, method: &str) {
@@ -175,14 +194,7 @@ fn stdio_contract_end_to_end() {
 
     // 2. 握手与协议面
     let mut c = Client::spawn(&db);
-    let init = c.request(
-        "initialize",
-        json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": { "name": "wake-test", "version": "0" }
-        }),
-    );
+    let init = c.initialize();
     assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
     assert_eq!(init["result"]["serverInfo"]["name"], "wake");
     assert!(init["result"]["capabilities"]["tools"].is_object());
@@ -439,6 +451,41 @@ fn stdio_contract_end_to_end() {
     // 7. 全程只读
     let after = std::fs::read(&db).unwrap();
     assert!(before == after, "wake-mcp must never write the index");
+}
+
+/// 只在被要求时使用(#64):`--on-request` 与 WAKE_ON_REQUEST=1 都换上这个模式的说明与工具描述,
+/// 都不给是默认那套——拿库里同一份文字比,措辞改了这里不用跟着改
+#[test]
+fn on_request_mode_tells_agents_to_wait_until_asked() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("wake.db");
+    drop(Store::open(&db).unwrap());
+    let handshake = |with: &dyn Fn(&mut Command)| {
+        let mut c = Client::spawn_with(&db, with);
+        let instructions = c.initialize()["result"]["instructions"].clone();
+        let tools = c.request("tools/list", json!({}))["result"]["tools"].clone();
+        c.finish();
+        (instructions, tools)
+    };
+    let expect = |usage| {
+        (
+            json!(mcp::instructions(usage)),
+            json!(tools::definitions_for(usage)),
+        )
+    };
+    assert_eq!(handshake(&|_| {}), expect(Usage::Proactive));
+    assert_eq!(
+        handshake(&|cmd| {
+            cmd.arg("--on-request");
+        }),
+        expect(Usage::OnRequest)
+    );
+    assert_eq!(
+        handshake(&|cmd| {
+            cmd.env(ON_REQUEST_ENV, "1");
+        }),
+        expect(Usage::OnRequest)
+    );
 }
 
 #[test]

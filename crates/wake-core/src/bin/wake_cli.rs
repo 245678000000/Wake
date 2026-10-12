@@ -25,7 +25,7 @@ use std::process::ExitCode;
 
 use wake_core::cli::{self, Action, CliError, Report, Stream};
 use wake_core::db::{self, LockHolder, Store};
-use wake_core::mcp::{self, tools};
+use wake_core::mcp::{self, tools, Usage};
 use wake_core::scanner::{self, NullEvents, Outcome, ScanEvents, ScanProgress, Skip};
 
 fn main() -> ExitCode {
@@ -93,6 +93,18 @@ fn run(db: &Option<PathBuf>, tool: &str, args: &serde_json::Value) -> ExitCode {
 /// 不写、退 0——钩子的输出原样进 agent 的上下文,连空行都是噪音。缺库、读不出照常走诊断
 /// 出口,钩子那头自己吞掉
 fn context(db: &Option<PathBuf>) -> ExitCode {
+    // 只在被要求时使用(#64):新会话开场什么都不加,与 wake-mcp 同一个开关、同一个判法。钩子把
+    // stderr 丢掉,这句只有在终端里自己跑的人看得见
+    if Usage::from_env() == Usage::OnRequest {
+        return write(Report {
+            stream: Stream::Stderr,
+            text: format!(
+                "wake-cli: {} is on, so new sessions get no context until you ask",
+                mcp::ON_REQUEST_ENV
+            ),
+            code: 0,
+        });
+    }
     let dir = match std::env::current_dir() {
         Ok(dir) => dir,
         Err(e) => return write(refuse(format!("cannot read the current directory: {e}"))),

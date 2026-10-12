@@ -150,7 +150,8 @@ It is what the [Claude Code plugin](#claude-code-plugin) and the [Codex plugin](
 prints lands in the new session's context, where a "no sessions" reply or a list of other
 projects would only be noise. A subfolder counts as its project, as with `--project
 "$PWD"`. Your home folder and the filesystem root never count as the project a folder
-belongs to — sessions started there are not about the project you open next.
+belongs to — sessions started there are not about the project you open next. With
+`WAKE_ON_REQUEST` on, it prints nothing (see [Only when you ask](mcp.md#only-when-you-ask)).
 
 
 ### `index`
@@ -378,6 +379,9 @@ For both:
   its own history, so the hook stays out of those.
 - A lookup made by the hook is not the agent asking Wake, so it does not show up in
   Insights under *Agents asking Wake*; the lookups the agent then makes on its own do.
+- To keep Wake quiet until you ask, set `WAKE_ON_REQUEST=1` in the environment Claude Code
+  or Codex starts from: the session-start hook adds nothing, and the agent uses Wake's
+  tools only when you ask (see [Only when you ask](mcp.md#only-when-you-ask)).
 - None of this edits another tool's configuration: Claude Code and Codex install the plugin
   themselves, and the hook settings are yours to paste.
 - On Windows, use the skill and the MCP server for now.

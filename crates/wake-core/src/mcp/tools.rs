@@ -17,6 +17,8 @@ use crate::services::context::{parse_since, resolve_project_paths};
 use crate::services::exporter::{fmt_time, render_compact, CompactOptions};
 use crate::text::{one_line, plural};
 
+use super::{Usage, TOOL_ON_REQUEST};
+
 struct ToolContext<'a> {
     store: &'a Store,
     adapters: &'a [Box<dyn AgentAdapter>],
@@ -153,13 +155,25 @@ fn since_param() -> Value {
     })
 }
 
-/// tools/list 的内容。名字、参数名是对外契约,改了别人的配置就失效
+/// tools/list 的内容(默认模式)。名字、参数名是对外契约,改了别人的配置就失效;CLI 只读这里的
+/// schema(帮助里的默认值与上限、与 COMMANDS 的双射)
 pub fn definitions() -> Vec<Value> {
+    definitions_for(Usage::Proactive)
+}
+
+/// 按 `Usage` 给的 tools/list:两种模式只差描述里"什么时候用"那一句(`Usage::compose`)
+pub fn definitions_for(usage: Usage) -> Vec<Value> {
+    let describe =
+        |what: &str, when: Option<&str>, how: &str| usage.compose(what, when, TOOL_ON_REQUEST, how);
     vec![
         json!({
             "name": SEARCH,
             "title": "Search session history",
-            "description": "Full-text search across every indexed coding-agent session on this machine (session titles, user prompts, assistant replies, tool names and inputs). Use it when the user asks whether something was discussed, tried or solved before, or wants the conversation about a topic, an error message, a file or a decision — git history does not hold that. Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus a `wake://session/<key>#<seq>` reference per snippet that you can read with wake_get_session.",
+            "description": describe(
+                "Full-text search across every indexed coding-agent session on this machine (session titles, user prompts, assistant replies, tool names and inputs).",
+                Some("Use it when the user asks whether something was discussed, tried or solved before, or wants the conversation about a topic, an error message, a file or a decision — git history does not hold that."),
+                "Terms are ANDed; CJK text and code substrings like `useEffect(` work. Returns matching sessions with up to three snippets each, plus a `wake://session/<key>#<seq>` reference per snippet that you can read with wake_get_session.",
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -176,7 +190,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": LIST_SESSIONS,
             "title": "List recent sessions",
-            "description": "Most recently updated coding-agent sessions, optionally scoped to a project, to some agents, to a time window, or to starred sessions. Use it when the user asks what they or an agent worked on recently, wants to resume or continue earlier work, or refers to \"yesterday's session\", \"last time\", \"what Codex did here\" — pass the current working directory as `project`. It returns the session keys wake_get_session needs. Subagent sessions are folded into their parents; archived sessions are excluded.",
+            "description": describe(
+                "Most recently updated coding-agent sessions, optionally scoped to a project, to some agents, to a time window, or to starred sessions.",
+                Some("Use it when the user asks what they or an agent worked on recently, wants to resume or continue earlier work, or refers to \"yesterday's session\", \"last time\", \"what Codex did here\"."),
+                "Pass the current working directory as `project`. It returns the session keys wake_get_session needs. Subagent sessions are folded into their parents; archived sessions are excluded.",
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -192,7 +210,12 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": GET_SESSION,
             "title": "Read a session transcript",
-            "description": "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted. Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it. Also reads memory files: pass a `wake://memory/<key>` reference from wake_list_memories or wake_search to get that file.",
+            // "Use it after …" 说的是先后,不是什么时候该查:两种模式都留着
+            "description": describe(
+                "Read one session's transcript, parsed live from the agent's own files, as compact Markdown: user and assistant messages with `[seq N]` markers, tool calls folded to one line each, injected context omitted.",
+                None,
+                "Use it after wake_search or wake_list_sessions to see what actually happened — the reasoning, the decisions and the exact steps of an earlier session. Paginated: when the reply ends with a `from_seq` hint, call again with it to continue. Accepts a session key or a `wake://session/<key>#<seq>` reference (the seq becomes the starting point). Subagent transcripts (Claude Code sidechains, Cursor subagents) are listed at the end of the main transcript; pass one's id as `subagent` to read it. Also reads memory files: pass a `wake://memory/<key>` reference from wake_list_memories or wake_search to get that file.",
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -212,7 +235,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": LIST_PROJECTS,
             "title": "List indexed projects",
-            "description": "Projects (working directories) that have coding-agent session history, most recently active first, with session counts. Use it when the user asks broadly what they have been working on (\"which projects did I touch this month?\") or to find the right `project` value for the other tools.",
+            "description": describe(
+                "Projects (working directories) that have coding-agent session history, most recently active first, with session counts.",
+                Some("Use it when the user asks broadly what they have been working on (\"which projects did I touch this month?\")."),
+                "It also gives the right `project` value for the other tools.",
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -225,7 +252,11 @@ pub fn definitions() -> Vec<Value> {
         json!({
             "name": LIST_MEMORIES,
             "title": "List agent memory files",
-            "description": "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files), Codex's memories — plus the instruction files the user keeps for them (CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules, .kiro/steering, copilot-instructions.md), read-only, grouped by project, user memory (the notes that apply to every project) last. Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas. Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
+            "description": describe(
+                "The memory files coding agents keep for themselves on this machine — Claude Code's and ZCode's per-project auto-memory (MEMORY.md and its topic files), Codex's memories — plus the instruction files the user keeps for them (CLAUDE.md, AGENTS.md, GEMINI.md, .cursor/rules, .kiro/steering, copilot-instructions.md), read-only, grouped by project, user memory (the notes that apply to every project) last.",
+                Some("Use it when the user asks what an agent already knows or remembers about a project, or to reuse another agent's notes: decisions, conventions, gotchas."),
+                "Each entry ends with a `wake://memory/<key>` reference; read one with wake_get_session.",
+            ),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1577,6 +1608,23 @@ mod tests {
         for d in &defs {
             assert_eq!(d["inputSchema"]["type"], "object");
             assert_eq!(d["annotations"]["readOnlyHint"], true);
+        }
+    }
+
+    /// 只在被要求时使用:每个工具都带那句限定、不再有"Use it when"一类的触发说法,别的
+    /// (名字、参数、注解)与默认逐字相同
+    #[test]
+    fn on_request_descriptions_only_swap_when_to_use() {
+        let strip = |d: &Value| {
+            let mut d = d.clone();
+            d.as_object_mut().unwrap().remove("description");
+            d
+        };
+        for (default, asked) in definitions().iter().zip(&definitions_for(Usage::OnRequest)) {
+            let text = asked["description"].as_str().unwrap();
+            assert!(text.contains(TOOL_ON_REQUEST), "{text}");
+            assert!(!text.contains("Use it when"), "{text}");
+            assert_eq!(strip(default), strip(asked));
         }
     }
 }

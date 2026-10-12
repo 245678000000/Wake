@@ -25,7 +25,8 @@
       ],
       "cwd": ".",
       "env_vars": [
-        "WAKE_BIN_DIR"
+        "WAKE_BIN_DIR",
+        "WAKE_ON_REQUEST"
       ]
     }
   },

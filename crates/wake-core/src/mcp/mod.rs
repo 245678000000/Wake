@@ -32,20 +32,91 @@ const SUPPORTED: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11
 pub const SERVER_NAME: &str = "wake";
 pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// 随 initialize 下发给客户端的使用说明(LLM 会读)。重点是"什么时候该用":
-/// 模型对陌生工具默认不碰,问"最近在做什么"会去翻 git log——要点明会话记录里
-/// 有而 git 里没有的东西(讨论、决策、试过的路、停在哪)
-const INSTRUCTIONS: &str = "Wake indexes every coding-agent session on this machine \
-(Claude Code, Codex, Cursor, Gemini CLI, OpenCode and more) and exposes them read-only. \
-Use these tools whenever the user refers to earlier conversations or sessions with any AI \
-coding agent: what was discussed, decided or tried, why something was done a certain way, \
-where previous work stopped, or whether an error was seen before. Git history and the \
-working tree do not contain that; Wake does. Start with wake_list_sessions (pass the \
-current working directory as `project`) or wake_search, then read the relevant transcript \
-with wake_get_session; wake_list_projects shows which projects have history. \
-wake_list_memories lists the notes agents keep for themselves about a project (Claude \
-Code and ZCode auto-memory, Codex memories); read one by passing its wake://memory/… \
-reference to wake_get_session. Nothing here can modify a session or a memory file.";
+/// agent 什么时候该用 Wake 的工具。默认 `Proactive`:用户提到之前的对话就用;`OnRequest`
+/// (`wake-mcp --on-request` / `WAKE_ON_REQUEST=1`,#64)只在用户明确让它查 Wake 或过去的会话
+/// 时才用——自己有记忆工具的人不想让 agent 为了回忆上下文自己去翻、花 token。只换下发给模型的
+/// 说明与工具描述里"什么时候用"那一句,工具本身与返回内容不变;这是给模型的指引,不是锁,
+/// 硬性拦住靠客户端的权限确认
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Usage {
+    Proactive,
+    OnRequest,
+}
+
+/// 插件用户改不了插件里的启动命令,靠这个环境变量打开 `Usage::OnRequest`;`wake-cli context`
+/// (开会话钩子)见到它也不输出——判法只有 `Usage::from_env` 这一份,钩子与 MCP 永远出自同一对
+/// 二进制,插件与 app 各自更新也不会一半生效
+pub const ON_REQUEST_ENV: &str = "WAKE_ON_REQUEST";
+
+impl Usage {
+    pub fn from_env() -> Self {
+        let value = std::env::var_os(ON_REQUEST_ENV);
+        // 不是 UTF-8 的值也是"设了"
+        Self::from_env_value(value.as_ref().map(|v| v.to_str().unwrap_or("1")))
+    }
+
+    /// 没设、空串、0 / false / no(不分大小写)是关,别的都是开
+    fn from_env_value(value: Option<&str>) -> Self {
+        match value.map(str::to_ascii_lowercase).as_deref() {
+            None | Some("" | "0" | "false" | "no") => Self::Proactive,
+            Some(_) => Self::OnRequest,
+        }
+    }
+
+    /// 一段给模型看的话 = 做什么 + 什么时候用 + 怎么用,只在被要求时使用只换中间那句(服务器说明与
+    /// 每个工具的描述共用,两种模式不各写一份全文)。`when` 为 None 的(wake_get_session 的描述没有
+    /// 触发句)默认就只有两段
+    pub(crate) fn compose(
+        self,
+        what: &str,
+        when: Option<&str>,
+        on_request: &str,
+        how: &str,
+    ) -> String {
+        let when = match self {
+            Self::Proactive => when,
+            Self::OnRequest => Some(on_request),
+        };
+        match when {
+            Some(when) => format!("{what} {when} {how}"),
+            None => format!("{what} {how}"),
+        }
+    }
+}
+
+/// 随 initialize 下发给客户端的使用说明(LLM 会读),三段拼成:是什么、什么时候用、怎么用。
+/// 默认那句是重点:模型对陌生工具默认不碰,问"最近在做什么"会去翻 git log——要点明会话
+/// 记录里有而 git 里没有的东西(讨论、决策、试过的路、停在哪)
+const INSTRUCTIONS_INTRO: &str = "Wake indexes every coding-agent session on this machine \
+(Claude Code, Codex, Cursor, Gemini CLI, OpenCode and more) and exposes them read-only.";
+const INSTRUCTIONS_WHEN: &str = "Use these tools whenever the user refers to earlier \
+conversations or sessions with any AI coding agent: what was discussed, decided or tried, \
+why something was done a certain way, where previous work stopped, or whether an error was \
+seen before. Git history and the working tree do not contain that; Wake does.";
+/// 只在被要求时使用换上的两句:服务器说明里一句、每个工具描述里一句,说的是同一件事,改一句
+/// 就一起改
+const INSTRUCTIONS_ON_REQUEST: &str = "The user wants these tools used only when they ask: \
+call them when the user explicitly asks you to look something up in Wake or in their past \
+sessions (\"check Wake\", \"search my past sessions for …\"), and don't call them on your \
+own to recall context.";
+pub(crate) const TOOL_ON_REQUEST: &str = "Call it only when the user explicitly asks you to \
+look something up in Wake or in their past sessions; don't call it on your own to recall \
+context.";
+const INSTRUCTIONS_HOW: &str = "Start with wake_list_sessions (pass the current working \
+directory as `project`) or wake_search, then read the relevant transcript with \
+wake_get_session; wake_list_projects shows which projects have history. wake_list_memories \
+lists the notes agents keep for themselves about a project (Claude Code and ZCode \
+auto-memory, Codex memories); read one by passing its wake://memory/… reference to \
+wake_get_session. Nothing here can modify a session or a memory file.";
+
+pub fn instructions(usage: Usage) -> String {
+    usage.compose(
+        INSTRUCTIONS_INTRO,
+        Some(INSTRUCTIONS_WHEN),
+        INSTRUCTIONS_ON_REQUEST,
+        INSTRUCTIONS_HOW,
+    )
+}
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -58,14 +129,16 @@ pub struct McpServer {
     store: Arc<Store>,
     adapters: Vec<Box<dyn AgentAdapter>>,
     transcripts: tools::TranscriptCache,
+    usage: Usage,
 }
 
 impl McpServer {
-    pub fn new(store: Arc<Store>, adapters: Vec<Box<dyn AgentAdapter>>) -> Self {
+    pub fn new(store: Arc<Store>, adapters: Vec<Box<dyn AgentAdapter>>, usage: Usage) -> Self {
         Self {
             store,
             adapters,
             transcripts: tools::TranscriptCache::default(),
+            usage,
         }
     }
 
@@ -155,7 +228,7 @@ impl McpServer {
         let result = match method {
             "initialize" => Ok(self.initialize(&params)),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools::definitions() })),
+            "tools/list" => Ok(json!({ "tools": tools::definitions_for(self.usage) })),
             "tools/call" => self.call_tool(&params),
             _ => Err((
                 JSONRPC_METHOD_NOT_FOUND,
@@ -182,7 +255,7 @@ impl McpServer {
             "protocolVersion": version,
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": SERVER_NAME, "title": "Wake", "version": SERVER_VERSION },
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions(self.usage),
         })
     }
 
@@ -307,8 +380,32 @@ mod tests {
     /// 时漏了这里)
     #[test]
     fn instructions_mention_every_tool() {
-        for name in tools::NAMES {
-            assert!(INSTRUCTIONS.contains(name), "INSTRUCTIONS 没提到 {name}");
+        for usage in [Usage::Proactive, Usage::OnRequest] {
+            let text = instructions(usage);
+            for name in tools::NAMES {
+                assert!(text.contains(name), "{usage:?} 的说明没提到 {name}");
+            }
+        }
+    }
+
+    /// 只在被要求时使用:只换"什么时候用"那一句,开头与用法照旧
+    #[test]
+    fn on_request_only_changes_when_to_use() {
+        let proactive = instructions(Usage::Proactive);
+        assert!(proactive.contains(INSTRUCTIONS_WHEN));
+        assert_eq!(
+            instructions(Usage::OnRequest),
+            proactive.replace(INSTRUCTIONS_WHEN, INSTRUCTIONS_ON_REQUEST)
+        );
+    }
+
+    #[test]
+    fn the_on_request_switch_reads_like_a_flag() {
+        for off in [None, Some(""), Some("0"), Some("false"), Some("No")] {
+            assert_eq!(Usage::from_env_value(off), Usage::Proactive, "{off:?}");
+        }
+        for on in ["1", "true", "YES", "on"] {
+            assert_eq!(Usage::from_env_value(Some(on)), Usage::OnRequest, "{on}");
         }
     }
 

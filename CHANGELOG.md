@@ -8,6 +8,7 @@
 - Update: Subagent sessions from OpenCode, Kilo Code, ZCode, Antigravity and OpenClaw are listed under the session that started them. ZCode side chats and workflow steps sit under their task too, and ZCode workflow tasks are listed
 - Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
 - Update: Insights no longer counts subagent sessions, or the prompts in them, as yours; their tokens still count
+- New: You can have agents use Wake only when you ask, not on their own; "Only when you ask" in the MCP guide shows how (#64, thanks @ItsRyanWu)
 
 ## [0.9.1] — 2026-10-10
 

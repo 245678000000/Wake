@@ -1,6 +1,7 @@
 //! wake-mcp:Wake 索引的只读 MCP server(stdio)。
 //!
-//!   wake-mcp [--db PATH]          以 MCP server 身份服务 stdin/stdout(客户端这样起它)
+//!   wake-mcp [--db PATH] [--on-request]
+//!                                 以 MCP server 身份服务 stdin/stdout(客户端这样起它)
 //!   wake-mcp setup [--db PATH]    打印接入 Claude Code / Codex / Cursor 的配置片段
 //!   wake-mcp call TOOL [JSON]     跑一次工具调用、打印文本(调试用)
 //!   wake-mcp --version | --help
@@ -12,26 +13,31 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use wake_core::db::Store;
-use wake_core::mcp::{self, McpServer};
+use wake_core::mcp::{self, McpServer, Usage};
 
 const USAGE: &str = "wake-mcp — read-only MCP server for your Wake session index
 
 USAGE:
-  wake-mcp [--db PATH]            serve MCP over stdio (what MCP clients run)
+  wake-mcp [--db PATH] [--on-request]
+                                  serve MCP over stdio (what MCP clients run)
   wake-mcp setup [--db PATH]      print config snippets for Claude Code / Codex / Cursor
   wake-mcp call TOOL [JSON]       run one tool call and print its text (debugging)
   wake-mcp --version | --help
 
 OPTIONS:
-  --db PATH   index database (default: Wake's own, e.g. ~/Library/Application Support/wake/wake.db)";
+  --db PATH      index database (default: Wake's own, e.g. ~/Library/Application Support/wake/wake.db)
+  --on-request   tell agents to use these tools only when you ask (same as WAKE_ON_REQUEST=1)";
 
 struct Args {
     db: Option<PathBuf>,
+    usage: Usage,
     command: Vec<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut db = None;
+    // 参数压过环境变量
+    let mut usage = Usage::from_env();
     let mut command = Vec::new();
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
@@ -41,6 +47,7 @@ fn parse_args() -> Result<Args, String> {
                     it.next().ok_or("--db needs a path".to_string())?,
                 ))
             }
+            "--on-request" => usage = Usage::OnRequest,
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);
@@ -54,16 +61,16 @@ fn parse_args() -> Result<Args, String> {
             _ => command.push(a),
         }
     }
-    Ok(Args { db, command })
+    Ok(Args { db, usage, command })
 }
 
 fn db_path(db: &Option<PathBuf>) -> PathBuf {
     wake_core::db::path_or_default(db.as_deref())
 }
 
-fn open(db: &Option<PathBuf>) -> Result<McpServer, String> {
+fn open(db: &Option<PathBuf>, usage: Usage) -> Result<McpServer, String> {
     let (store, adapters) = mcp::open_index(&db_path(db))?;
-    Ok(McpServer::new(store, adapters))
+    Ok(McpServer::new(store, adapters, usage))
 }
 
 fn main() -> ExitCode {
@@ -76,7 +83,7 @@ fn main() -> ExitCode {
     };
     match args.command.first().map(String::as_str) {
         None => {
-            let server = match open(&args.db) {
+            let server = match open(&args.db, args.usage) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("wake-mcp: {e}");
@@ -121,7 +128,7 @@ fn main() -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            let server = match open(&args.db) {
+            let server = match open(&args.db, args.usage) {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!("wake-mcp: {e}");

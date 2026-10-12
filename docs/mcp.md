@@ -110,6 +110,27 @@ that runs `wake-cli context`; see
 [Claude Code plugin](cli.md#claude-code-plugin) and [Codex plugin](cli.md#codex-plugin) in the
 command-line guide. Both plugins bring this MCP server along.
 
+### Only when you ask
+
+If your agent already keeps its own memory and you would rather it look in Wake only when
+you say so, start the server with `--on-request`:
+
+```bash
+claude mcp add --scope user wake -- "/Applications/Wake.app/Contents/MacOS/wake-mcp" --on-request
+```
+
+For Codex, add `args = ["--on-request"]` under `[mcp_servers.wake]`; for Cursor, add
+`"args": ["--on-request"]` next to `command`. With the Claude Code or Codex plugin, set
+`WAKE_ON_REQUEST=1` in the environment the agent starts from instead. The plugin then also
+skips the recent sessions it adds when a session starts.
+
+In this mode the server tells the agent to use its tools only when you ask it to look
+something up in Wake or in your past sessions ("check Wake for …"). The agent follows that
+as guidance; it is not a lock. To stop calls outright, have your client ask before each
+one (in Claude Code, keep the wake tools out of `permissions.allow`), or turn the server
+off in `/mcp` until you need it. The line from *Make the agent reach for it* and the Wake
+skill ask for the opposite, so leave them out.
+
 ### A worked example
 
 ```
