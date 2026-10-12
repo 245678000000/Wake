@@ -849,7 +849,8 @@ impl AgentAdapter for OpencodeAdapter {
         // 位次相同:更新时间新的,平局虚拟路径小的);每个库各报一遍的话,后报的说了算
         let mut chosen: HashMap<&str, (&OcDb, &OcRow)> = HashMap::new();
         for (db, rows) in &snapshots {
-            for row in rows.iter() {
+            // 没有正文的副本不列(list_session_files 同一条),scanner 用的是另一份,也就不参与裁决
+            for row in rows.iter().filter(|row| row.content_len > 0) {
                 let wins = chosen.get(row.id.as_str()).is_none_or(|(best_db, best)| {
                     row.updated_ms > best.updated_ms
                         || (row.updated_ms == best.updated_ms

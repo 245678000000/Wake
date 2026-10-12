@@ -417,6 +417,56 @@ fn query_rows(conn: &rusqlite::Connection) -> Option<Vec<ClawRow>> {
     rows
 }
 
+/// 旧版会话目录里列得出来的转录:(主干, 路径, metadata)。归档 / 检查点、空文件与不是普通
+/// 文件的不算——列表与关系里的 id 映射都按这一份,两边才不会对不上
+fn legacy_transcripts(sessions_dir: &Path) -> Vec<(String, PathBuf, fs::Metadata)> {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !is_legacy_transcript(&name) {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() || meta.len() == 0 {
+                return None;
+            }
+            let stem = name.strip_suffix(".jsonl").unwrap_or(&name).to_string();
+            Some((stem, entry.path(), meta))
+        })
+        .collect()
+}
+
+/// 每个会话 id 对应的列出来的转录主干:带话题的会话转录叫 `<id>-topic-<话题>.jsonl`
+/// (上游 resolveSessionTranscriptPathInDir),枚举时 native id 是整个主干;有裸文件名的用它
+fn legacy_stems(listed: impl IntoIterator<Item = String>) -> HashMap<String, String> {
+    let mut stems = HashMap::new();
+    for stem in listed {
+        let id = stem.split("-topic-").next().unwrap_or(&stem).to_string();
+        if id == stem {
+            stems.insert(id, stem);
+        } else {
+            stems.entry(id).or_insert(stem);
+        }
+    }
+    stems
+}
+
+/// 会话在 Wake 里的 id:库里有的用库里的,旧版的换成实际列出来的转录主干
+fn listed_id<'a>(
+    id: &'a str,
+    in_db: &HashSet<&str>,
+    stems: &'a HashMap<String, String>,
+) -> &'a str {
+    if in_db.contains(id) {
+        return id;
+    }
+    stems.get(id).map_or(id, String::as_str)
+}
+
 /// 旧版转录文件名过滤:归档/回滚快照/压缩检查点都不是活会话
 fn is_legacy_transcript(name: &str) -> bool {
     name.ends_with(".jsonl")
@@ -628,28 +678,15 @@ impl AgentAdapter for OpenclawAdapter {
                     }
                 }));
             }
-            let sessions = dir.join("sessions");
-            let Ok(entries) = fs::read_dir(&sessions) else {
-                continue;
-            };
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                if !is_legacy_transcript(&name) {
-                    continue;
-                }
-                let Ok(meta) = e.metadata() else { continue };
-                if !meta.is_file() || meta.len() == 0 {
-                    continue;
-                }
-                let stem = name.strip_suffix(".jsonl").unwrap_or(&name);
-                out.push(SessionFileRef {
+            out.extend(legacy_transcripts(&dir.join("sessions")).into_iter().map(
+                |(stem, path, meta)| SessionFileRef {
                     agent: AgentId::Openclaw,
-                    native_id: stem.to_string(),
-                    file_path: e.path().to_string_lossy().to_string(),
+                    native_id: stem,
+                    file_path: path.to_string_lossy().to_string(),
                     mtime_ms: mtime_ms(&meta),
                     size: meta.len() as i64,
-                });
-            }
+                },
+            ));
         }
         Ok(out)
     }
@@ -681,18 +718,34 @@ impl AgentAdapter for OpenclawAdapter {
         // 期间被写过时按戳重读就是把整个枚举查询再跑一遍)
         let mut snapshots = Vec::new();
         let mut legacy = Vec::new();
+        let mut transcripts = Vec::new();
         for dir in self.agent_dirs() {
             let db = dir.join("agent").join(DB_NAME);
             if db.is_file() {
                 snapshots.push(self.rows_cache_of(&db).latest()?);
             }
-            legacy.push(self.legacy_index(&dir.join("sessions"))?);
+            let sessions = dir.join("sessions");
+            legacy.push(self.legacy_index(&sessions)?);
+            transcripts.extend(
+                legacy_transcripts(&sessions)
+                    .into_iter()
+                    .map(|(stem, ..)| stem),
+            );
         }
-        let db_rows = || snapshots.iter().flat_map(|rows| rows.iter());
+        // 各 agent 目录收齐了再定:裸文件名优先得在全集上成立,不能看目录先后
+        let stems = legacy_stems(transcripts);
+        let all_rows = || snapshots.iter().flat_map(|rows| rows.iter());
+        // 没有事件的窗口不列(列表同一条),不算"库里那份"——迁进库时没带上事件、旧版 jsonl 还在的
+        // 会话,列出来的是旧版那份。时间线上照样留着它(下面的 windows)
         let legacy_entries = || legacy.iter().flat_map(|index| index.iter());
-        // 会话键 → 库里它的窗口(创建时间, 会话 id);旧版只知道每个键眼下那一条
+        let in_db: HashSet<&str> = all_rows()
+            .filter(|row| row.event_count > 0)
+            .map(|row| row.session_id.as_str())
+            .collect();
+        // 会话键 → 库里它的全部窗口(创建时间, 会话 id),空的也算:它在时间线上占着一段,拿掉的话
+        // 这段里派出的子代理会被挂到更早的那一窗。挑中的是空窗口时,`listed_id` 换成列出来的那份
         let mut windows: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
-        for row in db_rows() {
+        for row in all_rows() {
             windows
                 .entry(&row.session_key)
                 .or_default()
@@ -722,35 +775,59 @@ impl AgentAdapter for OpenclawAdapter {
                 .copied()
                 .or_else(|| windows.get(key)?.last().map(|(_, id)| *id))
         };
-        let db_links = db_rows().filter_map(|row| {
-            let parent = match row.parent.as_ref()? {
-                ParentRef::Session(id) => id.as_str(),
-                ParentRef::Key(key) => db_parent(key, row.hint.created_ms)?,
+        // 子会话(列出来的 id)→ 父会话(列出来的 id)。先放库里每一窗记的,再拿旧版索引里的盖上:
+        // 库里那份列出来的会话以库为准(旧版只记了父会话的键,下面不碰它);库里那份没事件、列出来
+        // 的是旧版那份时,旧版索引里有这条会话的关系就用它,没有(子会话键 reset 后索引换成了新的
+        // 那一条)就留着库里那一行记的
+        let mut links: HashMap<&str, &str> = HashMap::new();
+        for row in all_rows() {
+            let parent = match row.parent.as_ref() {
+                Some(ParentRef::Session(id)) => Some(id.as_str()),
+                Some(ParentRef::Key(key)) => db_parent(key, row.hint.created_ms),
+                None => None,
             };
-            Some((row.session_id.as_str(), parent))
-        });
-        // 同一会话两代都有(迁进库后旧 jsonl 还在)时关系以库里的为准:旧版只记了父会话的键
-        let in_db: HashSet<&str> = db_rows().map(|row| row.session_id.as_str()).collect();
+            if let Some(parent) = parent {
+                links.insert(
+                    listed_id(&row.session_id, &in_db, &stems),
+                    listed_id(parent, &in_db, &stems),
+                );
+            }
+        }
         let legacy_children: Vec<(&str, ParentRef)> = legacy_entries()
             .filter(|(id, _)| !in_db.contains(id.as_str()))
             .filter_map(|(id, (_, entry))| Some((id.as_str(), ParentRef::of(Some(entry), None)?)))
             .collect();
-        let legacy_links = legacy_children.iter().filter_map(|(id, parent)| {
+        for (id, parent) in &legacy_children {
             let parent = match parent {
-                ParentRef::Session(parent) => parent.as_str(),
-                ParentRef::Key(key) => legacy_parent(key)?,
+                ParentRef::Session(parent) => Some(parent.as_str()),
+                ParentRef::Key(key) => legacy_parent(key),
             };
-            Some((*id, parent))
-        });
-        Some(super::link_keys(
-            AgentId::Openclaw,
-            db_links.chain(legacy_links),
-        ))
+            if let Some(parent) = parent {
+                links.insert(
+                    listed_id(id, &in_db, &stems),
+                    listed_id(parent, &in_db, &stems),
+                );
+            }
+        }
+        Some(super::link_keys(AgentId::Openclaw, links))
     }
 
     /// 关系记在子会话自己的条目里:多 location 下按子会话的胜出副本认边
     fn parent_links_in_child(&self) -> bool {
         true
+    }
+
+    /// 旧版的父子关系记在 `agents/<x>/sessions/sessions.json` 里,关系里的 id 又按会话目录里
+    /// 列得出来的转录换算(`listed_id`):两样单独变了(删除也算)都要重取关系
+    fn is_snapshot_event(&self, path: &Path) -> bool {
+        path.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|name| name == "sessions")
+            && path.ancestors().nth(3) == Some(self.root.as_path())
+            && path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "sessions.json" || is_legacy_transcript(name))
     }
 
     // quick_meta 不覆写:库行给不出标题的可靠来源(名字在 session_info 事件里),

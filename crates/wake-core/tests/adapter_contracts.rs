@@ -3760,19 +3760,26 @@ fn unreadable_session_databases_freeze_instead_of_emptying() {
     assert_eq!(openclaw.parent_links(), None);
 }
 
-/// 旧版的子代理取父会话键眼下那一条,与时间无关:旧版条目常常只有会变的 updatedAt,拿它当
-/// 开始时间的话,父会话再写一轮(updatedAt 晚于子代理)归属就跑到库里更早的窗口去了
-#[test]
-fn openclaw_legacy_children_ignore_update_times() {
-    setup();
-    let tmp = tempfile::tempdir().unwrap();
-    let main = tmp.path().join("agents").join("main");
+/// OpenClaw 的检入 fixture(旧版 jsonl + 现版库)拷进临时目录,返回 `agents/main`;要改文件的
+/// 测试用它,共用的假 HOME 只读
+fn openclaw_copy(tmp: &Path) -> PathBuf {
+    let main = tmp.join("agents").join("main");
     common::copy_tree(
         &fixture("openclaw/agents/main/sessions"),
         &main.join("sessions"),
     );
     fs::create_dir_all(main.join("agent")).unwrap();
     common::build_openclaw_db(&main.join("agent").join("openclaw-agent.sqlite"));
+    main
+}
+
+/// 旧版的子代理取父会话键眼下那一条,与时间无关:旧版条目常常只有会变的 updatedAt,拿它当
+/// 开始时间的话,父会话再写一轮(updatedAt 晚于子代理)归属就跑到库里更早的窗口去了
+#[test]
+fn openclaw_legacy_children_ignore_update_times() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = openclaw_copy(tmp.path());
     let index = main.join("sessions").join("sessions.json");
     let later = fs::read_to_string(&index)
         .unwrap()
@@ -3786,41 +3793,182 @@ fn openclaw_legacy_children_ignore_update_times() {
     )));
 }
 
+/// 库里没有事件的窗口(迁进库时没带上事件、旧版 jsonl 还在)照样占着时间线上那一段:那段里
+/// 派出的子代理挂到它——列出来的是旧版那份——不能因为它不列就落到更早的那一窗。子会话自己
+/// 的窗口这样空着、旧版索引里又没有它(子会话键 reset 后索引换成了新的那一条)时,关系退回
+/// 库里那一行记的
+#[test]
+fn openclaw_empty_windows_still_bound_the_timeline() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = openclaw_copy(tmp.path());
+    rusqlite::Connection::open(main.join("agent").join("openclaw-agent.sqlite"))
+        .unwrap()
+        .execute_batch(
+            "DELETE FROM transcript_events WHERE session_id IN ('claw-0001', 'claw-0005');
+             DELETE FROM session_transcript_active_events
+                 WHERE session_id IN ('claw-0001', 'claw-0005');",
+        )
+        .unwrap();
+    for id in ["claw-0001", "claw-0005"] {
+        let header = format!(
+            r#"{{"type":"session","version":3,"id":"{id}","timestamp":"2026-08-08T09:00:00.000Z","cwd":"/Users/tester/Github/wakefx"}}"#
+        );
+        let message = r#"{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:00:05.000Z","message":{"role":"user","content":"kept in the old transcript","timestamp":1786266005000}}"#;
+        fs::write(
+            main.join("sessions").join(format!("{id}.jsonl")),
+            format!("{header}\n{message}\n"),
+        )
+        .unwrap();
+    }
+    let adapter = OpenclawAdapter::new().with_custom_root(tmp.path().join("agents"));
+    let listed: Vec<(String, String)> = adapter
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.native_id, r.file_path))
+        .collect();
+    assert!(listed
+        .iter()
+        .any(|(id, path)| id == "claw-0001" && path.ends_with("claw-0001.jsonl")));
+    let links = sorted_links(adapter.as_ref());
+    assert!(links.contains(&edge("openclaw:claw-0002", "openclaw:claw-0001")));
+    assert!(links.contains(&edge("openclaw:claw-0005", "openclaw:claw-0001")));
+}
+
+/// 同一会话在一个 agent 目录里有裸文件名、在另一个目录里只有话题转录:裸的那份列着,关系里的
+/// id 就是它,不能看哪个目录后读
+#[test]
+fn openclaw_bare_transcripts_win_across_agent_dirs() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = openclaw_copy(tmp.path());
+    let work = tmp.path().join("agents").join("work").join("sessions");
+    fs::create_dir_all(&work).unwrap();
+    fs::copy(
+        main.join("sessions")
+            .join("cccccccc-aaaa-bbbb-cccc-000000000017.jsonl"),
+        work.join("cccccccc-aaaa-bbbb-cccc-000000000017-topic-42.jsonl"),
+    )
+    .unwrap();
+    let adapter = OpenclawAdapter::new().with_custom_root(tmp.path().join("agents"));
+    adapter.list_session_files().unwrap();
+    assert!(sorted_links(adapter.as_ref()).contains(&edge(
+        "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
+        "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017"
+    )));
+}
+
 /// 同一会话在 stable 与 next 两个库里各有一份时,父子关系跟 scanner 选中的那份走(更新时间新
-/// 的),而不是后读的那个库说了算
+/// 的),而不是后读的那个库说了算;没有正文的副本不列,也不参与
 #[test]
 fn opencode_copies_in_both_databases_follow_the_winning_copy() {
     setup();
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("opencode");
-    fs::create_dir_all(&dir).unwrap();
-    let build = |name: &str, child_updated: i64, parent: &str| {
-        let conn = rusqlite::Connection::open(dir.join(name)).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT,
-                 time_created INTEGER, time_updated INTEGER, model TEXT, tokens_input INTEGER,
-                 tokens_output INTEGER, tokens_reasoning INTEGER, time_archived INTEGER,
-                 version TEXT, parent_id TEXT);
-             INSERT INTO session (id, directory, title, time_created, time_updated, version)
-                 VALUES ('ses_a', '/w', 'a', 1, 1, '1'), ('ses_b', '/w', 'b', 1, 1, '1');",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO session (id, directory, title, time_created, time_updated, version, parent_id)
-                 VALUES ('ses_child', '/w', 'child', 1, ?1, '1', ?2)",
-            rusqlite::params![child_updated, parent],
-        )
-        .unwrap();
+    // 两个库里各一份 ses_child:(更新时间, 父会话, 有没有正文)
+    let links = |stable: (i64, &str, bool), next: (i64, &str, bool)| {
+        let dir = tmp.path().join(format!("case-{}-{}", stable.0, next.0));
+        fs::create_dir_all(&dir).unwrap();
+        for (name, (updated, parent, content)) in
+            [("opencode.db", stable), ("opencode-next.db", next)]
+        {
+            let conn = rusqlite::Connection::open(dir.join(name)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                     time_created INTEGER, time_updated INTEGER, model TEXT, tokens_input INTEGER,
+                     tokens_output INTEGER, tokens_reasoning INTEGER, time_archived INTEGER,
+                     version TEXT, parent_id TEXT);
+                 CREATE TABLE part (id TEXT PRIMARY KEY, session_id TEXT, data TEXT);
+                 INSERT INTO session (id, directory, title, time_created, time_updated, version)
+                     VALUES ('ses_a', '/w', 'a', 1, 1, '1'), ('ses_b', '/w', 'b', 1, 1, '1');
+                 INSERT INTO part VALUES ('pa', 'ses_a', 'a'), ('pb', 'ses_b', 'b');",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session (id, directory, title, time_created, time_updated, version, parent_id)
+                     VALUES ('ses_child', '/w', 'child', 1, ?1, '1', ?2)",
+                rusqlite::params![updated, parent],
+            )
+            .unwrap();
+            if content {
+                conn.execute_batch("INSERT INTO part VALUES ('pc', 'ses_child', 'child')")
+                    .unwrap();
+            }
+        }
+        let adapter = OpencodeAdapter::new().with_custom_root(dir);
+        adapter.list_session_files().unwrap();
+        sorted_links(adapter.as_ref())
     };
     // stable 那份更新、先读;next 那份旧、后读
-    build("opencode.db", 200, "ses_a");
-    build("opencode-next.db", 100, "ses_b");
-    let adapter = OpencodeAdapter::new().with_custom_root(dir.clone());
-    adapter.list_session_files().unwrap();
     assert_eq!(
-        sorted_links(adapter.as_ref()),
+        links((200, "ses_a", true), (100, "ses_b", true)),
         vec![edge("opencode:ses_child", "opencode:ses_a")]
     );
+    // 更新的那份没有正文:列表不收它,scanner 用的是 next 那份
+    assert_eq!(
+        links((300, "ses_a", false), (100, "ses_b", true)),
+        vec![edge("opencode:ses_child", "opencode:ses_b")]
+    );
+}
+
+/// 旧版带话题的会话,转录叫 `<id>-topic-<话题>.jsonl`、列出来的 id 是整个主干:父会话只有
+/// 话题转录时,子代理要挂到列出来的那个 id 上,不是索引里的裸 id
+#[test]
+fn openclaw_legacy_topic_transcripts_keep_their_links() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let sessions = openclaw_copy(tmp.path()).join("sessions");
+    fs::rename(
+        sessions.join("cccccccc-aaaa-bbbb-cccc-000000000017.jsonl"),
+        sessions.join("cccccccc-aaaa-bbbb-cccc-000000000017-topic-42.jsonl"),
+    )
+    .unwrap();
+    let adapter = OpenclawAdapter::new().with_custom_root(tmp.path().join("agents"));
+    let ids: Vec<String> = adapter
+        .list_session_files()
+        .unwrap()
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    assert!(ids.contains(&"cccccccc-aaaa-bbbb-cccc-000000000017-topic-42".to_string()));
+    assert!(sorted_links(adapter.as_ref()).contains(&edge(
+        "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
+        "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017-topic-42"
+    )));
+    // 空的话题文件列表不收,也不拿来改写 id:子代理记着的确切父会话这里只剩一个空的话题
+    // 文件时,关系仍指向它原本的 id(那条会话可能在别的 location 里)
+    let index = sessions.join("sessions.json");
+    let mut entries: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&index).unwrap()).unwrap();
+    entries["agent:main:subagent:ffff"] = serde_json::json!({
+        "sessionId": "ffffffff-aaaa-bbbb-cccc-000000000019",
+        "updatedAt": 1786183300000_i64,
+        "parentSessionId": "99999999-aaaa-bbbb-cccc-000000000099"
+    });
+    fs::write(&index, entries.to_string()).unwrap();
+    fs::copy(
+        sessions.join("dddddddd-aaaa-bbbb-cccc-000000000018.jsonl"),
+        sessions.join("ffffffff-aaaa-bbbb-cccc-000000000019.jsonl"),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join("99999999-aaaa-bbbb-cccc-000000000099-topic-42.jsonl"),
+        "",
+    )
+    .unwrap();
+    adapter.list_session_files().unwrap();
+    assert!(sorted_links(adapter.as_ref()).contains(&edge(
+        "openclaw:ffffffff-aaaa-bbbb-cccc-000000000019",
+        "openclaw:99999999-aaaa-bbbb-cccc-000000000099"
+    )));
+    // 父子关系记在 sessions.json 里、关系里的 id 按列得出来的转录换算:这两样单独变了(删除也
+    // 算)都是快照事件,监听会重取关系;检查点与库文件不是
+    assert!(adapter.is_snapshot_event(&sessions.join("sessions.json")));
+    assert!(adapter.is_snapshot_event(&sessions.join("dddddddd-aaaa-bbbb-cccc-000000000018.jsonl")));
+    assert!(!adapter.is_snapshot_event(
+        &sessions.join("cccccccc-aaaa-bbbb-cccc-000000000017.checkpoint.1.jsonl")
+    ));
+    assert!(!adapter.is_snapshot_event(&tmp.path().join("agents/main/agent/openclaw-agent.sqlite")));
 }
 
 /// 自定义 location:构造器只认 home 与孤立的库文件两种形状,且只按路径整形不看
