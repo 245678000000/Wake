@@ -965,9 +965,14 @@ impl<T: Clone> MtimeCache<T> {
     /// 不了"不知道",而空答案的后果是全部放出 / 全部删掉(2026-09-21 review),旧答案
     /// 至少是上一次的事实。从没成功过才是 None
     pub fn get_or_stale(&self, mtime: i64, build: impl FnOnce() -> Option<T>) -> Option<T> {
-        if let Some(v) = self.get_or_try_build(mtime, build) {
-            return Some(v);
-        }
+        self.get_or_try_build(mtime, build)
+            .or_else(|| self.latest())
+    }
+
+    /// 上一次成功读到的值,不看戳、不重读。扫描末尾才问的快照(`parent_links`)要的是这一轮
+    /// 枚举入库的那一份:库在扫描期间被写过时按戳重读,只是把整个枚举查询再跑一遍,多读到的
+    /// 新会话这一轮也没入库
+    pub fn latest(&self) -> Option<T> {
         self.0.lock().unwrap().as_ref().map(|(_, v)| v.clone())
     }
 

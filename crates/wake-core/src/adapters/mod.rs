@@ -607,6 +607,24 @@ pub fn children_outlive_parent(adapters: &[Box<dyn AgentAdapter>], meta: &Sessio
     adapter_for(adapters, meta.agent, &meta.file_path).is_some_and(|a| a.children_outlive_parent())
 }
 
+/// `parent_links` 的边:(子会话 id, 父会话 id) 拼成两个本地 key。指向自己的不要——scanner
+/// 把自环当成环,挂在它下面的会话会跟着一起解挂
+pub(crate) fn link_keys<'a>(
+    agent: AgentId,
+    pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> Vec<(String, String)> {
+    pairs
+        .into_iter()
+        .filter(|(child, parent)| child != parent)
+        .map(|(child, parent)| {
+            (
+                session_key(agent, "", child),
+                session_key(agent, "", parent),
+            )
+        })
+        .collect()
+}
+
 /// 从解析后的消息派生 FTS 单元(text + tool 名称/输入摘要)。agent 对 Wake 自己的
 /// 查询(MCP 的 wake_* 工具、shell 里的 wake-cli / wake-mcp)不进索引:否则搜任何
 /// 词,第一条命中都是"上次搜这个词的那次调用",越用越吵(自指回声)。只跳过工具

@@ -20,7 +20,9 @@ use std::sync::Arc;
 ///   brain 目录还没有转录,这一形态未经真机验证。
 ///
 /// 两种都如实列出,同一会话转录与卡片的胜负交给 scanner 的副本裁决(`dedup_rank`:转录恒胜,
-/// 转录读不出时卡片接得住);转录的标题、工作区与来自哪一端仍以索引为准。
+/// 转录读不出时卡片接得住);转录的标题、工作区与来自哪一端仍以索引为准。索引里记了父会话
+/// (`parent_conversation_id`)的是派生出来的子会话,经 `parent_links` 挂到父会话下;
+/// `nesting_depth` 大于 0 却没记父会话的挂不上,不列。
 pub struct AntigravityAdapter {
     /// 会话索引;选中的自定义 location 不含它时为 None
     db: Option<PathBuf>,
@@ -47,8 +49,10 @@ struct AgRow {
     step_count: i64,
     modified_ms: i64,
     cwd: String,
-    /// 子会话(派生的、并行比较的):卡片与转录都不列
-    child: bool,
+    /// 派生出这个子会话的会话 id
+    parent: Option<String>,
+    /// 子会话(`nesting_depth` > 0)却没记父会话:挂不上,卡片与转录都不列
+    orphan: bool,
     /// 会话所在的 app 数据目录名;老库没有这一列,空
     app: String,
 }
@@ -106,13 +110,16 @@ impl AntigravityAdapter {
                 .query_map([], |r| {
                     let text =
                         |i: usize| r.get::<_, Option<String>>(i).map(Option::unwrap_or_default);
+                    let parent = Some(text(6)?).filter(|parent| !parent.is_empty());
+                    let nested = r.get::<_, Option<i64>>(7)?.unwrap_or(0) > 0;
                     let row = AgRow {
                         title: text(1)?,
                         preview: text(2)?,
                         step_count: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
                         modified_ms: sqlite_dt_ms(text(4)?.trim()),
                         cwd: canonical_project_path(&first_workspace(&text(5)?)),
-                        child: !text(6)?.is_empty() || r.get::<_, Option<i64>>(7)?.unwrap_or(0) > 0,
+                        orphan: nested && parent.is_none(),
+                        parent,
                         app: text(8)?,
                     };
                     Ok((r.get::<_, String>(0)?, row))
@@ -122,6 +129,17 @@ impl AntigravityAdapter {
                 .ok()?;
             Some(Arc::new(index))
         })
+    }
+
+    /// 索引的三态,列表与 parent_links 共用:库不在是空索引;库在却从没读成功过 = 不知道
+    /// (None)——列表据此报错(scanner 冻结这一家这一轮,库里的卡片原样留着),别当成没有
+    /// 会话,那会把卡片整批删掉
+    fn known_index(&self) -> Option<Arc<Index>> {
+        match self.index() {
+            Some(index) => Some(index),
+            None if self.db.as_ref().is_some_and(|db| db.is_file()) => None,
+            None => Some(Arc::default()),
+        }
     }
 
     fn parse(
@@ -287,7 +305,7 @@ fn app_dir_of(transcript: &Path) -> Option<&str> {
 fn transcript_ref(index: Option<&Index>, path: &Path) -> Option<SessionFileRef> {
     let id = session_dir(path)?.file_name()?.to_str()?;
     let row = index.and_then(|index| index.get(id));
-    if row.is_some_and(|row| row.child) {
+    if row.is_some_and(|row| row.orphan) {
         return None;
     }
     let mut r = default_file_ref(AgentId::Antigravity, path)?;
@@ -609,13 +627,9 @@ impl AgentAdapter for AntigravityAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let index = self.index();
-        // 索引在却从没读成功过:报错,scanner 把这一家这一轮冻结住(库里的卡片原样留着),
-        // 别把它当成"没有会话"——那会把卡片整批删掉;库不在才是确定没有
-        if index.is_none() && self.db.as_ref().is_some_and(|db| db.is_file()) {
-            return Err(anyhow!("cannot read the Antigravity conversation index"));
-        }
-        let index = index.as_deref();
+        let index = self
+            .known_index()
+            .ok_or_else(|| anyhow!("cannot read the Antigravity conversation index"))?;
         let rel = transcript_rel();
         let mut refs = Vec::new();
         for brain in &self.brains {
@@ -625,15 +639,15 @@ impl AgentAdapter for AntigravityAdapter {
             refs.extend(
                 entries
                     .flatten()
-                    .filter_map(|entry| transcript_ref(index, &entry.path().join(&rel))),
+                    .filter_map(|entry| transcript_ref(Some(&index), &entry.path().join(&rel))),
             );
         }
         // 有转录的会话也照列卡片:scanner 按 dedup_rank 取转录,转录读不出时退回卡片
-        if let (Some(db), Some(index)) = (&self.db, index) {
+        if let Some(db) = &self.db {
             refs.extend(
                 index
                     .iter()
-                    .filter(|(_, row)| !row.child)
+                    .filter(|(_, row)| !row.orphan)
                     .map(|(id, row)| card_ref(db, id, row)),
             );
         }
@@ -642,6 +656,27 @@ impl AgentAdapter for AntigravityAdapter {
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
         transcript_ref(self.index().as_deref(), path)
+    }
+
+    fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// 索引里记的父会话。库在却从没读成功过 = 不知道(None),库里的关系原样保留
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        let index = self.known_index()?;
+        Some(super::link_keys(
+            AgentId::Antigravity,
+            index
+                .iter()
+                .filter_map(|(id, row)| Some((id.as_str(), row.parent.as_deref()?))),
+        ))
+    }
+
+    /// 关系记在整个 `.gemini` 共用的索引里(Codex 的 state DB 同一种),子会话与父会话的
+    /// 转录都可能归另一个只选了 brain 的 location
+    fn parent_links_global(&self) -> bool {
+        true
     }
 
     fn quick_meta(&self, refs: &[SessionFileRef]) -> Option<HashMap<String, SessionMeta>> {

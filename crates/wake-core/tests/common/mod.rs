@@ -549,7 +549,7 @@ fn build_kilo_global_state(path: &Path, global_state: &str) {
 ///   agent / retry 两种已知但不渲染的类型
 /// - `ses_kilo_0002`:用户敲 `/review` 派子代理(消息里只有 subtask 块)、一条 compaction
 ///   标记、压缩出的摘要
-/// - `ses_kilo_0003`:子代理会话(parent_id),不列
+/// - `ses_kilo_0003`:子代理会话(parent_id),挂在 `ses_kilo_0001` 下
 /// - `ses_kilo_0004`:已归档
 /// - `ses_kilo_0005`:只有 session_message 的会话(v2 路径)
 /// - `ses_kilo_0006`:没有正文,不列
@@ -743,7 +743,9 @@ pub fn build_hermes_db(path: &Path) {
 /// OpenClaw `openclaw-agent.sqlite` 最小同构库:session_nodes + session_windows +
 /// transcript_events + session_transcript_active_events(列集只取 Wake 读的)。
 /// claw-0001 是活跃窗口:事件树里塞了一条被回滚的死分支(a2-dead),
-/// active_events 只列可见分支;claw-0002 是被 spawn 的子代理窗口(不列);
+/// active_events 只列可见分支;claw-0002 是被 spawn 的子代理窗口,只记了父会话的键
+///(挂在 claw-0001 下);claw-0004 也是子代理,条目里记了确切的父会话 claw-0003;claw-0005
+/// 是同一个子代理键(sub2)复用之前的旧窗口,条目不归它,按它自己那一行的键挂到 claw-0001;
 /// claw-0003 是 reset 前的旧窗口,node 指向 claw-0001,无 active_events
 ///(退回树回溯),entry_json 的 totalTokens 不归它。
 pub fn build_openclaw_db(path: &Path) {
@@ -777,14 +779,21 @@ pub fn build_openclaw_db(path: &Path) {
              1786266030000, 'Node label', NULL, NULL, NULL, NULL),
             ('agent:main:subagent:sub1', 'claw-0002',
              '{"sessionId":"claw-0002","updatedAt":1786266100000,"spawnedBy":"agent:main:main"}',
-             1786266100000, NULL, NULL, 'agent:main:main', 'agent:main:main', NULL);
+             1786266100000, NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
+            ('agent:main:subagent:sub2', 'claw-0004',
+             '{"sessionId":"claw-0004","updatedAt":1786266200000,"spawnedBy":"agent:main:main","parentSessionId":"claw-0003"}',
+             1786266200000, NULL, NULL, 'agent:main:main', 'agent:main:main', NULL);
         INSERT INTO session_windows VALUES
             ('claw-0001', 'agent:main:main', 1786266000000, 1786266030000, 1786266030000, 1786266000000,
              'claude-opus-5', 'anthropic', 'telegram', 'direct', NULL, NULL, NULL),
             ('claw-0002', 'agent:main:subagent:sub1', 1786266100000, 1786266100000, 1786266100000, 1786266100000,
              'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
             ('claw-0003', 'agent:main:main', 1786176000000, 1786176030000, 1786176030000, 1786176000000,
-             'gpt-5.5', 'openai', 'cli', 'direct', NULL, NULL, NULL);
+             'gpt-5.5', 'openai', 'cli', 'direct', NULL, NULL, NULL),
+            ('claw-0004', 'agent:main:subagent:sub2', 1786266200000, 1786266200000, 1786266200000, 1786266200000,
+             'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL),
+            ('claw-0005', 'agent:main:subagent:sub2', 1786266150000, 1786266160000, 1786266160000, 1786266150000,
+             'claude-opus-5', 'anthropic', NULL, NULL, 'agent:main:main', 'agent:main:main', NULL);
         INSERT INTO transcript_events VALUES
             ('claw-0001', 0, '{"type":"session","version":3,"id":"claw-0001","timestamp":"2026-08-08T09:00:00.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266000000),
             ('claw-0001', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:00:05.000Z","message":{"role":"user","content":"OpenClaw 库里的会话:查二维码组件 useEffect() 清理","timestamp":1786266005000}}', 1786266005000),
@@ -797,7 +806,11 @@ pub fn build_openclaw_db(path: &Path) {
             ('claw-0002', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:01:41.000Z","message":{"role":"user","content":"child task","timestamp":1786266101000}}', 1786266101000),
             ('claw-0003', 0, '{"type":"session","version":3,"id":"claw-0003","timestamp":"2026-08-07T08:00:00.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786176000000),
             ('claw-0003', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-07T08:00:05.000Z","message":{"role":"user","content":"reset 之前的老窗口","timestamp":1786176005000}}', 1786176005000),
-            ('claw-0003', 2, '{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-07T08:00:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"收到。"}],"api":"openai-responses","provider":"openai","model":"gpt-5.5","timestamp":1786176030000}}', 1786176030000);
+            ('claw-0003', 2, '{"type":"message","id":"a1","parentId":"u1","timestamp":"2026-08-07T08:00:30.000Z","message":{"role":"assistant","content":[{"type":"text","text":"收到。"}],"api":"openai-responses","provider":"openai","model":"gpt-5.5","timestamp":1786176030000}}', 1786176030000),
+            ('claw-0004', 0, '{"type":"session","version":3,"id":"claw-0004","timestamp":"2026-08-08T09:03:20.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266200000),
+            ('claw-0004', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:03:21.000Z","message":{"role":"user","content":"exact parent","timestamp":1786266201000}}', 1786266201000),
+            ('claw-0005', 0, '{"type":"session","version":3,"id":"claw-0005","timestamp":"2026-08-08T09:02:30.000Z","cwd":"/Users/tester/Github/wakefx"}', 1786266150000),
+            ('claw-0005', 1, '{"type":"message","id":"u1","parentId":null,"timestamp":"2026-08-08T09:02:31.000Z","message":{"role":"user","content":"earlier spawn under the same key","timestamp":1786266151000}}', 1786266151000);
         INSERT INTO session_transcript_active_events VALUES
             ('claw-0001', 0, 1, 0), ('claw-0001', 1, 2, 1), ('claw-0001', 2, 3, 2),
             ('claw-0001', 3, 5, 3), ('claw-0001', 4, 6, 4);
@@ -952,7 +965,8 @@ const ANTIGRAVITY_INDEX_TABLE: &str = r#"
 "#;
 
 /// Antigravity `conversation_summaries.db` 最小同构库(老库,没有 `app_data_dir`):标题在
-/// preview 列(title 列常空);ag-0002 是子会话(parent 非空),必须被过滤。
+/// preview 列(title 列常空);ag-0002 是挂在 ag-0001 下的子会话;ag-0003 的 nesting_depth
+/// 大于 0 却没记父会话,挂不上、不列。
 pub fn build_antigravity_db(path: &Path) {
     let conn = rusqlite::Connection::open(path).expect("create antigravity fixture db");
     conn.execute_batch(ANTIGRAVITY_INDEX_TABLE)
@@ -966,7 +980,9 @@ pub fn build_antigravity_db(path: &Path) {
             ('ag-0001', '', 'QR overlay polish', 12, '2026-08-06 13:00:00.000000+00:00',
              '["file:///Users/tester/Github/wakefx"]', '', 0, '2026-08-06 13:00:00.000000+00:00'),
             ('ag-0002', '', 'Child convo', 3, '2026-08-06 13:05:00.000000+00:00',
-             '["file:///Users/tester/Github/wakefx"]', 'ag-0001', 1, '0001-01-01 00:00:00+00:00');
+             '["file:///Users/tester/Github/wakefx"]', 'ag-0001', 1, '0001-01-01 00:00:00+00:00'),
+            ('ag-0003', '', 'Nested without a parent', 2, '2026-08-06 13:06:00.000000+00:00',
+             '["file:///Users/tester/Github/wakefx"]', '', 1, '0001-01-01 00:00:00+00:00');
         "#,
     )
     .expect("populate antigravity fixture db");
@@ -1210,10 +1226,13 @@ pub fn clear_agent_env_overrides() {
 
 /// ZCode `~/.zcode` 最小同构:cli/db/db.sqlite(OpenCode 形状,session 表按真机
 /// 3.14.0 / 运行时 0.16.9 的列)+ v2/tasks-index.sqlite(只有过滤要看的列)。
-/// zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的、zc-0005 是
-/// subagent_child,三条都不该列;zc-0008 是 fork(带 parent_id 但是用户自己的
-/// 对话)要列;zc-0002 的标题是占位(title_source=default)且首条是注入上下文;
-/// zc-0001 末尾有一条 compaction 摘要(user 角色、hidden);zc-0006 是没有
+/// zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的,都不该列;zc-0010 是
+/// 挂在被删的 zc-0003 下的子代理,跟着藏;zc-0013 的类型没见过,不列。zc-0005 子代理、
+/// zc-0009 辅助对话挂在 zc-0001 下,zc-0012 工作流子会话挂在 zc-0011(workflow_parent,
+/// 顶层)下;zc-0008 是 fork(带 parent_id 但在任务列表里,不挂),开头是从 zc-0001
+/// 复制来的两条 + fork_notice + 时间线分隔条;zc-0009 复制来的都标了隐藏(其中一条是父
+/// 任务的压缩摘要),标题是固定的 "Selection side chat";zc-0002 的标题是占位(title_source=default)且首条是注入
+/// 上下文;zc-0001 末尾有一条 compaction 摘要(user 角色、hidden);zc-0006 是没有
 /// semantics 的老写端;zc-0007 已归档
 pub fn build_zcode_db(path: &Path) {
     let conn = rusqlite::Connection::open(path).expect("create zcode fixture db");
@@ -1243,6 +1262,11 @@ pub fn build_zcode_db(path: &Path) {
             ('zc-0004','proj-wakefx',NULL,NULL,'zc-0004','/Users/tester/Github/wakefx',NULL,'imported from claude','0.16.9',1789000300000,1789000310000,NULL,'interactive','first_input'),
             ('zc-0005','proj-wakefx',NULL,'zc-0001','zc-0005','/Users/tester/Github/wakefx',NULL,'child task','0.16.9',1789000400000,1789000410000,NULL,'subagent_child','first_input'),
             ('zc-0008','proj-wakefx',NULL,'zc-0001','zc-0008','/Users/tester/Github/wakefx',NULL,'Fork of ZCode QR fix','0.16.9',1789000800000,1789000810000,NULL,'fork','generated'),
+            ('zc-0009','proj-wakefx',NULL,'zc-0001','zc-0009','/Users/tester/Github/wakefx',NULL,'Selection side chat','0.16.9',1789000900000,1789000910000,NULL,'selection_side_chat','generated'),
+            ('zc-0010','proj-wakefx',NULL,'zc-0003','zc-0010','/Users/tester/Github/wakefx',NULL,'child of a deleted task','0.16.9',1789001000000,1789001010000,NULL,'subagent_child','first_input'),
+            ('zc-0011','proj-wakefx',NULL,NULL,'zc-0011','/Users/tester/Github/wakefx',NULL,'Run the release workflow','0.16.9',1789001100000,1789001110000,NULL,'workflow_parent','first_input'),
+            ('zc-0012','proj-wakefx',NULL,'zc-0011','zc-0012','/Users/tester/Github/wakefx',NULL,'Check the changelog','0.16.9',1789001200000,1789001210000,NULL,'workflow_child','first_input'),
+            ('zc-0013','proj-wakefx',NULL,NULL,'zc-0013','/Users/tester/Github/wakefx',NULL,'a type from a future version','0.16.9',1789001300000,1789001310000,NULL,'future_kind','first_input'),
             ('zc-0006','proj-wakefx',NULL,NULL,'zc-0006','/Users/tester/Github/wakefx',NULL,'老写端没有 semantics','0.15.2',1789000500000,1789000510000,NULL,'interactive','first_input'),
             ('zc-0007','proj-wakefx',NULL,NULL,'zc-0007','/Users/tester/Github/wakefx',NULL,'archived one','0.16.9',1789000600000,1789000610000,1789000700000,'interactive','first_input');
         INSERT INTO message (id, session_id, time_created, time_updated, data, sequence) VALUES
@@ -1251,7 +1275,22 @@ pub fn build_zcode_db(path: &Path) {
             ('m-0001-2','zc-0001',1789000050000,1789000050000,'{"role":"user","time":{"created":1789000050000},"modelSelection":{"providerId":"account:zai","modelId":"GLM-5.3-Flash"},"semantics":{"origin":"real_user","kind":"user_prompt"}}',2),
             ('m-0001-3','zc-0001',1789000055000,1789000060000,'{"role":"assistant","time":{"created":1789000055000,"completed":1789000060000},"modelId":"GLM-5.3-Flash","tokens":{"total":30,"input":25,"output":5,"reasoning":0,"cache":{"read":0,"write":0}},"finish":"stop","semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',3),
             ('m-0001-4','zc-0001',1789000058000,1789000058000,'{"role":"user","time":{"created":1789000058000},"semantics":{"origin":"agent_runtime","kind":"compact_summary","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',4),
-            ('m-0008-0','zc-0008',1789000800000,1789000800000,'{"role":"user","time":{"created":1789000800000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',0),
+            ('m-0008-a','zc-0008',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"semantics":{"origin":"real_user","kind":"user_prompt","transcriptVisibility":"visible"}}',0),
+            ('m-0008-b','zc-0008',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000},"modelId":"GLM-5.3","tokens":{"total":120},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',1),
+            ('m-0008-c','zc-0008',1789000799000,1789000799000,'{"role":"user","time":{"created":1789000799000},"synthetic":true,"source":"fork","semantics":{"origin":"system","kind":"fork_notice","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',2),
+            ('m-0008-d','zc-0008',1789000799000,1789000799000,'{"role":"assistant","time":{"created":1789000799000,"completed":1789000799000},"modelId":"GLM-5.3","tokens":{"total":0},"semantics":{"origin":"system","kind":"timeline_event","transcriptVisibility":"visible"}}',3),
+            ('m-0008-0','zc-0008',1789000800000,1789000800000,'{"role":"user","time":{"created":1789000800000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',4),
+            ('m-0008-1','zc-0008',1789000805000,1789000810000,'{"role":"assistant","time":{"created":1789000805000},"modelId":"GLM-5.3-Flash","tokens":{"total":7},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',5),
+            ('m-0009-a','zc-0009',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000},"semantics":{"origin":"real_user","kind":"user_prompt","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',0),
+            ('m-0009-b','zc-0009',1789000005000,1789000012000,'{"role":"assistant","time":{"created":1789000005000},"modelId":"GLM-5.3","tokens":{"total":120},"semantics":{"origin":"agent_runtime","kind":"assistant_response","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',1),
+            ('m-0009-s','zc-0009',1789000058000,1789000058000,'{"role":"user","time":{"created":1789000058000},"semantics":{"origin":"agent_runtime","kind":"compact_summary","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',2),
+            ('m-0009-c','zc-0009',1789000899000,1789000899000,'{"role":"user","time":{"created":1789000899000},"synthetic":true,"source":"selection_side_chat","semantics":{"origin":"system","kind":"system_reminder","source":"selection_side_chat","uiVisibility":"hidden","transcriptVisibility":"hidden"}}',3),
+            ('m-0009-0','zc-0009',1789000900000,1789000900000,'{"role":"user","time":{"created":1789000900000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',4),
+            ('m-0009-1','zc-0009',1789000905000,1789000910000,'{"role":"assistant","time":{"created":1789000905000},"modelId":"GLM-5.3-Flash","tokens":{"total":9},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',5),
+            ('m-0010-0','zc-0010',1789001000000,1789001000000,'{"role":"user","time":{"created":1789001000000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0011-0','zc-0011',1789001100000,1789001100000,'{"role":"user","time":{"created":1789001100000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0012-0','zc-0012',1789001200000,1789001200000,'{"role":"user","time":{"created":1789001200000},"semantics":{"origin":"real_user"}}',0),
+            ('m-0013-0','zc-0013',1789001300000,1789001300000,'{"role":"user","time":{"created":1789001300000},"semantics":{"origin":"real_user"}}',0),
             ('m-0002-0','zc-0002',1789000100000,1789000100000,'{"role":"user","time":{"created":1789000100000},"semantics":{"origin":"system_injected","kind":"context","transcriptVisibility":"hidden"}}',0),
             ('m-0002-1','zc-0002',1789000101000,1789000101000,'{"role":"user","time":{"created":1789000101000},"semantics":{"origin":"real_user","kind":"user_prompt"}}',1),
             ('m-0002-2','zc-0002',1789000105000,1789000110000,'{"role":"assistant","time":{"created":1789000105000},"modelId":"GLM-5.3","tokens":{"total":10},"semantics":{"origin":"agent_runtime","kind":"assistant_response"}}',2),
@@ -1271,7 +1310,22 @@ pub fn build_zcode_db(path: &Path) {
             ('p-0001-2-0','m-0001-2','zc-0001',1789000050000,1789000050000,'{"type":"text","text":"谢谢,合并了"}',0),
             ('p-0001-3-0','m-0001-3','zc-0001',1789000055000,1789000060000,'{"type":"text","text":"不客气。"}',0),
             ('p-0001-4-0','m-0001-4','zc-0001',1789000058000,1789000058000,'{"type":"text","text":"Summary of the conversation so far: fixed the qr login bug."}',0),
+            ('p-0008-a-0','m-0008-a','zc-0008',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}',0),
+            ('p-0008-b-0','m-0008-b','zc-0008',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。"}',0),
+            ('p-0008-c-0','m-0008-c','zc-0008',1789000799000,1789000799000,'{"type":"text","text":"This conversation was forked from session zc-0001.","synthetic":true}',0),
+            ('p-0008-d-0','m-0008-d','zc-0008',1789000799000,1789000799000,'{"type":"timeline","timelineType":"session_fork","display":"separator","status":"completed","parentSessionId":"zc-0001"}',0),
             ('p-0008-0-0','m-0008-0','zc-0008',1789000800000,1789000800000,'{"type":"text","text":"forked follow-up"}',0),
+            ('p-0008-1-0','m-0008-1','zc-0008',1789000805000,1789000810000,'{"type":"text","text":"分叉之后的回答"}',0),
+            ('p-0009-a-0','m-0009-a','zc-0009',1789000000000,1789000000000,'{"type":"text","text":"ZCode 看看二维码扫描为何闪退,是不是 useEffect() 的问题"}',0),
+            ('p-0009-b-0','m-0009-b','zc-0009',1789000008000,1789000012000,'{"type":"text","text":"是依赖数组问题,我给出了修复补丁。"}',0),
+            ('p-0009-s-0','m-0009-s','zc-0009',1789000058000,1789000058000,'{"type":"text","text":"Summary of the parent task: fixed the qr login bug."}',0),
+            ('p-0009-c-0','m-0009-c','zc-0009',1789000899000,1789000899000,'{"type":"text","text":"The preceding conversation was inherited from the parent task for reference only.","synthetic":true}',0),
+            ('p-0009-0-0','m-0009-0','zc-0009',1789000900000,1789000900000,'{"type":"text","text":"这个 hook 为什么要清理"}',0),
+            ('p-0009-1-0','m-0009-1','zc-0009',1789000905000,1789000910000,'{"type":"text","text":"扫描器要在卸载时释放摄像头。"}',0),
+            ('p-0010-0-0','m-0010-0','zc-0010',1789001000000,1789001000000,'{"type":"text","text":"child of a deleted task"}',0),
+            ('p-0011-0-0','m-0011-0','zc-0011',1789001100000,1789001100000,'{"type":"text","text":"Run the release workflow"}',0),
+            ('p-0012-0-0','m-0012-0','zc-0012',1789001200000,1789001200000,'{"type":"text","text":"Check the changelog"}',0),
+            ('p-0013-0-0','m-0013-0','zc-0013',1789001300000,1789001300000,'{"type":"text","text":"from the future"}',0),
             ('p-0002-0-0','m-0002-0','zc-0002',1789000100000,1789000100000,'{"type":"text","text":"<workspace><root>/Users/tester/Github/wakefx</root></workspace>"}',0),
             ('p-0002-1-0','m-0002-1','zc-0002',1789000101000,1789000101000,'{"type":"text","text":"空标题会话取这句"}',0),
             ('p-0002-2-0','m-0002-2','zc-0002',1789000105000,1789000110000,'{"type":"text","text":"好的。"}',0),

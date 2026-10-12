@@ -166,6 +166,18 @@ fn roles_kinds(mainline: &[TranscriptMessage]) -> Vec<(Role, MessageKind)> {
     mainline.iter().map(|m| (m.role, m.kind)).collect()
 }
 
+/// adapter 报的父子关系,排好序
+fn sorted_links(adapter: &dyn AgentAdapter) -> Vec<(String, String)> {
+    let mut links = adapter.parent_links().expect("parent links readable");
+    links.sort();
+    links
+}
+
+/// 一条父子关系:(子会话 key, 父会话 key)
+fn edge(child: &str, parent: &str) -> (String, String) {
+    (child.to_string(), parent.to_string())
+}
+
 // 各 fixture 的固定引用
 fn claude_ref() -> SessionFileRef {
     fs_ref(
@@ -2298,10 +2310,20 @@ fn antigravity_parse_contract() {
     let env = setup();
     let adapter = AntigravityAdapter::new();
 
-    // 子会话(parent_conversation_id 非空)不进列表
-    let refs = adapter.list_session_files().expect("antigravity list");
-    assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].native_id, "ag-0001");
+    // 子会话(parent_conversation_id 非空)照列、挂到父会话下;nesting_depth 大于 0
+    // 却没记父会话的挂不上,不列
+    let mut ids: Vec<String> = adapter
+        .list_session_files()
+        .expect("antigravity list")
+        .into_iter()
+        .map(|r| r.native_id)
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["ag-0001", "ag-0002"]);
+    assert_eq!(
+        sorted_links(&adapter),
+        vec![edge("antigravity:ag-0002", "antigravity:ag-0001")]
+    );
 
     let r = db_ref(AgentId::Antigravity, &env.antigravity_db, "ag-0001");
     let s = adapter
@@ -2331,7 +2353,7 @@ fn antigravity_parse_contract() {
 }
 
 /// 新版本写下的明文转录(PR #52 整理的格式,合成 fixture):转录与索引卡片都如实列出,
-/// 同一个 id 由 dedup_rank 让转录胜出;索引里的子会话两种都不列
+/// 同一个 id 由 dedup_rank 让转录胜出;索引里的子会话两种都照列,挂到父会话下
 #[test]
 fn antigravity_transcripts_replace_index_cards() {
     use common::AgIndexRow;
@@ -2405,8 +2427,14 @@ fn antigravity_transcripts_replace_index_cards() {
             ("ag-1", card("ag-1")),
             ("ag-1", t1.to_string_lossy().to_string()),
             ("ag-2", card("ag-2")),
+            ("ag-3", card("ag-3")),
+            ("ag-3", t3.to_string_lossy().to_string()),
             ("ag-4", t4.to_string_lossy().to_string()),
         ]
+    );
+    assert_eq!(
+        sorted_links(adapter.as_ref()),
+        vec![edge("antigravity:ag-3", "antigravity:ag-1")]
     );
     // 同一个 id 的卡片与转录同时出现时,转录胜出
     assert_eq!(adapter.dedup_rank(&refs[1].file_path), 0);
@@ -2479,7 +2507,8 @@ fn antigravity_transcripts_replace_index_cards() {
     assert!(card2.mainline[0].text.contains("encrypted"));
 
     // 没进索引的会话:工作区取工具的工作目录,桌面端不挂 via
-    let s4 = adapter.parse_session(&refs[3]).expect("ag-4 parse_session");
+    let r4 = refs.iter().find(|r| r.native_id == "ag-4").expect("ag-4");
+    let s4 = adapter.parse_session(r4).expect("ag-4 parse_session");
     assert_eq!(s4.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s4.meta.source, None);
     assert_eq!(s4.meta.title, "Fix the button layout on the dashboard");
@@ -2490,7 +2519,11 @@ fn antigravity_transcripts_replace_index_cards() {
         (watched.native_id.as_str(), watched.mtime_ms, watched.size),
         ("ag-1", r.mtime_ms, r.size)
     );
-    assert!(adapter.file_ref(&t3).is_none(), "子会话不列");
+    assert_eq!(
+        adapter.file_ref(&t3).map(|r| r.native_id).as_deref(),
+        Some("ag-3"),
+        "子会话照列"
+    );
     // 转录会话整个目录进废纸篓,卡片只记墓碑
     assert_eq!(
         adapter.session_paths(&s.meta),
@@ -3490,8 +3523,9 @@ fn openclaw_legacy_ref(env: &TestEnv) -> SessionFileRef {
 }
 
 /// ZCode:cli/db/db.sqlite 是 OpenCode 形状的转录源,v2/tasks-index.sqlite 只借
-/// deleted / migration_source 两个过滤位;parent_id 非空不列;semantics.origin
-/// 白名单归 Meta、缺席放行;title_source=default 是占位;model 逐消息、token 按调用累加
+/// deleted / migration_source 两个过滤位;任务列表里的类型顶层列出,辅助对话 / 子代理 /
+/// 工作流子会话挂到父会话下;semantics.origin 白名单归 Meta、缺席放行;title_source=default
+/// 是占位;model 逐消息、token 按调用累加;分叉与辅助对话复制来的历史不算它们自己的
 #[test]
 fn zcode_parse_contract() {
     let env = setup();
@@ -3503,11 +3537,26 @@ fn zcode_parse_contract() {
         .map(|r| r.native_id)
         .collect();
     ids.sort();
-    // zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的、zc-0005 是
-    // subagent_child;zc-0008 是 fork——带 parent_id 但是用户自己的对话,要列
+    // zc-0003 桌面端软删、zc-0004 是向导从 Claude Code 导入的,zc-0010 挂在被删的
+    // zc-0003 下、跟着藏,zc-0013 的类型没见过;zc-0008 是 fork——带 parent_id 但在
+    // 任务列表里,顶层列出
     assert_eq!(
         ids,
-        vec!["zc-0001", "zc-0002", "zc-0006", "zc-0007", "zc-0008"]
+        vec![
+            "zc-0001", "zc-0002", "zc-0005", "zc-0006", "zc-0007", "zc-0008", "zc-0009", "zc-0011",
+            "zc-0012"
+        ]
+    );
+    // 子代理、辅助对话、工作流子会话挂到父会话下;fork 不挂。藏起来的 zc-0010 照报,
+    // 库里没有那一行,写不进去
+    assert_eq!(
+        sorted_links(&adapter),
+        vec![
+            edge("zcode:zc-0005", "zcode:zc-0001"),
+            edge("zcode:zc-0009", "zcode:zc-0001"),
+            edge("zcode:zc-0010", "zcode:zc-0003"),
+            edge("zcode:zc-0012", "zcode:zc-0011"),
+        ]
     );
 
     let r = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0001");
@@ -3583,11 +3632,56 @@ fn zcode_parse_contract() {
 
     let r7 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0007");
     assert!(adapter.parse_session(&r7).unwrap().meta.archived);
+
+    // fork:从 zc-0001 复制来的两条连同 fork_notice 折成一条标记,时间线分隔条不算未知;
+    // token 与模型只算分叉之后的,复制来的那句提问不进 FTS
+    let r8 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0008");
+    let s8 = adapter.parse_session(&r8).unwrap();
+    let t8 = adapter.parse_transcript(&r8).unwrap();
+    assert_eq!(s8.meta.title, "Fork of ZCode QR fix");
+    assert_eq!(s8.meta.tokens_used, Some(7));
+    assert_eq!(s8.meta.model.as_deref(), Some("GLM-5.3-Flash"));
+    assert_eq!(s8.meta.message_count, 2);
+    assert_eq!(t8.unknown_line_count, 0);
+    assert_eq!(
+        roles_kinds(&t8.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert!(t8.mainline[0]
+        .text
+        .contains("2 messages inherited from the parent task"));
+    assert!(s8.units.iter().all(|u| !u.text.contains("二维码")));
+    assert_eq!(
+        s8.units.iter().map(|u| u.seq).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+
+    // 辅助对话:复制来的同样折成一条——其中父任务的压缩摘要不折就会作为摘要露出来;
+    // 固定标题退回首条提问,token 与模型只算边界之后的
+    let r9 = db_ref(AgentId::Zcode, &env.zcode_db, "zc-0009");
+    let s9 = adapter.parse_session(&r9).unwrap();
+    let t9 = adapter.parse_transcript(&r9).unwrap();
+    assert_eq!(
+        roles_kinds(&t9.mainline),
+        vec![
+            (Role::System, MessageKind::Meta),
+            (Role::User, MessageKind::Text),
+            (Role::Assistant, MessageKind::Text),
+        ]
+    );
+    assert_eq!(s9.meta.title, "这个 hook 为什么要清理");
+    assert_eq!(s9.meta.tokens_used, Some(9));
+    assert_eq!(s9.meta.model.as_deref(), Some("GLM-5.3-Flash"));
+    assert_eq!(s9.meta.message_count, 2);
+    assert!(s9.units.iter().all(|u| !u.text.contains("二维码")));
 }
 
 /// 老库缺列(title_source / task_type / sequence 是 ALTER 追加的;parent_id 在
-/// 初始 schema 里,老库退回 parent_id IS NULL)与没装桌面端(没有 tasks-index)
-/// 都不能让整家消失
+/// 初始 schema 里,老库按它挂父会话)与没装桌面端(没有 tasks-index)都不能让整家消失
 #[test]
 fn zcode_degrades_on_old_schema_and_missing_task_index() {
     setup();
@@ -3608,23 +3702,125 @@ fn zcode_degrades_on_old_schema_and_missing_task_index() {
         INSERT INTO session VALUES ('old-2','p','old-1','/work/old','old child','0.15.2',1789000002000,1789000003000,NULL);
         INSERT INTO message VALUES ('m1','old-1',1789000000000,1789000000000,'{"role":"user","time":{"created":1789000000000}}');
         INSERT INTO part VALUES ('p1','m1','old-1',1789000000000,1789000000000,'{"type":"text","text":"老库也要能读"}');
+        INSERT INTO message VALUES ('m2','old-2',1789000002000,1789000002000,'{"role":"user","time":{"created":1789000002000}}');
+        INSERT INTO part VALUES ('p2','m2','old-2',1789000002000,1789000002000,'{"type":"text","text":"老库的子会话"}');
         "#,
     )
     .unwrap();
     drop(conn);
 
     let adapter = ZcodeAdapter::new().with_custom_root(home.path().join(".zcode"));
-    let refs = adapter.list_session_files().unwrap();
+    let mut refs = adapter.list_session_files().unwrap();
+    refs.sort_by(|a, b| a.native_id.cmp(&b.native_id));
+    assert_eq!(refs.len(), 2, "老 schema 不得整家消失");
+    // 没有 task_type 时按 parent_id 挂
     assert_eq!(
-        refs.len(),
-        1,
-        "老 schema 不得整家消失;没有 task_type 时子会话按 parent_id 不列"
+        sorted_links(adapter.as_ref()),
+        vec![edge("zcode:old-2", "zcode:old-1")]
     );
     let s = adapter.parse_session(&refs[0]).unwrap();
     assert_eq!(s.meta.title, "old schema");
     assert_eq!(s.meta.project_path, "/work/old");
     assert_eq!(s.meta.message_count, 1);
     assert!(!s.meta.archived);
+}
+
+/// 库在却读不出(不是 SQLite、表结构对不上)时列表报错,父子关系给 None:scanner 冻结这一家
+/// 这一轮,库里的会话与关系原样留着——当成没有会话会被当"磁盘已删"整批清掉(不变量 8①)。
+/// 刚建好、还没有会话表的库是确定没有
+#[test]
+fn unreadable_session_databases_freeze_instead_of_emptying() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let not_sqlite = |path: &Path| {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"not a sqlite database").unwrap();
+    };
+
+    let bad = tmp.path().join("bad").join("opencode.db");
+    not_sqlite(&bad);
+    let opencode = OpencodeAdapter::new().with_custom_root(bad);
+    assert!(opencode.list_session_files().is_err());
+    assert_eq!(opencode.parent_links(), None);
+
+    let fresh = tmp.path().join("fresh").join("opencode.db");
+    fs::create_dir_all(fresh.parent().unwrap()).unwrap();
+    rusqlite::Connection::open(&fresh)
+        .unwrap()
+        .execute_batch("CREATE TABLE other (x)")
+        .unwrap();
+    let opencode = OpencodeAdapter::new().with_custom_root(fresh);
+    assert!(opencode.list_session_files().unwrap().is_empty());
+    assert_eq!(opencode.parent_links(), Some(Vec::new()));
+
+    let agents = tmp.path().join(".openclaw").join("agents");
+    not_sqlite(&agents.join("main/agent/openclaw-agent.sqlite"));
+    let openclaw = OpenclawAdapter::new().with_custom_root(agents);
+    assert!(openclaw.list_session_files().is_err());
+    assert_eq!(openclaw.parent_links(), None);
+}
+
+/// 旧版的子代理取父会话键眼下那一条,与时间无关:旧版条目常常只有会变的 updatedAt,拿它当
+/// 开始时间的话,父会话再写一轮(updatedAt 晚于子代理)归属就跑到库里更早的窗口去了
+#[test]
+fn openclaw_legacy_children_ignore_update_times() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("agents").join("main");
+    common::copy_tree(
+        &fixture("openclaw/agents/main/sessions"),
+        &main.join("sessions"),
+    );
+    fs::create_dir_all(main.join("agent")).unwrap();
+    common::build_openclaw_db(&main.join("agent").join("openclaw-agent.sqlite"));
+    let index = main.join("sessions").join("sessions.json");
+    let later = fs::read_to_string(&index)
+        .unwrap()
+        .replace("1786179630000", "1786190000000");
+    fs::write(&index, later).unwrap();
+    let adapter = OpenclawAdapter::new().with_custom_root(tmp.path().join("agents"));
+    adapter.list_session_files().unwrap();
+    assert!(sorted_links(adapter.as_ref()).contains(&edge(
+        "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
+        "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017"
+    )));
+}
+
+/// 同一会话在 stable 与 next 两个库里各有一份时,父子关系跟 scanner 选中的那份走(更新时间新
+/// 的),而不是后读的那个库说了算
+#[test]
+fn opencode_copies_in_both_databases_follow_the_winning_copy() {
+    setup();
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("opencode");
+    fs::create_dir_all(&dir).unwrap();
+    let build = |name: &str, child_updated: i64, parent: &str| {
+        let conn = rusqlite::Connection::open(dir.join(name)).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, title TEXT,
+                 time_created INTEGER, time_updated INTEGER, model TEXT, tokens_input INTEGER,
+                 tokens_output INTEGER, tokens_reasoning INTEGER, time_archived INTEGER,
+                 version TEXT, parent_id TEXT);
+             INSERT INTO session (id, directory, title, time_created, time_updated, version)
+                 VALUES ('ses_a', '/w', 'a', 1, 1, '1'), ('ses_b', '/w', 'b', 1, 1, '1');",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session (id, directory, title, time_created, time_updated, version, parent_id)
+                 VALUES ('ses_child', '/w', 'child', 1, ?1, '1', ?2)",
+            rusqlite::params![child_updated, parent],
+        )
+        .unwrap();
+    };
+    // stable 那份更新、先读;next 那份旧、后读
+    build("opencode.db", 200, "ses_a");
+    build("opencode-next.db", 100, "ses_b");
+    let adapter = OpencodeAdapter::new().with_custom_root(dir.clone());
+    adapter.list_session_files().unwrap();
+    assert_eq!(
+        sorted_links(adapter.as_ref()),
+        vec![edge("opencode:ses_child", "opencode:ses_a")]
+    );
 }
 
 /// 自定义 location:构造器只认 home 与孤立的库文件两种形状,且只按路径整形不看
@@ -3887,7 +4083,12 @@ fn kilo_parse_contract() {
     ] {
         assert!(ids.contains(&id), "{id} 应列出: {ids:?}");
     }
-    assert!(!ids.contains(&"ses_kilo_0003"), "子代理会话不列");
+    // 子代理会话照常收录,挂到派它的会话下面
+    assert!(ids.contains(&"ses_kilo_0003"), "子代理会话也是会话");
+    assert_eq!(
+        sorted_links(&kilo),
+        vec![edge("kilo:ses_kilo_0003", "kilo:ses_kilo_0001")]
+    );
     assert!(!ids.contains(&"ses_kilo_0006"), "没有正文的会话不列");
     assert!(refs.iter().all(|r| r.agent == AgentId::Kilo));
 
@@ -4473,8 +4674,8 @@ fn hermes_legacy_schema_still_parses() {
 fn openclaw_parse_contract() {
     let env = setup();
     let adapter = OpenclawAdapter::new();
-    // 枚举:库里的活跃窗口 + reset 前旧窗口 + 旧版 jsonl;子代理(spawned_by /
-    // sessions.json 的 spawnedBy)与 checkpoint 快照都不列
+    // 枚举:库里的活跃窗口 + reset 前旧窗口 + 旧版 jsonl,子代理(spawned_by /
+    // sessions.json 的 spawnedBy)照列;checkpoint 快照不列
     let mut ids: Vec<String> = adapter
         .list_session_files()
         .expect("openclaw list")
@@ -4487,7 +4688,27 @@ fn openclaw_parse_contract() {
         vec![
             "cccccccc-aaaa-bbbb-cccc-000000000017",
             "claw-0001",
-            "claw-0003"
+            "claw-0002",
+            "claw-0003",
+            "claw-0004",
+            "claw-0005",
+            "dddddddd-aaaa-bbbb-cccc-000000000018"
+        ]
+    );
+    // 只记了父会话的键 agent:main:main 的:库里的 claw-0002 挑那个键在它创建时用着的窗口,
+    // 落在 reset 之后的 claw-0001;旧版的子代理取那个键眼下那一条(旧版那份)。claw-0004 记了
+    // 确切的父会话,哪怕按时间该是 claw-0001 也挂到它记的 claw-0003;claw-0005 是同一个键
+    // 复用之前的旧窗口,条目里那个确切的父会话不归它,按它自己那一行的键挂到 claw-0001
+    assert_eq!(
+        sorted_links(&adapter),
+        vec![
+            edge("openclaw:claw-0002", "openclaw:claw-0001"),
+            edge("openclaw:claw-0004", "openclaw:claw-0003"),
+            edge("openclaw:claw-0005", "openclaw:claw-0001"),
+            edge(
+                "openclaw:dddddddd-aaaa-bbbb-cccc-000000000018",
+                "openclaw:cccccccc-aaaa-bbbb-cccc-000000000017"
+            ),
         ]
     );
 

@@ -1106,7 +1106,18 @@ fn reparse_for_parent_change(
         return false;
     };
     let adapter = &adapters[adapter_ix];
-    let Some(reference) = adapter.file_ref(std::path::Path::new(file_path)) else {
+    // 数据库型会话的虚拟路径(`<库>#<id>`)不是文件,`file_ref` 认不出:从这一家的会话列表里
+    // 按路径找回引用。认不回来就只能保留旧关系,父会话还在的话这条关系就一直改不了
+    let reference = adapter
+        .file_ref(std::path::Path::new(file_path))
+        .or_else(|| {
+            adapter
+                .list_session_files()
+                .ok()?
+                .into_iter()
+                .find(|reference| reference.file_path == file_path)
+        });
+    let Some(reference) = reference else {
         eprintln!("[scanner] cannot restore detached session source: {file_path}");
         return false;
     };

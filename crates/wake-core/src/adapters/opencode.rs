@@ -6,6 +6,7 @@ use anyhow::{anyhow, Result};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// OpenCode stable:`~/.local/share/opencode/opencode.db`;OpenCode 2 next 渠道
 /// 另用同目录的 `opencode-next.db`。两库可同时存在,必须并行扫描而不是二选一。
@@ -14,7 +15,8 @@ use std::path::{Path, PathBuf};
 /// message 表只有角色与时间。OpenCode 2(binary `opencode2`)的真实 next schema
 /// 仍用 session 表,正文改放 session_message(type 列
 /// user|synthetic|assistant,data JSON)。早期 preview 曾用 session_v2 表,这里也
-/// 保持兼容。parent_id 非空 = 子代理,不进列表。
+/// 保持兼容。parent_id 非空 = 子代理(task 工具派出去的)会话:照常收录,经 `parent_links`
+/// 挂到派它的会话下面。
 ///
 /// Kilo Code 是同一个引擎上的另一个产品(见 `Flavor`),`OpencodeAdapter::kilo()`
 /// 读它的 `~/.local/share/kilo/kilo.db`——WorkBuddy 之于 CodeBuddy 的同一种孪生
@@ -64,7 +66,7 @@ const KILO: Flavor = Flavor {
 struct OcDb {
     path: PathBuf,
     /// 元数据查询带全表相关子查询,按各库 mtime 分别缓存一轮扫描内的重复调用
-    rows_cache: MtimeCache<Vec<OcRow>>,
+    rows_cache: MtimeCache<Arc<Vec<OcRow>>>,
 }
 
 /// 两代 session 表的公共列(别名 s;content_len 子查询两代不同,单独拼)
@@ -75,18 +77,22 @@ const ROW_COLS: &str = "s.id, s.directory, s.title, s.time_created, s.time_updat
 fn select_from(table: &str, content_len: &str, v2_messages: &str) -> String {
     format!(
         "SELECT {ROW_COLS}, {content_len} AS content_len,
-                {v2_messages} AS v2_messages
+                {v2_messages} AS v2_messages, s.parent_id
          FROM {table} s"
     )
 }
 
-fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
-    conn.query_row(
+/// 查不到是没有这张表;查询本身出错(文件不是 SQLite、读到一半出错)往上交,别当成没有
+fn has_table(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
+    match conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
         [name],
         |_| Ok(()),
-    )
-    .is_ok()
+    ) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// 根据库内真实表组合生成一次枚举 SQL。新版 next 与 v1 共用 session 表,
@@ -96,13 +102,14 @@ fn has_table(conn: &rusqlite::Connection, name: &str) -> bool {
 /// 两代表都有行时,session_message 里有用户 / 助手消息才算 v2 转录;只有 shell /
 /// compaction 这类旁路记录的(实验开关 `*_EXPERIMENTAL_EVENT_SYSTEM` 下 v1 运行时的
 /// 零星双写,Kilo 实测)读 message + part,否则整段对话会被换成那几条
-fn rows_sql(conn: &rusqlite::Connection) -> Option<String> {
-    let has_session = has_table(conn, "session");
-    let has_session_v2 = has_table(conn, "session_v2");
-    let has_parts = has_table(conn, "part");
-    let has_messages_v2 = has_table(conn, "session_message");
+/// Ok(None) = 没有会话表
+fn rows_sql(conn: &rusqlite::Connection) -> rusqlite::Result<Option<String>> {
+    let has_session = has_table(conn, "session")?;
+    let has_session_v2 = has_table(conn, "session_v2")?;
+    let has_parts = has_table(conn, "part")?;
+    let has_messages_v2 = has_table(conn, "session_message")?;
     if !has_session && !has_session_v2 {
-        return None;
+        return Ok(None);
     }
 
     let part_len = "(SELECT COALESCE(SUM(LENGTH(p.data)), 0) FROM part p \
@@ -117,10 +124,7 @@ fn rows_sql(conn: &rusqlite::Connection) -> Option<String> {
     // 早期 preview schema:session_v2 是全集,session 仅作 v1 回捞。
     if has_session_v2 {
         let len = if has_messages_v2 { message_len } else { "0" };
-        selects.push(format!(
-            "{} WHERE s.parent_id IS NULL",
-            select_from("session_v2", len, "1")
-        ));
+        selects.push(select_from("session_v2", len, "1"));
     }
 
     if has_session {
@@ -133,20 +137,20 @@ fn rows_sql(conn: &rusqlite::Connection) -> Option<String> {
             (false, true) => (message_len.to_string(), "1".to_string()),
             (false, false) => ("0".to_string(), "0".to_string()),
         };
-        let mut sql = format!(
-            "{} WHERE s.parent_id IS NULL",
-            select_from("session", &len, &v2)
-        );
+        let mut sql = select_from("session", &len, &v2);
         if has_session_v2 {
-            sql.push_str(" AND s.id NOT IN (SELECT id FROM session_v2)");
+            sql.push_str(" WHERE s.id NOT IN (SELECT id FROM session_v2)");
         }
         selects.push(sql);
     }
-    Some(selects.join(" UNION ALL "))
+    Ok(Some(selects.join(" UNION ALL ")))
 }
 
+/// 没有 session 表的库(刚建好、还没迁移)是确定没有会话,不是读不出
 fn query_rows(conn: &rusqlite::Connection, id: Option<&str>) -> Result<Vec<OcRow>> {
-    let sql = rows_sql(conn).ok_or_else(|| anyhow!("opencode database has no session table"))?;
+    let Some(sql) = rows_sql(conn)? else {
+        return Ok(Vec::new());
+    };
     let sql = match id {
         Some(_) => format!("SELECT * FROM ({sql}) WHERE id = ?1"),
         None => sql,
@@ -176,6 +180,9 @@ fn row_from(r: &rusqlite::Row) -> rusqlite::Result<OcRow> {
         version: r.get::<_, Option<String>>(8)?.unwrap_or_default(),
         content_len: r.get(9)?,
         v2_messages: r.get::<_, i64>(10)? != 0,
+        parent: r
+            .get::<_, Option<String>>(11)?
+            .filter(|parent| !parent.is_empty()),
     })
 }
 
@@ -278,11 +285,12 @@ impl OpencodeAdapter {
         open_sqlite_ro(db, self.flavor.dir)
     }
 
-    fn rows(&self, db: &OcDb) -> Option<Vec<OcRow>> {
+    /// None = 库在却读不出(打不开、查询出错)
+    fn rows(&self, db: &OcDb) -> Option<Arc<Vec<OcRow>>> {
         let mtime = super::sqlite_ro::db_cache_stamp(&db.path);
         db.rows_cache.get_or_try_build(mtime, || {
             let ro = self.open(&db.path)?;
-            query_rows(&ro.conn, None).ok()
+            query_rows(&ro.conn, None).ok().map(Arc::new)
         })
     }
 
@@ -304,7 +312,7 @@ impl OpencodeAdapter {
             .and_then(|m| m.get("id").and_then(|v| v.as_str()).map(String::from));
         let project_path = canonical_project_path(&row.directory);
         SessionMeta {
-            key: format!("{}:{}", self.flavor.agent.as_str(), row.id),
+            key: session_key(self.flavor.agent, "", &row.id),
             host: String::new(),
             id: row.id.clone(),
             agent: self.flavor.agent,
@@ -636,9 +644,10 @@ impl BlockAcc {
                 self.content.push_text(&text);
             }
             // agent = 正文里 @ 了哪个代理(文字本身在 text 块里);retry = 请求重试的记录;
-            // compaction = 触发压缩的标记(摘要本身是后面那条助手消息)
+            // compaction = 触发压缩的标记(摘要本身是后面那条助手消息);timeline = ZCode 画在
+            // 对话里的分隔条(分叉、压缩进度),没有正文
             Some("step-start") | Some("step-finish") | Some("snapshot") | Some("patch")
-            | Some("agent") | Some("retry") | Some("compaction") => {}
+            | Some("agent") | Some("retry") | Some("compaction") | Some("timeline") => {}
             Some("file") if is_image_part(p) => self.push_image(p, decode_images),
             Some("file") => {}
             _ => return false,
@@ -779,6 +788,8 @@ struct OcRow {
     content_len: i64,
     /// 这条会话的正文实际来自 session_message,而不是旧 message + part。
     v2_messages: bool,
+    /// 派出这个子代理会话的会话 id
+    parent: Option<String>,
 }
 
 impl OcRow {
@@ -801,10 +812,14 @@ impl AgentAdapter for OpencodeAdapter {
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
         let mut out = Vec::new();
-        for db in &self.dbs {
-            let Some(rows) = self.rows(db) else { continue };
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮(不变量 8①)——
+        // 当成没有会话的话,这一轮会把整家会话当"磁盘已删"清掉
+        for db in self.dbs.iter().filter(|db| db.path.is_file()) {
+            let rows = self
+                .rows(db)
+                .ok_or_else(|| anyhow!("{} exists but could not be read", db.path.display()))?;
             out.extend(
-                rows.into_iter()
+                rows.iter()
                     .filter(|row| row.content_len > 0)
                     .map(|row| SessionFileRef {
                         agent: self.flavor.agent,
@@ -816,6 +831,47 @@ impl AgentAdapter for OpencodeAdapter {
             );
         }
         Ok(out)
+    }
+
+    fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// 子代理会话那一行的 parent_id,取这一轮枚举读到的那份(`MtimeCache::latest`:扫描末尾
+    /// 才问到这里,库在扫描期间被写过时按戳重读就是把整个枚举查询再跑一遍)。库不在 = 没有
+    /// 关系;库在却从没读成功过 = 不知道(None),库里的关系原样保留
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        let mut snapshots = Vec::new();
+        for db in self.dbs.iter().filter(|db| db.path.is_file()) {
+            snapshots.push((db, db.rows_cache.latest()?));
+        }
+        // 同一会话在 stable 与 next 两个库里各有一份时,关系跟 scanner 选中的那份走(两个库
+        // 位次相同:更新时间新的,平局虚拟路径小的);每个库各报一遍的话,后报的说了算
+        let mut chosen: HashMap<&str, (&OcDb, &OcRow)> = HashMap::new();
+        for (db, rows) in &snapshots {
+            for row in rows.iter() {
+                let wins = chosen.get(row.id.as_str()).is_none_or(|(best_db, best)| {
+                    row.updated_ms > best.updated_ms
+                        || (row.updated_ms == best.updated_ms
+                            && virtual_path(&db.path, &row.id)
+                                < virtual_path(&best_db.path, &best.id))
+                });
+                if wins {
+                    chosen.insert(&row.id, (db, row));
+                }
+            }
+        }
+        Some(super::link_keys(
+            self.flavor.agent,
+            chosen
+                .into_iter()
+                .filter_map(|(id, (_, row))| Some((id, row.parent.as_deref()?))),
+        ))
+    }
+
+    /// 关系记在子会话自己那一行:多 location 下按子会话的胜出副本认边
+    fn parent_links_in_child(&self) -> bool {
+        true
     }
 
     fn quick_meta(&self, refs: &[SessionFileRef]) -> Option<HashMap<String, SessionMeta>> {

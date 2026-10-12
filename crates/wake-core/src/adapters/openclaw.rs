@@ -27,18 +27,25 @@ use std::sync::{Arc, Mutex};
 /// scanner 按 mtime 裁决(不变量 8⑦),这里不做二选一。
 /// 消息形状即 pi-ai,渲染核心与 pi.rs 共用(pi_format);OpenClaw 独有的是
 /// thinking 块、`runtimeContextCarrier` 归 Meta、compaction/branch_summary/
-/// custom_message/session_info 四种条目。spawned_by 非空 = 子代理,不列。
+/// custom_message/session_info 四种条目。
+///
+/// 派生出来的子代理(`spawnedBy`)与面板上开的子会话(`parentSessionKey`)照常列出,经
+/// `parent_links` 挂到父会话下。条目(库里的 entry_json 与旧版 sessions.json 同一个形状)
+/// 记了父会话的确切 id(`parentSessionId` / `spawnedBySessionId`)就用它——库里的条目只描述
+/// 这个键眼下那一窗,子会话键被复用时旧窗口用它自己那一行记的。只记了会话键的:库里的子会话
+/// 挑那个键在它创建时用着的窗口(一个键 reset 之后对应好几个窗口);旧版只知道每个键眼下那
+/// 一条,旧版的子会话就取它(旧版 OpenClaw 也是按键跳转)。同一会话两代都有时以库里的为准。
 pub struct OpenclawAdapter {
     /// `<state dir>/agents`
     root: PathBuf,
     /// 每库一份窗口行缓存(键 = 库路径),按库(含 -wal)mtime 失效
-    rows_cache: Mutex<HashMap<PathBuf, Arc<MtimeCache<Vec<ClawRow>>>>>,
+    rows_cache: Mutex<HashMap<PathBuf, Arc<MtimeCache<Arc<Vec<ClawRow>>>>>>,
     /// 旧版 sessions.json 索引,每个 sessions 目录一份,按文件 mtime 失效
     index_cache: Mutex<HashMap<PathBuf, Arc<MtimeCache<LegacyIndex>>>>,
 }
 
-/// sessions.json 解析结果:sessionId → 条目
-type LegacyIndex = Arc<HashMap<String, Value>>;
+/// sessions.json 解析结果:sessionId → (会话键, 条目)
+type LegacyIndex = Arc<HashMap<String, (String, Value)>>;
 
 const DB_NAME: &str = "openclaw-agent.sqlite";
 /// 转录事件 JSON 的已知非内容类型:静默跳过,表外计 unknown(格式漂移金丝雀)
@@ -93,24 +100,37 @@ impl OpenclawAdapter {
         dirs
     }
 
-    fn rows(&self, db: &Path) -> Option<Vec<ClawRow>> {
-        let cache = Arc::clone(
+    fn rows_cache_of(&self, db: &Path) -> Arc<MtimeCache<Arc<Vec<ClawRow>>>> {
+        Arc::clone(
             self.rows_cache
                 .lock()
                 .unwrap()
                 .entry(db.to_path_buf())
                 .or_insert_with(|| Arc::new(MtimeCache::new())),
-        );
+        )
+    }
+
+    /// None = 库在却读不出(打不开、查询出错)
+    fn rows(&self, db: &Path) -> Option<Arc<Vec<ClawRow>>> {
         let stamp = super::sqlite_ro::db_cache_stamp(db);
-        cache.get_or_try_build(stamp, || {
+        self.rows_cache_of(db).get_or_try_build(stamp, || {
             let ro = open_sqlite_ro(db, "openclaw")?;
-            query_rows(&ro.conn)
+            query_rows(&ro.conn).map(Arc::new)
         })
     }
 
-    /// 旧版 `sessions.json`:按 sessionId 的索引(原文件按 session_key 键)
-    fn legacy_index(&self, sessions_dir: &Path) -> LegacyIndex {
+    /// 旧版 `sessions.json`:按 sessionId 的索引(原文件按会话键键)。没有这个文件是空的,
+    /// 解不开也按空的算(上游写它是先写临时文件再改名,解不开就是坏了、不会自己好);
+    /// 在却读不出(I/O)是 None
+    fn legacy_index(&self, sessions_dir: &Path) -> Option<LegacyIndex> {
         let file = sessions_dir.join("sessions.json");
+        let meta = match fs::metadata(&file) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Some(LegacyIndex::default())
+            }
+            Err(_) => return None,
+        };
         let cache = Arc::clone(
             self.index_cache
                 .lock()
@@ -118,30 +138,30 @@ impl OpenclawAdapter {
                 .entry(file.clone())
                 .or_insert_with(|| Arc::new(MtimeCache::new())),
         );
-        let stamp = fs::metadata(&file).map(|m| mtime_ms(&m)).unwrap_or(0);
-        cache
-            .get_or_try_build(stamp, || {
-                let text = fs::read_to_string(&file).ok()?;
-                let Value::Object(map) = serde_json::from_str::<Value>(&text).ok()? else {
-                    return None;
-                };
-                Some(Arc::new(
-                    map.into_values()
-                        .filter_map(|v| Some((v.get("sessionId")?.as_str()?.to_string(), v)))
-                        .collect(),
-                ))
-            })
-            .unwrap_or_default()
+        cache.get_or_try_build(mtime_ms(&meta), || {
+            let text = fs::read_to_string(&file).ok()?;
+            let map = match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(map)) => map,
+                _ => Default::default(),
+            };
+            Some(Arc::new(
+                map.into_iter()
+                    .filter_map(|(key, v)| {
+                        Some((v.get("sessionId")?.as_str()?.to_string(), (key, v)))
+                    })
+                    .collect(),
+            ))
+        })
     }
 
     fn legacy_hint(&self, path: &Path, native_id: &str) -> RowHint {
         let Some(dir) = path.parent() else {
             return RowHint::default();
         };
-        let index = self.legacy_index(dir);
+        let index = self.legacy_index(dir).unwrap_or_default();
         // topic 转录 `<sessionId>-topic-<id>.jsonl` 共用父会话的索引项
         let base = native_id.split("-topic-").next().unwrap_or(native_id);
-        let Some(v) = index.get(native_id).or_else(|| index.get(base)) else {
+        let Some((_, v)) = index.get(native_id).or_else(|| index.get(base)) else {
             return RowHint::default();
         };
         let s = |k: &str| v.get(k).and_then(Value::as_str).map(String::from);
@@ -165,7 +185,7 @@ impl OpenclawAdapter {
             .or_else(|| title_from_messages(&p.messages))
             .unwrap_or_else(|| UNTITLED.to_string());
         SessionMeta {
-            key: format!("openclaw:{}", r.native_id),
+            key: session_key(AgentId::Openclaw, "", &r.native_id),
             host: String::new(),
             id: r.native_id.clone(),
             agent: AgentId::Openclaw,
@@ -216,7 +236,11 @@ impl OpenclawAdapter {
         let db = Path::new(strip_virtual_path(&r.file_path));
         let row = self
             .rows(db)
-            .and_then(|rows| rows.into_iter().find(|row| row.session_id == r.native_id))
+            .and_then(|rows| {
+                rows.iter()
+                    .find(|row| row.session_id == r.native_id)
+                    .cloned()
+            })
             .ok_or_else(|| anyhow!("openclaw session {} not in store", r.native_id))?;
         let ro = open_sqlite_ro(db, "openclaw")
             .ok_or_else(|| anyhow!("cannot open openclaw store {}", db.display()))?;
@@ -271,7 +295,8 @@ impl OpenclawAdapter {
 #[derive(Clone)]
 struct ClawRow {
     session_id: String,
-    spawned_by: Option<String>,
+    session_key: String,
+    parent: Option<ParentRef>,
     event_count: i64,
     content_len: i64,
     hint: RowHint,
@@ -288,6 +313,32 @@ struct RowHint {
     updated_ms: i64,
 }
 
+/// 子会话指向父会话的线索
+#[derive(Clone)]
+enum ParentRef {
+    /// 确切的那一条会话
+    Session(String),
+    /// 只有会话键:reset 之后一个键对应好几个窗口,按子会话开始的时间挑
+    Key(String),
+}
+
+impl ParentRef {
+    /// `entry` 是条目(库里只给这个键眼下那一窗);`own_key` 是库里窗口行自己记的
+    /// spawned_by / parent_session_key(旧版没有)
+    fn of(entry: Option<&Value>, own_key: Option<String>) -> Option<Self> {
+        let s = |k: &str| optional_string(entry?.get(k));
+        s("parentSessionId")
+            .or_else(|| s("spawnedBySessionId"))
+            .map(Self::Session)
+            .or_else(|| {
+                own_key
+                    .or_else(|| s("spawnedBy"))
+                    .or_else(|| s("parentSessionKey"))
+                    .map(Self::Key)
+            })
+    }
+}
+
 /// 上游全部 ms 整数;防御性兼容秒,阈值与 parse_utils::to_epoch_ms 同一条线
 fn norm_ms(v: i64) -> i64 {
     to_epoch_ms(&Value::from(v))
@@ -300,7 +351,7 @@ fn query_rows(conn: &rusqlite::Connection) -> Option<Vec<ClawRow>> {
                     w.transcript_updated_at, w.started_at, w.model, w.channel, w.display_name,
                     n.label, n.display_name, n.entry_json,
                     COUNT(e.seq), COALESCE(SUM(LENGTH(e.event_json)), 0),
-                    COALESCE(MAX(e.created_at), 0)
+                    COALESCE(MAX(e.created_at), 0), w.session_key, w.parent_session_key
              FROM session_windows w
              LEFT JOIN session_nodes n ON n.session_key = w.session_key
              LEFT JOIN transcript_events e ON e.session_id = w.session_id
@@ -336,8 +387,14 @@ fn query_rows(conn: &rusqlite::Connection) -> Option<Vec<ClawRow>> {
             let tokens = is_current
                 .then(|| entry.get("totalTokens").and_then(Value::as_i64))
                 .flatten();
+            let key_at = |ix: usize| {
+                r.get::<_, Option<String>>(ix)
+                    .map(|key| key.filter(|key| !key.is_empty()))
+            };
+            let own_key = key_at(1)?.or(key_at(16)?);
             Ok(ClawRow {
-                spawned_by: r.get::<_, Option<String>>(1)?.filter(|s| !s.is_empty()),
+                session_key: r.get(15)?,
+                parent: ParentRef::of(is_current.then_some(&entry), own_key),
                 event_count: r.get(12)?,
                 content_len: r.get(13)?,
                 hint: RowHint {
@@ -555,35 +612,26 @@ impl AgentAdapter for OpenclawAdapter {
         let mut out = Vec::new();
         for dir in self.agent_dirs() {
             let db = dir.join("agent").join(DB_NAME);
+            // 库在却读不出报 Err,scanner 冻结这一家这一轮(不变量 8①)——当成没有会话的话,
+            // 这一轮会把库里的会话当"磁盘已删"清掉
             if db.is_file() {
-                if let Some(rows) = self.rows(&db) {
-                    out.extend(
-                        rows.into_iter()
-                            .filter(|row| row.spawned_by.is_none() && row.event_count > 0)
-                            .map(|row| SessionFileRef {
-                                agent: AgentId::Openclaw,
-                                native_id: row.session_id.clone(),
-                                file_path: virtual_path(&db, &row.session_id),
-                                mtime_ms: row.hint.updated_ms,
-                                size: row.content_len,
-                            }),
-                    );
-                }
+                let rows = self
+                    .rows(&db)
+                    .ok_or_else(|| anyhow!("{} exists but could not be read", db.display()))?;
+                out.extend(rows.iter().filter(|row| row.event_count > 0).map(|row| {
+                    SessionFileRef {
+                        agent: AgentId::Openclaw,
+                        native_id: row.session_id.clone(),
+                        file_path: virtual_path(&db, &row.session_id),
+                        mtime_ms: row.hint.updated_ms,
+                        size: row.content_len,
+                    }
+                }));
             }
             let sessions = dir.join("sessions");
             let Ok(entries) = fs::read_dir(&sessions) else {
                 continue;
             };
-            let index = self.legacy_index(&sessions);
-            let spawned: HashSet<&str> = index
-                .iter()
-                .filter(|(_, v)| {
-                    v.get("spawnedBy")
-                        .and_then(Value::as_str)
-                        .is_some_and(|s| !s.is_empty())
-                })
-                .map(|(id, _)| id.as_str())
-                .collect();
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
                 if !is_legacy_transcript(&name) {
@@ -594,10 +642,6 @@ impl AgentAdapter for OpenclawAdapter {
                     continue;
                 }
                 let stem = name.strip_suffix(".jsonl").unwrap_or(&name);
-                let base = stem.split("-topic-").next().unwrap_or(stem);
-                if spawned.contains(stem) || spawned.contains(base) {
-                    continue;
-                }
                 out.push(SessionFileRef {
                     agent: AgentId::Openclaw,
                     native_id: stem.to_string(),
@@ -624,6 +668,89 @@ impl AgentAdapter for OpenclawAdapter {
             return None;
         }
         default_file_ref(AgentId::Openclaw, path)
+    }
+
+    fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// 库里的窗口与旧版索引一起认:父会话可能在另一个 agent 的库里(跨 agent 派生),也可能
+    /// 只剩旧版 jsonl。库在却从没读成功过、索引读不出 = 不知道(None),库里的关系原样保留
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        // 库里的窗口取这一轮枚举读到的那份(`MtimeCache::latest`:扫描末尾才问到这里,库在扫描
+        // 期间被写过时按戳重读就是把整个枚举查询再跑一遍)
+        let mut snapshots = Vec::new();
+        let mut legacy = Vec::new();
+        for dir in self.agent_dirs() {
+            let db = dir.join("agent").join(DB_NAME);
+            if db.is_file() {
+                snapshots.push(self.rows_cache_of(&db).latest()?);
+            }
+            legacy.push(self.legacy_index(&dir.join("sessions"))?);
+        }
+        let db_rows = || snapshots.iter().flat_map(|rows| rows.iter());
+        let legacy_entries = || legacy.iter().flat_map(|index| index.iter());
+        // 会话键 → 库里它的窗口(创建时间, 会话 id);旧版只知道每个键眼下那一条
+        let mut windows: HashMap<&str, Vec<(i64, &str)>> = HashMap::new();
+        for row in db_rows() {
+            windows
+                .entry(&row.session_key)
+                .or_default()
+                .push((row.hint.created_ms, &row.session_id));
+        }
+        for list in windows.values_mut() {
+            list.sort_unstable();
+        }
+        let current: HashMap<&str, &str> = legacy_entries()
+            .map(|(id, (key, _))| (key.as_str(), id.as_str()))
+            .collect();
+        // 库里的子会话:那个键在它创建时用着的窗口(不晚于它的最后一个,都晚于它就取最早的),
+        // 库里没有这个键才退到旧版那一条
+        let db_parent = |key: &str, at: i64| match windows.get(key) {
+            Some(list) => list
+                .iter()
+                .rev()
+                .find(|(start, _)| *start <= at)
+                .or(list.first())
+                .map(|(_, id)| *id),
+            None => current.get(key).copied(),
+        };
+        // 旧版的子会话:那个键眼下那一条,旧版里没有这个键才退到库里最新的窗口
+        let legacy_parent = |key: &str| {
+            current
+                .get(key)
+                .copied()
+                .or_else(|| windows.get(key)?.last().map(|(_, id)| *id))
+        };
+        let db_links = db_rows().filter_map(|row| {
+            let parent = match row.parent.as_ref()? {
+                ParentRef::Session(id) => id.as_str(),
+                ParentRef::Key(key) => db_parent(key, row.hint.created_ms)?,
+            };
+            Some((row.session_id.as_str(), parent))
+        });
+        // 同一会话两代都有(迁进库后旧 jsonl 还在)时关系以库里的为准:旧版只记了父会话的键
+        let in_db: HashSet<&str> = db_rows().map(|row| row.session_id.as_str()).collect();
+        let legacy_children: Vec<(&str, ParentRef)> = legacy_entries()
+            .filter(|(id, _)| !in_db.contains(id.as_str()))
+            .filter_map(|(id, (_, entry))| Some((id.as_str(), ParentRef::of(Some(entry), None)?)))
+            .collect();
+        let legacy_links = legacy_children.iter().filter_map(|(id, parent)| {
+            let parent = match parent {
+                ParentRef::Session(parent) => parent.as_str(),
+                ParentRef::Key(key) => legacy_parent(key)?,
+            };
+            Some((*id, parent))
+        });
+        Some(super::link_keys(
+            AgentId::Openclaw,
+            db_links.chain(legacy_links),
+        ))
+    }
+
+    /// 关系记在子会话自己的条目里:多 location 下按子会话的胜出副本认边
+    fn parent_links_in_child(&self) -> bool {
+        true
     }
 
     // quick_meta 不覆写:库行给不出标题的可靠来源(名字在 session_info 事件里),

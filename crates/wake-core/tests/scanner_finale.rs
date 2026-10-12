@@ -1664,6 +1664,87 @@ fn antigravity_transcript_takes_over_its_index_card() {
     assert_eq!(rows(), 1);
 }
 
+/// Antigravity 的父子关系记在整个 `.gemini` 共用的索引里,转录却可能归另一个只选了 brain
+/// 的 location:父子两条会话的转录都在那边时,报边的默认实例两头都不拥有,关系照样挂上
+///(`parent_links_global`,Codex 那张总表的同一条兜底)
+#[test]
+fn antigravity_child_nests_when_its_transcripts_live_elsewhere() {
+    use common::AgIndexRow;
+    use wake_core::adapters::antigravity::AntigravityAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let gemini = home.path().join(".gemini");
+    common::build_antigravity_index(
+        &gemini,
+        &[
+            AgIndexRow {
+                id: "ag-1",
+                preview: "Dashboard buttons",
+                workspace: "/Users/tester/Github/dashboard",
+                app: "antigravity",
+                ..Default::default()
+            },
+            AgIndexRow {
+                id: "ag-2",
+                preview: "Spawned helper",
+                workspace: "/Users/tester/Github/dashboard",
+                parent: "ag-1",
+                app: "antigravity",
+            },
+        ],
+    );
+    let elsewhere = home.path().join("backup").join("brain");
+    common::stage_antigravity_transcript(&elsewhere, "ag-1", &[]);
+    let child = common::stage_antigravity_transcript(&elsewhere, "ag-2", &[]);
+    let adapters: Vec<Box<dyn AgentAdapter>> = vec![
+        AntigravityAdapter::new().with_custom_root(gemini.clone()),
+        AntigravityAdapter::new().with_custom_root(elsewhere.clone()),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let s = store
+        .get_session("antigravity:ag-2")
+        .unwrap()
+        .expect("子会话入库");
+    assert_eq!(s.file_path, child.to_string_lossy(), "转录压过索引里的卡片");
+    assert_eq!(
+        store.parent_key_of("antigravity:ag-2").unwrap().as_deref(),
+        Some("antigravity:ag-1")
+    );
+}
+
+/// 数据库型会话(虚拟路径 `<库>#<id>`)换了父会话:scanner 解挂前要从子会话自己的文件重解析,
+/// `file_ref` 认不出虚拟路径,得从这一家的会话列表里找回引用——找不回来时,旧父会话还在就
+/// 一直留着旧关系
+#[test]
+fn database_session_moves_to_its_new_parent() {
+    use wake_core::adapters::zcode::ZcodeAdapter;
+    let home = tempfile::tempdir().unwrap();
+    let zcode = home.path().join(".zcode");
+    let db = zcode.join("cli/db/db.sqlite");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    common::build_zcode_db(&db);
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ZcodeAdapter::new().with_custom_root(zcode.clone())];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert_eq!(
+        store.parent_key_of("zcode:zc-0005").unwrap().as_deref(),
+        Some("zcode:zc-0001")
+    );
+
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch("UPDATE session SET parent_id = 'zc-0011' WHERE id = 'zc-0005'")
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    assert_eq!(
+        store.parent_key_of("zcode:zc-0005").unwrap().as_deref(),
+        Some("zcode:zc-0011")
+    );
+}
+
 /// Grok Bot:副本是 app 的滚动缓存——对话被清出缓存时卡片接替(同一个 key,库里始终一行),
 /// 缓存回来时副本接回;侧栏里改名时副本文件没动,全量扫描靠引用里并进的指纹认出来;删除只是
 /// 隐藏:缓存文件原样留在原处,下一轮扫描也不会把它当成"从废纸篓放回来了"而撤掉墓碑
@@ -1897,6 +1978,14 @@ fn kilo_migrated_task_prefers_the_database_copy() {
             store.parent_key_of(&child.key).unwrap().as_deref(),
             Some(legacy_task_key("01944f77-3500-7abc-8def-0123456789ab").as_str()),
             "legacy_first={legacy_first}:子任务挂回父任务"
+        );
+        assert_eq!(
+            store
+                .parent_key_of("kilo:ses_kilo_0003")
+                .unwrap()
+                .as_deref(),
+            Some("kilo:ses_kilo_0001"),
+            "legacy_first={legacy_first}:新版的子代理会话挂在派它的会话下面"
         );
     }
 

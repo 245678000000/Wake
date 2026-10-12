@@ -13,11 +13,19 @@
 //! (首启向导从 Claude Code 导入的对话——原家已经索引过,再列一遍就是双份)。
 //! 它不产生会话,不进 data_roots(不变量 8);读不出来 = 什么都不藏。
 //!
-//! 哪些会话算用户的:按 `session.task_type` **白名单** interactive / fork /
-//! selection_side_chat(后两种带 parent_id——用户从某条会话分出去的对话,桌面端
-//! 照样列在任务里,所以不能按 parent_id 一刀切);subagent_child / workflow_child
-//! 这类运行时会话不列。未知类型不列(dsh 同款取舍:宁可少列也不放 Untitled 噪音)。
-//! task_type 是 ALTER 追加的列,老库退回 `parent_id IS NULL`(OpenCode 语义)。
+//! 列哪些会话、挂不挂,照桌面端自己的分法(源码 task-list-session-membership.ts):任务列表
+//! 里的 interactive / fork / workflow_parent 顶层列出(fork 也带 parent_id,但它在任务列表
+//! 里,不挂);辅助对话 selection_side_chat、子代理 subagent_child、工作流的子会话
+//! workflow_child / nested_workflow_child 桌面端放在父任务里展示,这里经 `parent_links`
+//! 挂到父会话下面。未知类型不列(dsh 同款取舍:宁可少列也不放 Untitled 噪音)。task_type
+//! 是 ALTER 追加的列,老库没有它时按 OpenCode 语义:parent_id 非空就是子会话。桌面端删掉
+//! 的任务连同挂在它下面的一起藏:子会话在 cli 库里留着,不藏就成了顶层的孤儿。
+//!
+//! 分叉与辅助对话开头都是从父任务复制来的历史:分叉照原样复制、末尾一条 `fork_notice`;
+//! 辅助对话复制来的全标了隐藏,末尾是一条 source 为 selection_side_chat 的 system_reminder
+//! (父任务的压缩摘要照样带着 compact_summary,不折就会露出来)。两种都在最后一条边界处折成
+//! 一条 Meta,token 与模型只算边界之后的。辅助对话的标题恒为 "Selection side chat"(桌面端
+//! 只给顶层的 interactive 生成标题),退回首条提问。
 //!
 //! Meta 判据两条并列:`semantics.transcriptVisibility == "hidden"`(源码里 fork
 //! 通知、system reminder、compaction 摘要都这么标,任一角色)与用户消息的
@@ -63,6 +71,7 @@ use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const HOME_DIR_NAME: &str = ".zcode";
 /// 会话与正文的唯一来源,相对 ZCode home
@@ -71,6 +80,15 @@ const DB_REL: &str = "cli/db/db.sqlite";
 const TASKS_REL: &str = "v2/tasks-index.sqlite";
 /// 按项目的记忆目录,相对 ZCode home:`<slug>-<hash>/memory/*.md`
 const MEMORIES_REL: &str = "cli/memories/projects";
+/// 桌面端任务列表里的类型(源码 `TASK_LIST_SESSION_TYPES`),顶层列出
+const TASK_LIST_TYPES: [&str; 3] = ["interactive", "fork", "workflow_parent"];
+/// 桌面端放在父任务里展示的类型:辅助对话、子代理、工作流的子会话,挂到父会话下
+const CHILD_TYPES: [&str; 4] = [
+    "selection_side_chat",
+    "subagent_child",
+    "workflow_child",
+    "nested_workflow_child",
+];
 
 pub struct ZcodeAdapter {
     db: PathBuf,
@@ -79,7 +97,7 @@ pub struct ZcodeAdapter {
     /// ZCode home(记忆目录的所在);孤立的库拷贝没有——侧档绝不越界摸父目录(不变量 8⑨)
     home: Option<PathBuf>,
     /// 枚举查询带全表相关子查询,按库 mtime 缓存一轮扫描内的重复调用
-    rows_cache: MtimeCache<Vec<ZcRow>>,
+    rows_cache: MtimeCache<Arc<Vec<ZcRow>>>,
     /// tasks-index 里要藏的会话 id,按它自己的 mtime 缓存
     hidden_cache: MtimeCache<HashSet<String>>,
     /// 记忆文档按目录指纹缓存(每轮扫描都会列,没变不重读)
@@ -91,13 +109,15 @@ struct ZcRow {
     id: String,
     directory: String,
     title: String,
-    /// title_source == "default":桌面端还没来得及生成标题的占位(源码里配的是空 title)
+    /// 占位标题:title_source 为 default(源码里配的是空 title),或辅助对话的固定标签
     placeholder_title: bool,
     created_ms: i64,
     updated_ms: i64,
     archived: bool,
     /// part.data 总长——空会话过滤与 SessionFileRef.size 的脏判据(单会话取行时不算)
     content_len: i64,
+    /// 挂在哪个会话下(`CHILD_TYPES`;fork 也带 parent_id,但不挂)
+    parent: Option<String>,
 }
 
 /// ALTER 追加的列各自在不在(初始 schema 的列不用探)
@@ -137,7 +157,7 @@ impl ZcSchema {
     }
 }
 
-/// 一次会话解析的产物:正文之外还带枚举列里没有的 token 累计
+/// 一次会话解析的产物:正文之外还带枚举列里没有的 token 累计(只算复制来的历史之后的)
 struct Parsed {
     messages: Vec<TranscriptMessage>,
     unknown: u32,
@@ -191,8 +211,8 @@ impl ZcodeAdapter {
         let workspaces: HashMap<String, String> = self
             .rows()
             .unwrap_or_default()
-            .into_iter()
-            .map(|row| (memory_dir_hash(&row.directory), row.directory))
+            .iter()
+            .map(|row| (memory_dir_hash(&row.directory), row.directory.clone()))
             .collect();
         super::project_tree_units(source, |entry| {
             let project_path = entry
@@ -206,14 +226,20 @@ impl ZcodeAdapter {
         })
     }
 
-    /// 行清单。库这一刻读不出(ZCode 原地 migration、copy 梯度失败)交回**上一次读到
-    /// 的**:枚举接口表达不了"不知道",而空清单会让 scanner 把整家会话当"磁盘已删"
-    /// 清掉、下一轮再全部重解析回来;从没读成功过才是 None(2026-09-21 review)
-    fn rows(&self) -> Option<Vec<ZcRow>> {
+    /// 行清单,列表与 parent_links 共用这一份三态。库不在 = 确定没有(空,不交回缓存里的
+    /// 旧行——Antigravity 的 index 同一条);库这一刻读不出(ZCode 原地 migration、copy
+    /// 梯度失败)交回**上一次读到的**:空清单会让 scanner 把整家会话当"磁盘已删"清掉、
+    /// 下一轮再全部重解析回来;库在却从没读成功过才是 None = 不知道(2026-09-21 review)
+    fn rows(&self) -> Option<Arc<Vec<ZcRow>>> {
+        if !self.db.is_file() {
+            return Some(Arc::default());
+        }
         let stamp = db_cache_stamp(&self.db);
         self.rows_cache.get_or_stale(stamp, || {
             let ro = self.open()?;
-            query_rows(&ro.conn, ZcSchema::probe(&ro.conn), None).ok()
+            query_rows(&ro.conn, ZcSchema::probe(&ro.conn), None)
+                .ok()
+                .map(Arc::new)
         })
     }
 
@@ -254,16 +280,18 @@ impl ZcodeAdapter {
 }
 
 fn build_meta(r: &SessionFileRef, row: &ZcRow, parsed: &Parsed) -> SessionMeta {
-    // 占位标题退回首条真人消息;其余三级(first_input / generated / custom)
-    // 库里的就是最终值
-    let title = (!row.placeholder_title)
-        .then_some(row.title.as_str())
-        .map(clean_title_candidate)
-        .filter(|t| !t.is_empty())
-        .or_else(|| title_from_messages(&parsed.messages))
-        .unwrap_or_else(|| UNTITLED.to_string());
+    // 占位标题退回首条真人消息,一句都没有才用它;其余三级(first_input / generated /
+    // custom)库里的就是最终值
+    let stored = Some(clean_title_candidate(&row.title)).filter(|t| !t.is_empty());
+    let asked = || title_from_messages(&parsed.messages);
+    let title = if row.placeholder_title {
+        asked().or(stored)
+    } else {
+        stored.or_else(asked)
+    }
+    .unwrap_or_else(|| UNTITLED.to_string());
     SessionMeta {
-        key: format!("zcode:{}", row.id),
+        key: session_key(AgentId::Zcode, "", &row.id),
         host: String::new(),
         id: row.id.clone(),
         agent: AgentId::Zcode,
@@ -292,7 +320,7 @@ fn build_meta(r: &SessionFileRef, row: &ZcRow, parsed: &Parsed) -> SessionMeta {
         model: parsed.messages.iter().rev().find_map(|m| m.model.clone()),
         tokens_used: (parsed.tokens > 0).then_some(parsed.tokens),
         archived: row.archived,
-        // task_type 只有 interactive / fork / selection_side_chat 会列,没有可打的 via 徽章
+        // 列出的都是桌面端里的任务或任务里的会话,没有可打的 via 徽章
         source: None,
         favorite: false,
         pinned: false,
@@ -329,12 +357,19 @@ fn query_rows(
     } else {
         "'first_input'"
     };
-    // 用户自己的会话才列(白名单,见模块注释);老库没有 task_type 退回
-    // parent_id IS NULL(OpenCode 语义)
-    let listed = if schema.task_type {
-        "s.task_type IN ('interactive', 'fork', 'selection_side_chat')"
+    // 类型定列不列、挂不挂(见模块注释);老库没有 task_type:全列,parent_id 非空就挂
+    let (task_type, listed) = if schema.task_type {
+        let known: Vec<String> = TASK_LIST_TYPES
+            .iter()
+            .chain(&CHILD_TYPES)
+            .map(|t| format!("'{t}'"))
+            .collect();
+        (
+            "s.task_type",
+            format!("s.task_type IN ({})", known.join(", ")),
+        )
     } else {
-        "s.parent_id IS NULL"
+        ("NULL", "1".to_string())
     };
     let content_len = if id.is_some() {
         "0"
@@ -343,20 +378,34 @@ fn query_rows(
     };
     let sql = format!(
         "SELECT s.id, s.directory, s.title, {title_source}, s.time_created, s.time_updated,
-                s.time_archived, {content_len}
+                s.time_archived, {content_len}, s.parent_id, {task_type}
          FROM session s WHERE {listed} AND (?1 IS NULL OR s.id = ?1)"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([id], |r| {
+        let task_type = r.get::<_, Option<String>>(9)?;
+        let side_chat = task_type.as_deref() == Some("selection_side_chat");
         Ok(ZcRow {
             id: r.get(0)?,
             directory: r.get::<_, Option<String>>(1)?.unwrap_or_default(),
             title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-            placeholder_title: r.get::<_, Option<String>>(3)?.as_deref() == Some("default"),
+            placeholder_title: match r.get::<_, Option<String>>(3)?.as_deref() {
+                Some("default") => true,
+                Some("generated") => side_chat,
+                _ => false,
+            },
             created_ms: r.get::<_, Option<i64>>(4)?.unwrap_or(0),
             updated_ms: r.get::<_, Option<i64>>(5)?.unwrap_or(0),
             archived: r.get::<_, Option<i64>>(6)?.is_some(),
             content_len: r.get::<_, Option<i64>>(7)?.unwrap_or(0),
+            parent: r
+                .get::<_, Option<String>>(8)?
+                .filter(|parent| !parent.is_empty())
+                .filter(|_| {
+                    task_type
+                        .as_deref()
+                        .is_none_or(|t| CHILD_TYPES.contains(&t))
+                }),
         })
     })?;
     rows.collect()
@@ -395,9 +444,29 @@ fn read_hidden(tasks_db: &Path) -> Option<HashSet<String>> {
     rows.collect::<rusqlite::Result<HashSet<_>>>().ok()
 }
 
-/// OpenCode 的 v1 两表循环 + ZCode 自己的三处差异:assistant 顶层 modelId、
+/// 桌面端藏起来的任务连同挂在它下面的会话(`parent` 只认 `CHILD_TYPES`,桌面端删掉
+/// 父任务时分叉照样留在任务列表里)。一遍遍把父会话已在名单里的加进来,直到不再变多
+fn with_children(rows: &[ZcRow], mut hidden: HashSet<String>) -> HashSet<String> {
+    loop {
+        let before = hidden.len();
+        for row in rows {
+            if row
+                .parent
+                .as_ref()
+                .is_some_and(|parent| hidden.contains(parent))
+            {
+                hidden.insert(row.id.clone());
+            }
+        }
+        if hidden.len() == before {
+            return hidden;
+        }
+    }
+}
+
+/// OpenCode 的 v1 两表循环 + ZCode 自己的几处差异:assistant 顶层 modelId、
 /// tokens.total 按调用累加(failed turn 没有 part、出不了消息,token 也照记)、
-/// semantics 归 Meta / CompactSummary
+/// semantics 归 Meta / CompactSummary,以及从父任务复制来的历史(见模块注释)
 fn parse_messages(
     ro: &SqliteRo,
     sid: &str,
@@ -405,29 +474,47 @@ fn parse_messages(
     order: &V1Order,
 ) -> Result<Parsed> {
     let mut tokens = 0i64;
-    let (messages, unknown) =
+    // 已拼出几条消息;最后一条复制边界(含)之前有几条
+    let mut built = 0usize;
+    let mut inherited = 0usize;
+    let (mut messages, unknown) =
         parse_v1_messages(ro, sid, decode_images, order, |md, role, message| {
+            let semantics = md.get("semantics");
+            let semantic = |key: &str| semantics.and_then(|s| s.get(key)).and_then(Value::as_str);
             if role == Role::Assistant {
                 tokens += md
                     .pointer("/tokens/total")
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
             }
-            let Some(m) = message else { return };
-            if role == Role::Assistant {
-                m.model = optional_string(md.get("modelId"));
+            if let Some(m) = message {
+                built += 1;
+                if role == Role::Assistant {
+                    m.model = optional_string(md.get("modelId"));
+                }
+                let hidden = semantic("transcriptVisibility") == Some("hidden");
+                let injected = role == Role::User
+                    && semantic("origin").is_some_and(|origin| origin != "real_user");
+                if semantic("kind") == Some("compact_summary") {
+                    m.kind = MessageKind::CompactSummary;
+                } else if hidden || injected {
+                    m.kind = MessageKind::Meta;
+                }
             }
-            let semantics = md.get("semantics");
-            let semantic = |key: &str| semantics.and_then(|s| s.get(key)).and_then(Value::as_str);
-            let hidden = semantic("transcriptVisibility") == Some("hidden");
-            let injected = role == Role::User
-                && semantic("origin").is_some_and(|origin| origin != "real_user");
-            if semantic("kind") == Some("compact_summary") {
-                m.kind = MessageKind::CompactSummary;
-            } else if hidden || injected {
-                m.kind = MessageKind::Meta;
+            let boundary = match semantic("kind") {
+                Some("fork_notice") => true,
+                Some("system_reminder") => semantic("source") == Some("selection_side_chat"),
+                _ => false,
+            };
+            if boundary {
+                inherited = built;
+                tokens = 0;
             }
         })?;
+    // 辅助对话复制来的虽然都标了隐藏,父任务的压缩摘要照样是 CompactSummary、会露出来,
+    // 一律折掉(桌面端的辅助对话也是从空白开始)
+    collapse_inherited(&mut messages, inherited, "task");
+    assign_seq(&mut messages);
     Ok(Parsed {
         messages,
         unknown,
@@ -441,28 +528,45 @@ impl AgentAdapter for ZcodeAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        // 库不在 = 没有会话(Ok 空,不变量 8①);库在但从没读成功过(ZCode 常驻、正在原地
-        // migration)= 不知道,报 Err 让这一轮扫描停下——折成空会让 seen_paths 清理把整家
-        // 会话当"磁盘已删"删掉、下一轮再全部重解析回来(2026-09-22 review)
-        let rows = match self.rows() {
-            Some(rows) => rows,
-            None if self.db.is_file() => {
-                anyhow::bail!("{} exists but could not be read", self.db.display())
-            }
-            None => Vec::new(),
-        };
-        let hidden = self.hidden();
+        // 库在但从没读成功过(ZCode 常驻、正在原地 migration)= 不知道,报 Err 让 scanner
+        // 冻结这一家这一轮——折成空会让 seen_paths 清理把整家会话当"磁盘已删"删掉、下一轮
+        // 再全部重解析回来(2026-09-22 review);库不在是 Ok 空(不变量 8①)
+        let rows = self
+            .rows()
+            .ok_or_else(|| anyhow!("{} exists but could not be read", self.db.display()))?;
+        let hidden = with_children(&rows, self.hidden());
         Ok(rows
-            .into_iter()
+            .iter()
             .filter(|row| row.content_len > 0 && !hidden.contains(&row.id))
             .map(|row| SessionFileRef {
                 agent: AgentId::Zcode,
+                native_id: row.id.clone(),
                 file_path: virtual_path(&self.db, &row.id),
-                native_id: row.id,
                 mtime_ms: row.updated_ms,
                 size: row.content_len,
             })
             .collect())
+    }
+
+    fn manages_parent_links(&self) -> bool {
+        true
+    }
+
+    /// `CHILD_TYPES` 那几种会话的 parent_id。库在却从没读成功过 = 不知道(None),库里的
+    /// 关系原样保留。这里照常按库戳读:扫描收尾的记忆同步(`tree_units`)本来就要按戳重读
+    /// 一次,先读的那次把缓存焐热
+    fn parent_links(&self) -> Option<Vec<(String, String)>> {
+        let rows = self.rows()?;
+        Some(super::link_keys(
+            AgentId::Zcode,
+            rows.iter()
+                .filter_map(|row| Some((row.id.as_str(), row.parent.as_deref()?))),
+        ))
+    }
+
+    /// 关系记在子会话自己那一行:多 location 下按子会话的胜出副本认边
+    fn parent_links_in_child(&self) -> bool {
+        true
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
