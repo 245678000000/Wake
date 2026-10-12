@@ -1,17 +1,17 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.2] — 2026-10-12
 
-- New: Grok Bot conversations show up in Wake, read from what the Grok Bot desktop app keeps on this computer — the latest messages of your recent conversations; in group chats each message shows which bot sent it. A conversation the app no longer keeps stays listed with its last message, and deleting one in Wake only hides it, since the conversation itself lives in Grok Bot's cloud
-- Fix: The Settings sidebar lines up with the main window's: its title sits under the window buttons, and its icons and labels start where the main sidebar's do. The refresh status at the bottom of the main sidebar lines up with the icons above it too, and the Agents and Projects headers are spaced like All Sessions and Starred above them
-- Fix: DeepSeek Harness subagent sessions are indexed and listed under the session that started them, titled with their task; a subagent or forked session no longer repeats the conversation it started from, and its tokens are its own. Existing indexes are re-read once after upgrading (#63, thanks @ztcngadget888)
-- Update: Subagent sessions from OpenCode, Kilo Code, ZCode, Antigravity and OpenClaw are listed under the session that started them. ZCode side chats and workflow steps sit under their task too, and ZCode workflow tasks are listed
-- Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
-- Update: Insights no longer counts subagent sessions, or the prompts in them, as yours; their tokens still count
-- New: You can have agents use Wake only when you ask, not on their own; "Only when you ask" in the MCP guide shows how (#64, thanks @ItsRyanWu)
 - New: Subagents started by Claude Code, Cursor, CodeBuddy, WorkBuddy, Qoder and Kimi Code are sessions of their own, listed under the session that started them, so you can search and open them like any other
 - New: A tool call that started a subagent has a button that opens the subagent's session, and a subagent's session links back to the one that started it
+- New: Grok Bot conversations show up in Wake, read from what the Grok Bot desktop app keeps on this computer — the latest messages of your recent conversations; in group chats each message shows which bot sent it. A conversation the app no longer keeps stays listed with its last message, and deleting one in Wake only hides it, since the conversation itself lives in Grok Bot's cloud
+- New: You can have agents use Wake only when you ask, not on their own; "Only when you ask" in the MCP guide shows how (#64, thanks @ItsRyanWu)
+- Update: Subagent sessions from OpenCode, Kilo Code, ZCode, Antigravity and OpenClaw are listed under the session that started them. ZCode side chats and workflow steps sit under their task too, and ZCode workflow tasks are listed
+- Update: Insights no longer counts subagent sessions, or the prompts in them, as yours; their tokens still count
+- Fix: DeepSeek Harness subagent sessions are indexed and listed under the session that started them, titled with their task; a subagent or forked session no longer repeats the conversation it started from, and its tokens are its own. Existing indexes are re-read once after upgrading (#63, thanks @ztcngadget888)
+- Fix: ZCode forks no longer repeat the task they were forked from, and their tokens are their own; side chats are titled with their first question instead of "Selection side chat"
 - Fix: Claude Code workflow steps no longer show up as separate sessions while they run and vanish on the next refresh
+- Fix: The Settings sidebar lines up with the main window's: its title sits under the window buttons, and its icons and labels start where the main sidebar's do. The refresh status at the bottom of the main sidebar lines up with the icons above it too, and the Agents and Projects headers are spaced like All Sessions and Starred above them
 
 ## [0.9.1] — 2026-10-10
 
