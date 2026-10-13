@@ -191,10 +191,8 @@ impl Workbench {
                                             )
                                         })
                                         .when(selectable && members.len() > 1, |row| {
-                                            row.child(crate::tp!(
-                                                "{} nested session",
-                                                "{} nested sessions",
-                                                members.len() - 1
+                                            row.child(crate::workbench::nested_tally(
+                                                members.len() as i64 - 1,
                                             ))
                                         }),
                                 ),

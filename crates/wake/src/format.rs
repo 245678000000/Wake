@@ -56,11 +56,28 @@ fn smart_time_from(ts: i64, now: &DateTime<Local>) -> String {
         dt.format(t("%-I:%M %p")).to_string()
     } else if dt.date_naive() == now.date_naive() - Duration::days(1) {
         t("Yesterday").to_string()
-    } else if dt.year() == now.year() {
-        dt.format(t("%b %-d")).to_string()
     } else {
-        dt.format(t("%b %-d, %Y")).to_string()
+        calendar_date(&dt, now)
     }
+}
+
+/// epoch ms → 日期("Oct 12",不是今年的带上年份),给嵌在句子里的用("Hidden {}"):
+/// smart_time 的 "Yesterday" / "Just now" 是独立标签,放进句子里大小写不对
+pub fn short_date(ts: i64) -> String {
+    match Local.timestamp_millis_opt(ts).single() {
+        Some(dt) if ts > 0 => calendar_date(&dt, &Local::now()),
+        _ => String::new(),
+    }
+}
+
+/// 日期,今年的不带年份(smart_time 一天以前的那两档与 short_date 共用)
+fn calendar_date(dt: &DateTime<Local>, now: &DateTime<Local>) -> String {
+    let format = if dt.year() == now.year() {
+        t("%b %-d")
+    } else {
+        t("%b %-d, %Y")
+    };
+    dt.format(format).to_string()
 }
 
 /// 详情页时间信息：保留到秒，避免相对时间丢失会话的精确时间上下文。

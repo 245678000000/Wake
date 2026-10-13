@@ -722,14 +722,7 @@ impl Workbench {
             };
             dialog
                 .title(div().text_size(FONT_HEADING).font_semibold().child(title))
-                .confirm()
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default()
-                        .show_cancel(true)
-                        .cancel_text(t("Cancel"))
-                        .ok_text(t("Confirm"))
-                        .ok_variant(gpui_component::button::ButtonVariant::Danger),
-                )
+                .button_props(crate::ui::danger_buttons(t("Confirm")))
                 .footer(
                     v_flex()
                         .w_full()

@@ -897,10 +897,8 @@ impl ListDelegate for SessionsDelegate {
                                             .flex_shrink_0()
                                             .child(format!("{child_count}"))
                                             .tooltip(move |window, cx| {
-                                                gpui_component::tooltip::Tooltip::new(crate::tp!(
-                                                    "{} nested session",
-                                                    "{} nested sessions",
-                                                    child_count
+                                                gpui_component::tooltip::Tooltip::new(nested_tally(
+                                                    child_count,
                                                 ))
                                                 .build(window, cx)
                                             }),
@@ -2220,6 +2218,8 @@ pub struct Workbench {
     settings_window: Option<AnyWindowHandle>,
     settings_page: SettingsPage,
     update_status: UpdateStatus,
+    /// Settings → Data 的"已隐藏的会话":要把各家的会话列一遍,进 Data 页时在后台对
+    hidden: HiddenSessions,
     total_sessions: i64,
 
     list_state: Entity<ListState<SessionsDelegate>>,
@@ -2503,6 +2503,19 @@ pub(crate) struct DataSettingsSnapshot {
     pub(crate) session_count: i64,
 }
 
+/// Settings → Data 的"已隐藏的会话"(`cleanup::hidden_sessions`)
+#[derive(Default)]
+pub(crate) struct HiddenSessions {
+    pub(crate) groups: Vec<wake_core::cleanup::HiddenGroup>,
+    /// 正在后台对(进 Data 页就起一轮)
+    pub(crate) checking: bool,
+    /// 对的期间又隐藏或取消隐藏了会话:这一轮读到的墓碑已经过时,结果作废、跑完再对一遍
+    recheck: bool,
+    /// 正在取消隐藏的那一组(按 hidden_at 认)
+    pub(crate) unhiding: Option<i64>,
+    pub(crate) error: Option<SharedString>,
+}
+
 /// Settings → Remote hosts 的一行(库表 remote_hosts + 会话计数拼装)
 #[derive(Clone)]
 pub(crate) struct RemoteHostRow {
@@ -2681,6 +2694,7 @@ impl Workbench {
             settings_window: None,
             settings_page: SettingsPage::General,
             update_status: UpdateStatus::Idle,
+            hidden: HiddenSessions::default(),
             total_sessions: 0,
             list_state,
             palette_list,
@@ -3075,8 +3089,112 @@ impl Workbench {
     }
 
     pub(crate) fn select_settings_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        let changed = self.settings_page != page;
         self.settings_page = page;
+        if changed {
+            self.refresh_hidden_sessions(cx);
+        }
         cx.notify();
+    }
+
+    pub(crate) fn hidden_sessions(&self) -> &HiddenSessions {
+        &self.hidden
+    }
+
+    /// Settings 的 Data 页要显示了(或正显示着):在后台重新对一遍已隐藏的会话(各家的会话要列
+    /// 一遍)。不在 Data 页就不对;正在对就记下 `recheck`,这一轮跑完再来一遍
+    fn refresh_hidden_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.settings_page != SettingsPage::Data {
+            return;
+        }
+        if self.hidden.checking {
+            self.hidden.recheck = true;
+            return;
+        }
+        self.hidden.checking = true;
+        let store = self.store.clone();
+        let adapters = self.adapters.clone();
+        let task =
+            cx.background_spawn(
+                async move { wake_core::cleanup::hidden_sessions(&store, &adapters) },
+            );
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.hidden.checking = false;
+                if std::mem::take(&mut this.hidden.recheck) {
+                    this.refresh_hidden_sessions(cx);
+                    return;
+                }
+                match result {
+                    Ok(groups) => {
+                        this.hidden.groups = groups;
+                        this.hidden.error = None;
+                    }
+                    Err(e) => {
+                        this.hidden.error =
+                            Some(crate::tf!("Couldn't list hidden sessions: {}", e).into())
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 取消隐藏一组(`cleanup::unhide`:撤墓碑、重新入库),回来后刷新列表与侧栏计数
+    pub(crate) fn unhide_sessions(&mut self, hidden_at: i64, cx: &mut Context<Self>) {
+        if self.hidden.unhiding.is_some() {
+            return;
+        }
+        let Some(group) = self
+            .hidden
+            .groups
+            .iter()
+            .find(|group| group.hidden_at == hidden_at)
+            .cloned()
+        else {
+            return;
+        };
+        self.hidden.unhiding = Some(hidden_at);
+        self.hidden.error = None;
+        cx.notify();
+        let store = self.store.clone();
+        let adapters = self.adapters.clone();
+        let roster = adapters.clone();
+        let lock = self.index_lock.clone();
+        let task = cx.background_spawn(async move {
+            let _lock = lock;
+            wake_core::cleanup::unhide(&store, &adapters, group)
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            this.update(cx, |this, cx| {
+                this.hidden.unhiding = None;
+                match result {
+                    Ok(()) => {
+                        this.hidden
+                            .groups
+                            .retain(|group| group.hidden_at != hidden_at);
+                        // 正在对的那一轮读的是取消隐藏之前的墓碑,会把这一组列回来
+                        if this.hidden.checking {
+                            this.hidden.recheck = true;
+                        }
+                        // 取消隐藏期间换了来源配置(停用、移除了 location):旧 roster 可能把新配置下
+                        // 不该在的会话写了回来,按新配置补一轮增量扫描清掉
+                        if !Arc::ptr_eq(&roster, &this.adapters) {
+                            this.kick_incremental_scan(cx);
+                        }
+                        this.refresh(cx);
+                    }
+                    Err(e) => this.hidden.error = Some(crate::tf!("Couldn't unhide: {}", e).into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(crate) fn open_about(&mut self, cx: &mut Context<Self>) {
@@ -3133,6 +3251,7 @@ impl Workbench {
     /// 之后：Settings 首帧会读取 location 快照，同步开窗会反读仍被独占借用
     /// 的 Workbench，触发 GPUI double lease。
     pub(crate) fn open_settings(&mut self, cx: &mut Context<Self>) {
+        self.refresh_hidden_sessions(cx);
         let workbench = cx.entity();
         cx.defer(move |cx| Self::show_settings_window(workbench, cx));
     }
@@ -4398,20 +4517,12 @@ impl Workbench {
                         .font_semibold()
                         .child(crate::tf!("Remove {}?", name)),
                 )
-                .confirm()
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default()
-                        .ok_text(t("Remove"))
-                        .ok_variant(gpui_component::button::ButtonVariant::Danger),
-                )
+                .button_props(crate::ui::danger_buttons(t("Remove")))
                 .child(
                     div()
                         .text_size(FONT_BODY)
                         .text_color(theme.foreground)
-                        .child(
-                            "Its sessions leave the index and the local cache is deleted. \
-                             Nothing on the remote host is touched.",
-                        ),
+                        .child(t("Its sessions leave the index and the local cache is deleted. Nothing on the remote host is touched.")),
                 )
                 .on_ok(move |_, window, cx| {
                     entity.update(cx, |this, cx| {
@@ -5500,6 +5611,10 @@ impl Workbench {
                     window.push_notification(Notification::success(message), cx);
                     // 立刻把它从列表摘掉,不等 watcher 那 800ms 去抖
                     this.refresh(cx);
+                    // Settings 正开在 Data 页:已隐藏的会话跟着多一项
+                    if hidden && this.settings_window.is_some() {
+                        this.refresh_hidden_sessions(cx);
+                    }
                 }
                 Err(e) => window
                     .push_notification(Notification::error(crate::tf!("Delete failed: {}", e)), cx),
@@ -5554,8 +5669,8 @@ impl Workbench {
                 (true, true) => (
                     t("Hide this session tree?"),
                     crate::tp!(
-                        "This session and {} nested session are stored in {1}'s own database, which Wake never changes, so no files are moved. Wake just stops listing them.",
-                        "This session and {} nested sessions are stored in {1}'s own database, which Wake never changes, so no files are moved. Wake just stops listing them.",
+                        "This session and {} nested session are stored in {1}'s own data, which Wake never changes, so no files are moved. Wake just stops listing them; you can unhide them in Settings → Data.",
+                        "This session and {} nested sessions are stored in {1}'s own data, which Wake never changes, so no files are moved. Wake just stops listing them; you can unhide them in Settings → Data.",
                         nested_count,
                         meta.agent.display_name()
                     ),
@@ -5563,7 +5678,7 @@ impl Workbench {
                 (true, false) => (
                     t("Hide this session?"),
                     crate::tf!(
-                        "This session is stored in {}'s own database, which Wake never changes, so no files are moved. Wake just stops listing it.",
+                        "This session is stored in {}'s own data, which Wake never changes, so no files are moved. Wake just stops listing it; you can unhide it in Settings → Data.",
                         meta.agent.display_name()
                     ),
                 ),
@@ -5588,15 +5703,11 @@ impl Workbench {
                         .font_semibold()
                         .child(title),
                 )
-                // 破坏性确认:主按钮点名动作并用 danger 形态,不留裸 "OK"。
-                // .confirm() 必须显式调用——Dialog 只在设了 footer 时才渲染
-                // 按钮行,只挂 on_ok 的弹窗实际无按钮(仅回车可确认)
-                .confirm()
-                .button_props(
-                    gpui_component::dialog::DialogButtonProps::default()
-                        .ok_text(if hide_only { t("Hide") } else { move_to_trash() })
-                        .ok_variant(gpui_component::button::ButtonVariant::Danger),
-                )
+                .button_props(crate::ui::danger_buttons(if hide_only {
+                    t("Hide")
+                } else {
+                    move_to_trash()
+                }))
                 .child(
                     v_flex()
                         .gap(SPACE_SM)
@@ -9600,6 +9711,11 @@ pub(crate) fn session_tally(n: i64) -> String {
 /// "N files"(Memory locations 的行)
 pub(crate) fn file_tally(n: i64) -> String {
     crate::tp!("{} file", "{} files", n)
+}
+
+/// "N nested sessions"(会话行的子会话数提示、Clean up 的树、Data 页已隐藏的会话)
+pub(crate) fn nested_tally(n: i64) -> String {
+    crate::tp!("{} nested session", "{} nested sessions", n)
 }
 
 /// 远程会话的 @host 徽章:填充胶囊但用 primary 淡底 + primary 字,与紧邻的 muted

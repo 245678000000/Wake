@@ -1,5 +1,10 @@
 # Changelog
 
+## [Unreleased]
+
+- New: Sessions you hide in Wake can be brought back: Settings → Data lists them, and Unhide puts each one back with the sessions hidden along with it
+- Fix: Confirming that you want to hide or delete a session, or remove a remote host, now offers a Cancel button
+
 ## [0.9.2] — 2026-10-12
 
 - New: Subagents started by Claude Code, Cursor, CodeBuddy, WorkBuddy, Qoder and Kimi Code are sessions of their own, listed under the session that started them, so you can search and open them like any other

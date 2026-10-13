@@ -23,6 +23,15 @@ pub struct RemoteHost {
     pub last_sync_error: Option<String>,
 }
 
+/// tombstones 表的一行(`Store::tombstones`):一次删除记下的会话。key 在老库里可能为空
+#[derive(Debug, Clone)]
+pub struct Tombstone {
+    pub file_path: String,
+    pub key: String,
+    /// epoch ms;同一次删除(连同随它一起删的子会话)是同一个值
+    pub deleted_at: i64,
+}
+
 const DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS schema_meta (key TEXT PRIMARY KEY, value TEXT);
 
@@ -1131,6 +1140,44 @@ impl Store {
         let conn = self.read.lock().unwrap();
         let mut stmt = conn.prepare_cached("SELECT 1 FROM tombstones WHERE file_path = ?1")?;
         Ok(stmt.exists(params![file_path])?)
+    }
+
+    /// 墓碑表的全部行,按写入先后(rowid:一次删除里先写用户点的那条,随它一起删的子会话
+    /// 在后)。Settings → Data 的"已隐藏的会话"拿它对照各家此刻还列得出的会话
+    /// (`cleanup::hidden_sessions`)
+    pub fn tombstones(&self) -> Result<Vec<Tombstone>> {
+        let conn = self.read.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT file_path, COALESCE(key, ''), COALESCE(deleted_at, 0) FROM tombstones
+             ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Tombstone {
+                file_path: r.get(0)?,
+                key: r.get(1)?,
+                deleted_at: r.get(2)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// 取消隐藏:撤掉压着这些会话的墓碑——按 key 也按路径,同一会话别的副本记下的那行一并撤,
+    /// 否则扫描照样挡着它(`cleanup::unhide`)
+    pub fn release_tombstones(&self, keys: &[String], file_paths: &[String]) -> Result<()> {
+        let mut conn = self.write.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut by_key = tx.prepare_cached("DELETE FROM tombstones WHERE key = ?1")?;
+            for key in keys {
+                by_key.execute(params![key])?;
+            }
+            let mut by_path = tx.prepare_cached("DELETE FROM tombstones WHERE file_path = ?1")?;
+            for path in file_paths {
+                by_path.execute(params![path])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// 放回识别:磁盘上这份文件的指纹(`put_back_fingerprint`)与删除前记下的一致——用户

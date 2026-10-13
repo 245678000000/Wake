@@ -2,18 +2,22 @@
 //! per-target Trash results and a durable journal. No source database writes.
 use crate::{
     adapters::{adapter_for, child_outlives_parent, AgentAdapter},
-    db::{put_back_fingerprint, Store},
+    db::{put_back_fingerprint, Store, Tombstone},
     models::*,
+    scanner::{copy_order, scan_files, NullEvents, RootOwners},
     services::terminal,
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Read,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::UNIX_EPOCH,
 };
 
@@ -899,6 +903,150 @@ pub fn trash_sessions(store: &Store, sessions: &[SessionMeta], targets: &[String
     let keys: Vec<String> = sessions.iter().map(|s| s.key.clone()).collect();
     store.remove_trashed_sessions(&keys, &prints)?;
     Ok(moved.is_empty())
+}
+
+/// Settings → Data 里的一项"已隐藏的会话":同一次删除藏起来、来源还在的会话——用户点的那条
+/// 连同随它一起藏起来的子会话
+#[derive(Clone, Debug)]
+pub struct HiddenGroup {
+    /// epoch ms
+    pub hidden_at: i64,
+    /// 用户点的那条(它解析不出来时由下一条代表)
+    pub head: SessionMeta,
+    /// 随它一起藏起来的子会话有几条
+    pub nested: usize,
+    /// 取消隐藏时撤掉的墓碑:按 key(墓碑自己记的、各份副本的)也按墓碑的路径
+    keys: Vec<String>,
+    paths: Vec<String>,
+    /// 重新入库时交给扫描的来源(同一会话的几份副本都在,扫描照常按位次挑)
+    refs: Vec<SessionFileRef>,
+}
+
+/// 被 Wake 藏起来、来源却还在的会话:墓碑压着、各家此刻还列得出来的。主要是存在别家自己数据里的
+/// 会话被"删除"(其实是隐藏,`trash_sessions` 一个文件都没移);被放回原处却认不出指纹的文件、
+/// 别的 location 里的副本也在其列——副本按路径或列表给的 key 认,文件名不是会话 id 的家(Gemini)
+/// 认不出:墓碑记的是解析后的 key,要把这几家的会话逐个解析才对得上,每次进 Data 页都这么做太重,
+/// 而那只发生在会话进了废纸篓、另一个 location 还留着一份时,从废纸篓放回原件就回来了。已经进了废纸篓的列不出来;批量清理有自己的恢复(清理记录里
+/// 的 Restore,先核对放回的文件),也不在其列。判据与扫描同一套:路径或 key 压在墓碑下,文件只归
+/// 拥有它的最深的根(`RootOwners`),被外壳认领的替身撤了墓碑也回不来、不算。按删除分组、最近的
+/// 在前。要把有墓碑的那几家的会话列一遍,放后台跑
+pub fn hidden_sessions(
+    store: &Store,
+    adapters: &[Box<dyn AgentAdapter>],
+) -> Result<Vec<HiddenGroup>> {
+    let cleanups: HashSet<i64> = history(store)?.iter().map(|batch| batch.stamp).collect();
+    let tombstones: Vec<Tombstone> = store
+        .tombstones()?
+        .into_iter()
+        .filter(|t| !cleanups.contains(&t.deleted_at))
+        .collect();
+    if tombstones.is_empty() {
+        return Ok(Vec::new());
+    }
+    let owners = RootOwners::new(adapters);
+    // 只列有墓碑的那几家(老墓碑没记 key,按路径归属认)
+    let agents: HashSet<AgentId> = tombstones
+        .iter()
+        .filter_map(|t| {
+            t.key
+                .split(':')
+                .next()
+                .and_then(AgentId::from_str)
+                .or_else(|| owners.owner_of(&t.file_path).map(|ix| adapters[ix].agent()))
+        })
+        .collect();
+    let by_path: HashMap<&str, usize> = tombstones
+        .iter()
+        .enumerate()
+        .map(|(ix, t)| (t.file_path.as_str(), ix))
+        .collect();
+    let by_key: HashMap<&str, usize> = tombstones
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| !t.key.is_empty())
+        .map(|(ix, t)| (t.key.as_str(), ix))
+        .collect();
+    let claimed = store.claimed_keys()?;
+    let key_of =
+        |ix: usize, r: &SessionFileRef| session_key(r.agent, adapters[ix].host(), &r.native_id);
+    // 墓碑(按写入先后)→ 压着的来源
+    let mut found: BTreeMap<usize, Vec<(usize, SessionFileRef)>> = BTreeMap::new();
+    for (ix, adapter) in adapters.iter().enumerate() {
+        if !agents.contains(&adapter.agent()) {
+            continue;
+        }
+        // 这一刻读不出的这一家跳过:列不出来就说不清它还在不在
+        let Ok(listed) = adapter.list_session_files() else {
+            continue;
+        };
+        for r in listed {
+            let key = key_of(ix, &r);
+            let Some(&t) = by_path
+                .get(r.file_path.as_str())
+                .or_else(|| by_key.get(key.as_str()))
+            else {
+                continue;
+            };
+            if owners.admits(ix, &r.file_path) && !claimed.contains(&key) {
+                found.entry(t).or_default().push((ix, r));
+            }
+        }
+    }
+    // 按删除分组;组内按墓碑写入先后,用户点的那条在前
+    let mut deletions: BTreeMap<i64, Vec<(usize, Vec<(usize, SessionFileRef)>)>> = BTreeMap::new();
+    for (t, mut copies) in found {
+        copies.sort_by(|a, b| copy_order(adapters, a, b));
+        deletions
+            .entry(tombstones[t].deleted_at)
+            .or_default()
+            .push((t, copies));
+    }
+    let mut groups = Vec::new();
+    for (hidden_at, members) in deletions.into_iter().rev() {
+        // 解析得出来的第一条给这一组起名字,每条按扫描的回退顺序挨个试副本;一条都解析不出
+        // 就没法说它是什么,不列
+        let Some(head) = members.iter().find_map(|(_, copies)| {
+            copies
+                .iter()
+                .find_map(|(ix, r)| adapters[*ix].parse_session(r).ok())
+                .map(|parsed| parsed.meta)
+        }) else {
+            continue;
+        };
+        let mut group = HiddenGroup {
+            hidden_at,
+            head,
+            nested: members.len() - 1,
+            keys: Vec::new(),
+            paths: Vec::new(),
+            refs: Vec::new(),
+        };
+        for (t, copies) in members {
+            let tombstone = &tombstones[t];
+            if !tombstone.key.is_empty() {
+                group.keys.push(tombstone.key.clone());
+            }
+            group.paths.push(tombstone.file_path.clone());
+            for (ix, r) in copies {
+                group.keys.push(key_of(ix, &r));
+                group.refs.push(r);
+            }
+        }
+        groups.push(group);
+    }
+    Ok(groups)
+}
+
+/// 取消隐藏一组:撤掉压着它们的墓碑,按来源重新入库——扫描照常挑副本、挂回父子关系,
+/// 收藏与置顶本来就留着
+pub fn unhide(
+    store: &Arc<Store>,
+    adapters: &[Box<dyn AgentAdapter>],
+    group: HiddenGroup,
+) -> Result<()> {
+    store.release_tombstones(&group.keys, &group.paths)?;
+    scan_files(adapters, store, &NullEvents, group.refs);
+    Ok(())
 }
 
 pub fn execute(

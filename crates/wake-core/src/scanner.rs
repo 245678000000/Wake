@@ -297,6 +297,56 @@ pub fn run_scan(
     result
 }
 
+/// 归属表:(根, 实例下标)。跨家/跨实例的重叠根下(自定义 location 可以落进别家树,pi/kiro 的
+/// 递归枚举会吞下界内一切 .jsonl),一个文件只属于**最长根**的那个实例——别家枚举到也丢弃,
+/// 与 watcher 的最长根分派同一语义。不做这道过滤,两家会对同一 file_path 轮流写库(UNIQUE
+/// 冲突 + 错误归属,2026-08-24 Codex review)。全量枚举与"已隐藏的会话"共用
+pub(crate) struct RootOwners(Vec<(String, usize)>);
+
+impl RootOwners {
+    pub(crate) fn new(adapters: &[Box<dyn AgentAdapter>]) -> Self {
+        Self(
+            adapters
+                .iter()
+                .enumerate()
+                .flat_map(|(ix, a)| {
+                    a.data_roots()
+                        .into_iter()
+                        .map(move |root| (root.to_string_lossy().to_string(), ix))
+                })
+                .collect(),
+        )
+    }
+
+    pub(crate) fn owner_of(&self, path: &str) -> Option<usize> {
+        self.0
+            .iter()
+            .filter(|(root, _)| crate::adapters::path_owns(root, path))
+            .max_by_key(|(root, _)| root.len())
+            .map(|(_, ix)| *ix)
+    }
+
+    /// 实例 `ix` 枚举到的这条引用归不归它:没有更深的根拥有它。无任何根认领的(越界枚举或
+    /// 合成测试)保守放行给枚举者,只裁决"确有更深的根拥有它"的情形
+    pub(crate) fn admits(&self, ix: usize, path: &str) -> bool {
+        self.owner_of(path).is_none_or(|owner| owner == ix)
+    }
+}
+
+/// 同一会话几份副本的先后:副本 `dedup_rank` 小者、mtime 新者、平局路径字典序小者。全量枚举的
+/// 候选排序与"已隐藏的会话"挑哪份展示共用;写事务里的 `write_session_guarded` 是同一把尺子
+pub(crate) fn copy_order(
+    adapters: &[Box<dyn AgentAdapter>],
+    (ia, a): &(usize, SessionFileRef),
+    (ib, b): &(usize, SessionFileRef),
+) -> std::cmp::Ordering {
+    adapters[*ia]
+        .dedup_rank(&a.file_path)
+        .cmp(&adapters[*ib].dedup_rank(&b.file_path))
+        .then_with(|| b.mtime_ms.cmp(&a.mtime_ms))
+        .then_with(|| a.file_path.cmp(&b.file_path))
+}
+
 /// 这条路径还压在墓碑下吗。用户从废纸篓放回的文件(磁盘上这份的指纹与删除前记下的对得上,
 /// 比较在 `Store::release_put_back` 里)当场撤掉墓碑放行,放回去的会话在下一轮扫描或 watcher
 /// 收到放回事件时就重新入库。压着墓碑的路径才去 stat。全量枚举与增量两处共用
@@ -397,24 +447,8 @@ fn run_scan_inner(
     }
     let mut queue: Vec<WorkItem> = Vec::new();
 
-    // 归属表:(根, 实例下标)。跨家/跨实例的重叠根下(自定义 location 可以
-    // 落进别家树,pi/kiro 的递归枚举会吞下界内一切 .jsonl),一个文件只属于
-    // **最长根**的那个实例——别家枚举到也丢弃,与 watcher 的最长根分派同一
-    // 语义。不做这道过滤,两家会对同一 file_path 轮流写库(UNIQUE 冲突 +
-    // 错误归属,2026-08-24 Codex review)
-    let mut roots: Vec<(String, usize)> = Vec::new();
-    for (ix, a) in adapters.iter().enumerate() {
-        for r in a.data_roots() {
-            roots.push((r.to_string_lossy().to_string(), ix));
-        }
-    }
-    let owner_of = |path: &str| -> Option<usize> {
-        roots
-            .iter()
-            .filter(|(root, _)| crate::adapters::path_owns(root, path))
-            .max_by_key(|(root, _)| root.len())
-            .map(|(_, ix)| *ix)
-    };
+    // 一个文件只归数据根最长的那个实例(`RootOwners`)
+    let owners = RootOwners::new(adapters);
     // 墓碑查询与去重域共用的会话 key:按枚举实例的 host 构造(远程三段),
     // 下面四处同一口径,别各自 format
     let key_of =
@@ -447,9 +481,7 @@ fn run_scan_inner(
             // 被外壳产品认领的替身(Craft 的 Claude 后端在 ~/.claude 落的那份)不索引:
             // 不在 seen_paths 里,库里若还有它的行,下面的删除检测一并清掉
             .filter(|r| !claimed.contains(&key_of(ix, r)))
-            // 无任何根认领的引用(越界枚举或合成测试)保守放行给枚举者;
-            // 过滤只裁决"确有更深的根拥有它"的情形
-            .filter(|r| owner_of(&r.file_path).is_none_or(|o| o == ix))
+            .filter(|r| owners.admits(ix, &r.file_path))
             .collect();
         per_adapter.push(refs);
     }
@@ -473,13 +505,7 @@ fn run_scan_inner(
         }
     }
     for v in candidates.values_mut() {
-        v.sort_by(|(ia, a), (ib, b)| {
-            adapters[*ia]
-                .dedup_rank(&a.file_path)
-                .cmp(&adapters[*ib].dedup_rank(&b.file_path))
-                .then_with(|| b.mtime_ms.cmp(&a.mtime_ms))
-                .then_with(|| a.file_path.cmp(&b.file_path))
-        });
+        v.sort_by(|a, b| copy_order(adapters, a, b));
     }
     for (ix, refs) in per_adapter.iter_mut().enumerate() {
         refs.retain(|r| {
@@ -575,7 +601,9 @@ fn run_scan_inner(
     // 删除检测:库里有但磁盘没了。枚举失败的那几家这一轮不知道在不在,归它们的行不动
     let mut pruned = false;
     for (path, (_, _, key)) in &known {
-        if !seen_paths.contains(path) && !owner_of(path).is_some_and(|ix| frozen.contains(&ix)) {
+        if !seen_paths.contains(path)
+            && !owners.owner_of(path).is_some_and(|ix| frozen.contains(&ix))
+        {
             let _ = store.remove_session(key);
             pruned = true;
         }

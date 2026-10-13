@@ -10,12 +10,12 @@ use std::ops::{Add, Mul, Neg, Sub};
 
 use gpui::{
     div, px, AbsoluteLength, AnyElement, App, DefiniteLength, Div, FontWeight, Global, Hsla,
-    InteractiveElement as _, IntoElement, Length, MouseButton, ParentElement as _, Pixels, Styled,
-    Window, WindowId,
+    InteractiveElement as _, IntoElement, Length, MouseButton, ParentElement as _, Pixels,
+    SharedString, Styled, Window, WindowId,
 };
 use gpui_component::{
-    button::Button,
-    dialog::{AlertDialog, Dialog},
+    button::{Button, ButtonVariant},
+    dialog::{AlertDialog, Dialog, DialogButtonProps},
     h_flex, ActiveTheme as _, Root, Sizable as _, WindowExt as _,
 };
 
@@ -454,6 +454,17 @@ where
         let width = dialog_width(width, window);
         build(dialog.p(SPACE_LG), window, cx).width(width)
     });
+}
+
+/// 破坏性确认框的按钮:取消 + 点名动作的 danger 主按钮,不留裸 "OK"。`button_props` 会整个
+/// 换掉 `AlertDialog::confirm()` 开的取消按钮(confirm 只是把 show_cancel 置真),所以取消在
+/// 这里开(用户 2026-10-13 报:隐藏确认框只有 Hide、没有 Cancel)
+pub fn danger_buttons(ok: impl Into<SharedString>) -> DialogButtonProps {
+    DialogButtonProps::default()
+        .show_cancel(true)
+        .cancel_text(crate::i18n::t("Cancel"))
+        .ok_text(ok)
+        .ok_variant(ButtonVariant::Danger)
 }
 
 /// 定宽栏(侧栏、会话流、设置侧栏,合计设计宽 `rails`)的缩放倍数:跟着界面缩放放大,

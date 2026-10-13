@@ -240,6 +240,7 @@
   "Remove": "移除",
   "Remove failed": "移除失败",
   "Remove {}?": "移除 {}?",
+  "Its sessions leave the index and the local cache is deleted. Nothing on the remote host is touched.": "它的会话会移出索引,本机的缓存会删掉。远程主机上的东西一概不动。",
   "Restore defaults": "恢复默认",
   "Restore failed": "恢复失败",
   "Restored": "已还原",
@@ -303,9 +304,9 @@
   "This path is already in Wake's memory locations": "这个路径已经在 Wake 的记忆位置里了",
   "This session and {} nested session will be moved to {1}. Put them back from {1} and they show up again.": "此会话及其 {0} 个子会话将被移到{1}。从{1}放回原处后,它们会重新出现。",
   "This session and {} nested sessions will be moved to {1}. Put them back from {1} and they show up again.": "此会话及其 {0} 个子会话将被移到{1}。从{1}放回原处后,它们会重新出现。",
-  "This session and {} nested session are stored in {1}'s own database, which Wake never changes, so no files are moved. Wake just stops listing them.": "此会话及其 {0} 个子会话存放在 {1} 自己的数据库里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它们。",
-  "This session and {} nested sessions are stored in {1}'s own database, which Wake never changes, so no files are moved. Wake just stops listing them.": "此会话及其 {0} 个子会话存放在 {1} 自己的数据库里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它们。",
-  "This session is stored in {}'s own database, which Wake never changes, so no files are moved. Wake just stops listing it.": "这个会话存放在 {} 自己的数据库里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它。",
+  "This session and {} nested session are stored in {1}'s own data, which Wake never changes, so no files are moved. Wake just stops listing them; you can unhide them in Settings → Data.": "此会话及其 {0} 个子会话存放在 {1} 自己的数据里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它们;可以在 设置 → 数据 里取消隐藏。",
+  "This session and {} nested sessions are stored in {1}'s own data, which Wake never changes, so no files are moved. Wake just stops listing them; you can unhide them in Settings → Data.": "此会话及其 {0} 个子会话存放在 {1} 自己的数据里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它们;可以在 设置 → 数据 里取消隐藏。",
+  "This session is stored in {}'s own data, which Wake never changes, so no files are moved. Wake just stops listing it; you can unhide it in Settings → Data.": "这个会话存放在 {} 自己的数据里,Wake 从不改动它,所以不会移动任何文件,只是不再列出它;可以在 设置 → 数据 里取消隐藏。",
   "Thu": "周四",
   "Thursdays": "周四",
   "Today": "今天",
@@ -499,5 +500,11 @@
   "Run in a terminal to install the Wake plugin": "在终端里运行，安装 Wake 插件",
   "Copy the command that adds wake-cli to PATH": "拷贝把 wake-cli 加进 PATH 的命令",
   "Codex plugin": "Codex 插件",
-  "Run in a terminal, then trust its hook in Codex's /hooks": "在终端里运行，再在 Codex 的 /hooks 里信任它的钩子"
+  "Run in a terminal, then trust its hook in Codex's /hooks": "在终端里运行，再在 Codex 的 /hooks 里信任它的钩子",
+  "Hidden sessions": "已隐藏的会话",
+  "No hidden sessions": "没有隐藏的会话",
+  "Unhide": "取消隐藏",
+  "Hidden {}": "隐藏于 {}",
+  "Couldn't list hidden sessions: {}": "列不出已隐藏的会话:{}",
+  "Couldn't unhide: {}": "取消隐藏失败:{}"
 }

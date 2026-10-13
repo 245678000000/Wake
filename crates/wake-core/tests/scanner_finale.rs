@@ -1982,6 +1982,87 @@ fn grok_bot_card_stands_in_when_the_cache_drops_a_conversation() {
         "缓存文件还在原处,隐藏照样生效(副本与卡片同一个 key)"
     );
     assert_eq!(rows(), 4);
+
+    // 隐藏的会话列在 Settings → Data(缓存文件还在原处);取消隐藏当场回来,不等下一轮扫描
+    let mut groups = wake_core::cleanup::hidden_sessions(&store, &adapters).unwrap();
+    assert_eq!(groups.len(), 1);
+    let group = groups.remove(0);
+    assert_eq!(
+        (
+            group.head.key.as_str(),
+            group.head.title.as_str(),
+            group.nested
+        ),
+        (key.as_str(), "Ada Lovelace", 0)
+    );
+    wake_core::cleanup::unhide(&store, &adapters, group).unwrap();
+    assert_eq!(
+        store
+            .get_session(&key)
+            .unwrap()
+            .expect("取消隐藏")
+            .file_path,
+        replica.to_string_lossy()
+    );
+    assert_eq!(rows(), 5);
+    assert!(wake_core::cleanup::hidden_sessions(&store, &adapters)
+        .unwrap()
+        .is_empty());
+
+    // 再藏一次,这回副本坏了、卡片还在:与扫描同样按顺序退到卡片,这一组照样列得出、取消隐藏由卡片接回
+    let s = store.get_session(&key).unwrap().unwrap();
+    assert!(wake_core::cleanup::trash_sessions(&store, &[s], &[]).unwrap());
+    std::fs::write(&replica, b"{ not json").unwrap();
+    let mut groups = wake_core::cleanup::hidden_sessions(&store, &adapters).unwrap();
+    assert_eq!(groups.len(), 1, "副本读不出,由卡片代表这一组");
+    let group = groups.remove(0);
+    assert_eq!(group.head.title, "Ada Lovelace");
+    wake_core::cleanup::unhide(&store, &adapters, group).unwrap();
+    let s = store.get_session(&key).unwrap().expect("卡片接回");
+    assert!(s.file_path.ends_with(&format!("#{ID}")), "{}", s.file_path);
+}
+
+/// 隐藏一整棵(Claude Code 会话连同它派的子代理,一个文件都不移)是一项:用户点的那条在前,
+/// 取消隐藏整棵一起回来、子代理挂回原处。进了废纸篓的(文件已经不在)不在其列
+#[test]
+fn hidden_trees_come_back_together() {
+    let home = tempfile::tempdir().unwrap();
+    let projects = home.path().join("projects");
+    let (project, a, b) = common::stage_claude_branch(&projects);
+    let (task, step) = common::stage_claude_subagents(&project, &a, "o", "toolu_o");
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![ClaudeAdapter::new().with_custom_root(projects)];
+    let dir = tempfile::tempdir().unwrap();
+    let store = temp_store(dir.path());
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    let key = |id: &str| format!("claude-code:{id}");
+    let original = store.get_session(&key(&a)).unwrap().unwrap();
+
+    let plan = wake_core::cleanup::delete_plan(&store, &adapters, &original).unwrap();
+    assert!(wake_core::cleanup::trash_sessions(&store, &plan.sessions, &[]).unwrap());
+    // 分支是另一棵、照常删进废纸篓:它不在已隐藏的会话里
+    let branch = store.get_session(&key(&b)).unwrap().unwrap();
+    std::fs::remove_file(&branch.file_path).unwrap();
+    wake_core::cleanup::trash_sessions(&store, &[branch], &[]).unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+
+    let mut groups = wake_core::cleanup::hidden_sessions(&store, &adapters).unwrap();
+    assert_eq!(groups.len(), 1, "分支的文件已经不在,不算隐藏");
+    let group = groups.remove(0);
+    assert_eq!(group.head.key, key(&a), "用户点的那条在前");
+    assert_eq!(group.nested, 2, "它派的两个子代理随它一起");
+
+    wake_core::cleanup::unhide(&store, &adapters, group).unwrap();
+    for child in [&task, &step] {
+        assert_eq!(
+            store.parent_key_of(&key(child)).unwrap(),
+            Some(key(&a)),
+            "{child} 挂回原处"
+        );
+    }
+    assert!(wake_core::cleanup::hidden_sessions(&store, &adapters)
+        .unwrap()
+        .is_empty());
 }
 
 /// Cursor 两源端到端:转录带正文的会话固定由 CLI 源胜出(它有 slug 可反推

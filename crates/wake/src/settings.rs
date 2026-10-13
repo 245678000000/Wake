@@ -158,6 +158,35 @@ fn select_control(
         .into_any_element()
 }
 
+/// 页内区块标题(Data 页的 Storage / Hidden sessions、Connect 页的各块)
+fn section_title(label: impl Into<SharedString>, cx: &App) -> Div {
+    div()
+        .flex_shrink_0()
+        .text_size(FONT_CAPTION)
+        .font_semibold()
+        .text_color(cx.theme().foreground)
+        .child(label.into())
+}
+
+/// 圆角卡,行与行之间一条 hairline(Session / Memory locations 的每一家、Data 页已隐藏的会话)
+fn hairline_card(rows: impl IntoIterator<Item = AnyElement>, cx: &App) -> Div {
+    let theme = cx.theme();
+    v_flex()
+        .w_full()
+        .flex_shrink_0()
+        .overflow_hidden()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.popover)
+        .children(rows.into_iter().enumerate().map(|(ix, row)| {
+            div()
+                .w_full()
+                .when(ix > 0, |this| this.border_t_1().border_color(theme.border))
+                .child(row)
+        }))
+}
+
 /// "一张卡一行"的信息卡(Data、Connect、Updates 的卡与 General / Appearance 的设置行
 /// 共用):popover 底圆角卡,行高由调用方给(设置行 72、其余 84),主信息 FONT_BODY,
 /// 副行由调用方给(caption 级),右侧一个操作
@@ -812,12 +841,7 @@ impl SettingsView {
         ];
 
         let rows = [
-            div()
-                .text_size(FONT_CAPTION)
-                .font_semibold()
-                .text_color(theme.foreground)
-                .child(t("Storage"))
-                .into_any_element(),
+            section_title(t("Storage"), cx).into_any_element(),
             settings_info_card(
                 t("Wake data"),
                 details,
@@ -826,6 +850,10 @@ impl SettingsView {
                 cx,
             )
             .into_any_element(),
+            section_title(t("Hidden sessions"), cx)
+                .pt(SPACE_MD)
+                .into_any_element(),
+            self.render_hidden_sessions(cx),
         ];
         Self::rows_page(
             "settings-data-scroll",
@@ -835,6 +863,123 @@ impl SettingsView {
             rows,
             cx,
         )
+    }
+
+    /// Data 页的"已隐藏的会话":Wake 不再列出、来源却还在的会话(删除存在别家自己数据里的
+    /// 会话其实是隐藏),一次隐藏一行——随它一起藏的子会话算在里面——右端取消隐藏。要把各家的
+    /// 会话列一遍才对得出,进页时 Workbench 在后台对(`refresh_hidden_sessions`)
+    fn render_hidden_sessions(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let hidden = self.workbench.read(cx).hidden_sessions();
+        let note = |text: SharedString, color: Hsla| {
+            h_flex()
+                .min_h(zpx(48.))
+                .px(SPACE_LG)
+                .items_center()
+                .text_size(FONT_CAPTION)
+                .text_color(color)
+                .child(text)
+                .into_any_element()
+        };
+        let mut rows: Vec<AnyElement> = Vec::new();
+        if let Some(error) = &hidden.error {
+            rows.push(note(error.clone(), theme.danger));
+        }
+        if hidden.groups.is_empty() {
+            if hidden.checking {
+                rows.push(note(t("Checking…").into(), theme.muted_foreground));
+            } else if hidden.error.is_none() {
+                rows.push(note(t("No hidden sessions").into(), theme.muted_foreground));
+            }
+        }
+        rows.extend(
+            hidden
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(ix, group)| self.render_hidden_row(ix, group, hidden.unhiding, cx)),
+        );
+        hairline_card(rows, cx).into_any_element()
+    }
+
+    /// 已隐藏的一行:品牌图 + 用户点的那条会话的标题,副行项目 · 一起藏的子会话数 · 哪天藏的
+    fn render_hidden_row(
+        &self,
+        ix: usize,
+        group: &wake_core::cleanup::HiddenGroup,
+        unhiding: Option<i64>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let head = &group.head;
+        let mut caption = vec![if head.project_name.is_empty() {
+            t("Unknown project").to_string()
+        } else {
+            head.project_name.clone()
+        }];
+        if group.nested > 0 {
+            caption.push(crate::workbench::nested_tally(group.nested as i64));
+        }
+        caption.push(crate::tf!(
+            "Hidden {}",
+            crate::format::short_date(group.hidden_at)
+        ));
+        let workbench = self.workbench.clone();
+        let hidden_at = group.hidden_at;
+        h_flex()
+            .id(("settings-hidden-row", ix))
+            .min_h(zpx(60.))
+            .w_full()
+            .px(SPACE_LG)
+            .gap(SPACE_MD)
+            .items_center()
+            .child(
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(ICON_TEXT_GAP)
+                    .items_center()
+                    .child(
+                        img(head.agent.brand_icon(theme.mode.is_dark()))
+                            .size(zpx(17.))
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap(zpx(3.))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(FONT_BODY)
+                                    .text_color(theme.foreground)
+                                    .child(head.title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(FONT_CAPTION)
+                                    .text_color(theme.muted_foreground)
+                                    .child(caption.join(" · ")),
+                            ),
+                    ),
+            )
+            .child(
+                settings_button(
+                    Button::new(("settings-unhide", ix))
+                        .label(t("Unhide"))
+                        .loading(unhiding == Some(hidden_at))
+                        .disabled(unhiding.is_some()),
+                    cx,
+                )
+                .on_click(move |_, _, cx| {
+                    workbench.update(cx, |this, cx| this.unhide_sessions(hidden_at, cx));
+                }),
+            )
+            .into_any_element()
     }
 
     /// Settings → Connect 的复制钮:只有图标,说明在 tooltip——卡上已经摆着要复制的东西或
@@ -1081,14 +1226,6 @@ impl SettingsView {
             .into_any_element()
         };
 
-        let section = |label: &'static str| {
-            div()
-                .flex_shrink_0()
-                .text_size(FONT_CAPTION)
-                .font_semibold()
-                .text_color(theme.foreground)
-                .child(label)
-        };
         // 区块标题右侧的文档链接:MCP 面与命令行面各链自己那份,页尾只放一条
         // 会让读 CLI 那半页的人点进 MCP 的参考里。设置窗里不放文档,所以这页
         // 只有状态、动作与这几个去处,没有解释性的散文(用户 2026-09-11 定)
@@ -1097,7 +1234,7 @@ impl SettingsView {
                 .flex_shrink_0()
                 .gap(SPACE_SM)
                 .items_center()
-                .child(section(label).flex_1())
+                .child(section_title(label, cx).flex_1())
                 .children(guide.map(|(id, url)| {
                     div()
                         .id(id)
@@ -1569,21 +1706,7 @@ impl SettingsView {
                             .child(agent.display_name()),
                     ),
             )
-            .child(
-                v_flex()
-                    .w_full()
-                    .overflow_hidden()
-                    .rounded(theme.radius_lg)
-                    .border_1()
-                    .border_color(theme.border)
-                    .bg(theme.popover)
-                    .children(rows.into_iter().enumerate().map(|(ix, row)| {
-                        div()
-                            .w_full()
-                            .when(ix > 0, |this| this.border_t_1().border_color(theme.border))
-                            .child(row)
-                    })),
-            )
+            .child(hairline_card(rows, cx))
             .into_any_element()
     }
 
