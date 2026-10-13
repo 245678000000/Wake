@@ -1,6 +1,6 @@
-// The agents Wake reads, in the app's own order (AgentId::ALL). Names, brand marks and
-// series colours mirror crates/wake-core/src/models.rs and crates/wake/src/theme.rs;
-// `where` is the short form of the README's data-source column.
+// The agents Wake reads. Names, brand marks and series colours mirror
+// crates/wake-core/src/models.rs and crates/wake/src/theme.rs; `where` is the short form
+// of the README's data-source column.
 export interface Agent {
   id: string;
   name: string;
@@ -22,6 +22,7 @@ export const AGENTS: Agent[] = [
   { id: 'pi', name: 'Pi', icon: 'pi', color: '#3AAE8C', where: '~/.pi/agent/sessions' },
   { id: 'omp', name: 'Oh My Pi', icon: 'omp', color: '#B05CE6', where: '~/.omp/agent/sessions' },
   { id: 'grok', name: 'Grok Build', icon: 'grok', color: '#8A7F73', where: '~/.grok/sessions' },
+  { id: 'grok-bot', name: 'Grok Bot', icon: 'grok-bot', color: '#AC396D', where: 'Grok Bot/sand-client-persistence' },
   { id: 'kimi', name: 'Kimi Code', icon: 'kimi', color: '#E4739E', where: '~/.kimi-code/sessions' },
   { id: 'antigravity', name: 'Antigravity', icon: 'antigravity', color: '#648AB5', where: '~/.gemini/antigravity/brain' },
   { id: 'dsh', name: 'DeepSeek Harness', icon: 'deepseek', color: '#4D6BFE', where: '~/.dsh/sessions' },
