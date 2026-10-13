@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.3] — 2026-10-13
 
 - New: Sessions you hide in Wake can be brought back: Settings → Data lists them, and Unhide puts each one back with the sessions hidden along with it
 - Fix: Confirming that you want to hide or delete a session, or remove a remote host, now offers a Cancel button
