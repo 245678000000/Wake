@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, strip_virtual_path, virtual_path, SqliteRo};
+use super::sqlite_ro::{has_table, open_sqlite_ro, strip_virtual_path, virtual_path, SqliteRo};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -80,19 +80,6 @@ fn select_from(table: &str, content_len: &str, v2_messages: &str) -> String {
                 {v2_messages} AS v2_messages, s.parent_id
          FROM {table} s"
     )
-}
-
-/// 查不到是没有这张表;查询本身出错(文件不是 SQLite、读到一半出错)往上交,别当成没有
-fn has_table(conn: &rusqlite::Connection, name: &str) -> rusqlite::Result<bool> {
-    match conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
-        [name],
-        |_| Ok(()),
-    ) {
-        Ok(()) => Ok(true),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
-        Err(e) => Err(e),
-    }
 }
 
 /// 根据库内真实表组合生成一次枚举 SQL。新版 next 与 v1 共用 session 表,
@@ -287,8 +274,8 @@ impl OpencodeAdapter {
 
     /// None = 库在却读不出(打不开、查询出错)
     fn rows(&self, db: &OcDb) -> Option<Arc<Vec<OcRow>>> {
-        let mtime = super::sqlite_ro::db_cache_stamp(&db.path);
-        db.rows_cache.get_or_try_build(mtime, || {
+        let stamp = super::sqlite_ro::db_cache_stamp(&db.path);
+        db.rows_cache.get_or_try_build(stamp, || {
             let ro = self.open(&db.path)?;
             query_rows(&ro.conn, None).ok().map(Arc::new)
         })

@@ -1,7 +1,9 @@
 use rusqlite::{Connection, OpenFlags};
 use std::collections::HashSet;
 use std::fs;
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// 只读打开的别家 SQLite 连接;若走了 copy 降级,临时目录随 drop 清理。
 pub struct SqliteRo {
@@ -33,7 +35,6 @@ pub fn open_sqlite_ro(db: &Path, tag: &str) -> Option<SqliteRo> {
     // 多 host 镜像)并发走到这里时不能共用一个目录,否则互相覆盖 db.sqlite、先退出的
     // 一方 remove_dir_all 把另一方的连接从脚下抽走(2026-09-22 review)
     let path_hash = {
-        use std::hash::{Hash as _, Hasher as _};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         db.hash(&mut h);
         h.finish()
@@ -57,6 +58,20 @@ pub fn open_sqlite_ro(db: &Path, tag: &str) -> Option<SqliteRo> {
         conn,
         _tmp: Some(guard),
     })
+}
+
+/// 查不到是没有这张表;查询本身出错(文件不是 SQLite、读到一半出错)往上交,别当成没有——
+/// 拷贝那一档不探测,不是 SQLite 的文件也"打得开",查表才报错
+pub fn has_table(conn: &Connection, name: &str) -> rusqlite::Result<bool> {
+    match conn.query_row(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |_| Ok(()),
+    ) {
+        Ok(()) => Ok(true),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// 某张表现有的列名;表不存在或读不出给空集。逐版 ALTER 的别家库靠它做列级
@@ -99,9 +114,20 @@ pub fn strip_virtual_path(path: &str) -> &str {
     }
 }
 
-/// 行缓存的失效戳:主库与 `-wal` 的 mtime 取新者。WAL 库的新写入往往只落
-/// `-wal`(写端尚未 checkpoint;远程 rsync 镜像更是永远没人 checkpoint 主库),
-/// 只看主库 mtime 会让缓存抱着旧快照不放、新会话直到重启才出现。
+/// 扫描代次:用户要的刷新(全量扫描、记忆同步)开头加一(scanner `enter_scan_gate`),
+/// `db_cache_stamp` 把它算进戳
+static SCAN_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn next_scan_epoch() {
+    SCAN_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// 行缓存的失效戳(只拿来比相等):主库与 `-wal` 的 mtime 取新者,再带上扫描代次。
+/// WAL 库的新写入往往只落 `-wal`(写端尚未 checkpoint;远程 rsync 镜像更是永远没人
+/// checkpoint 主库),只看主库 mtime 会让缓存抱着旧快照不放、新会话直到重启才出现。
+/// 扫描代次让每次刷新至少重读一次源库,一轮之内照旧按 mtime 省掉重复读取:别家库的
+/// mtime 不总会动——Windows 的 NTFS 在写句柄关掉之前不保证更新修改时间,OpenCode
+/// 这类常驻进程一直开着自己的库,在它里面删掉的会话刷新后照样列着、直到重启 Wake(#70)
 pub fn db_cache_stamp(db: &Path) -> i64 {
     let stamp = |p: &Path| {
         std::fs::metadata(p)
@@ -110,5 +136,8 @@ pub fn db_cache_stamp(db: &Path) -> i64 {
     };
     let mut wal = db.as_os_str().to_owned();
     wal.push("-wal");
-    stamp(db).max(stamp(Path::new(&wal)))
+    let mtime = stamp(db).max(stamp(Path::new(&wal)));
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (mtime, SCAN_EPOCH.load(Ordering::Relaxed)).hash(&mut h);
+    h.finish() as i64
 }

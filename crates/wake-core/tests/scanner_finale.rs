@@ -2990,3 +2990,34 @@ fn craft_parent_links_follow_the_childs_winning_copy() {
     run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
     assert_eq!(parent_of(), None, "落选副本里的旧关系不该被采纳");
 }
+
+/// 刷新至少重读一次别家的库,不只看 mtime(#70):Windows 的 NTFS 在写句柄关掉之前不保证
+/// 更新修改时间,OpenCode 运行时一直开着自己的库,在它里面删掉的会话原先刷新后照样列着、
+/// 直到重启 Wake。这里删完把库的 mtime 改回去,任何平台上都是那个情形
+#[test]
+fn a_refresh_rereads_a_database_whose_mtime_did_not_move() {
+    use wake_core::adapters::opencode::OpencodeAdapter;
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("opencode.db");
+    common::build_opencode_db(&db);
+    let adapters: Vec<Box<dyn AgentAdapter>> =
+        vec![OpencodeAdapter::new().with_custom_root(db.clone())];
+    let store = temp_store(tmp.path());
+    run_scan(&adapters, &store, &Recorder::new(), false).unwrap();
+    let indexed = || store.get_session("opencode:oc-0001").unwrap().is_some();
+    assert!(indexed());
+
+    let mtime = std::fs::metadata(&db).unwrap().modified().unwrap();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("DELETE FROM session WHERE id = 'oc-0001'", [])
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&db)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    run_scan(&adapters, &store, &Recorder::new(), true).unwrap();
+    assert!(!indexed(), "库的 mtime 没动,刷新也得看见会话已经删了");
+}

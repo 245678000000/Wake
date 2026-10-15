@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, virtual_path};
+use super::sqlite_ro::{has_table, open_sqlite_ro, virtual_path};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -247,9 +247,13 @@ impl CursorIdeAdapter {
     /// ISO `createdAt`,再缺退 `createdAt`(该字段实测全覆盖)。
     /// 项目路径优先 `workspaceIdentifier.uri.fsPath`,回退首个 git 仓库路径。
     fn rows(&self) -> Option<Vec<IdeRow>> {
-        let mtime = super::sqlite_ro::db_cache_stamp(&self.db);
-        self.rows_cache.get_or_try_build(mtime, || {
+        let stamp = super::sqlite_ro::db_cache_stamp(&self.db);
+        self.rows_cache.get_or_try_build(stamp, || {
             let ro = open_sqlite_ro(&self.db, "cursor-ide")?;
+            // 库在、没有 cursorDiskKV(还没开过 Composer 的老库)= 确实没有会话;读不出才是 None
+            if !has_table(&ro.conn, "cursorDiskKV").ok()? {
+                return Some(Vec::new());
+            }
             let mut stmt = ro
                 .conn
                 .prepare(&format!(
@@ -597,9 +601,13 @@ impl AgentAdapter for CursorIdeAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let Some(rows) = self.rows() else {
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮(不变量 8①)
+        if !self.db.is_file() {
             return Ok(Vec::new());
-        };
+        }
+        let rows = self
+            .rows()
+            .ok_or_else(|| anyhow!("{} exists but could not be read", self.db.display()))?;
         Ok(rows
             .into_iter()
             .map(|row| SessionFileRef {
@@ -657,9 +665,9 @@ impl AgentAdapter for CursorIdeAdapter {
 
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         // 库读不出 = None(scanner 保留库里的关系),不折成空
-        let mtime = super::sqlite_ro::db_cache_stamp(&self.db);
+        let stamp = super::sqlite_ro::db_cache_stamp(&self.db);
         self.links_cache
-            .get_or_try_build(mtime, || parent_links_from(&self.db))
+            .get_or_try_build(stamp, || parent_links_from(&self.db))
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {

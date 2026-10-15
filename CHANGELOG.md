@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Fix: Refresh picks up sessions you deleted in OpenCode while it was still running, instead of listing them until Wake restarts (#70, thanks @lin-code-world)
+
 ## [0.9.3] — 2026-10-13
 
 - New: Sessions you hide in Wake can be brought back: Settings → Data lists them, and Unhide puts each one back with the sessions hidden along with it

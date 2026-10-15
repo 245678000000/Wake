@@ -4453,21 +4453,40 @@ fn unreadable_session_databases_freeze_instead_of_emptying() {
         fs::write(path, b"not a sqlite database").unwrap();
     };
 
-    let bad = tmp.path().join("bad").join("opencode.db");
-    not_sqlite(&bad);
-    let opencode = OpencodeAdapter::new().with_custom_root(bad);
+    let bad = |file: &str| {
+        let path = tmp.path().join("bad").join(file);
+        not_sqlite(&path);
+        path
+    };
+    let fresh = |file: &str| {
+        let path = tmp.path().join("fresh").join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE other (x)")
+            .unwrap();
+        path
+    };
+
+    let opencode = OpencodeAdapter::new().with_custom_root(bad("opencode.db"));
     assert!(opencode.list_session_files().is_err());
     assert_eq!(opencode.parent_links(), None);
-
-    let fresh = tmp.path().join("fresh").join("opencode.db");
-    fs::create_dir_all(fresh.parent().unwrap()).unwrap();
-    rusqlite::Connection::open(&fresh)
-        .unwrap()
-        .execute_batch("CREATE TABLE other (x)")
-        .unwrap();
-    let opencode = OpencodeAdapter::new().with_custom_root(fresh);
+    let opencode = OpencodeAdapter::new().with_custom_root(fresh("opencode.db"));
     assert!(opencode.list_session_files().unwrap().is_empty());
     assert_eq!(opencode.parent_links(), Some(Vec::new()));
+
+    // 刷新一定重读别家库之后(#70),读不出不再有缓存兜着:折成空列表就是整家会话被清掉
+    let builds: [(&str, fn() -> Box<dyn AgentAdapter>); 3] = [
+        ("session-store.db", || Box::new(CopilotAdapter::new())),
+        ("state.vscdb", || Box::new(CursorIdeAdapter::new())),
+        ("state.db", || Box::new(HermesAdapter::new())),
+    ];
+    for (file, build) in builds {
+        let adapter = build().with_custom_root(bad(file));
+        assert!(adapter.list_session_files().is_err(), "{file}");
+        let adapter = build().with_custom_root(fresh(file));
+        assert!(adapter.list_session_files().unwrap().is_empty(), "{file}");
+    }
 
     let agents = tmp.path().join(".openclaw").join("agents");
     not_sqlite(&agents.join("main/agent/openclaw-agent.sqlite"));

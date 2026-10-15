@@ -1,5 +1,5 @@
 use super::parse_utils::*;
-use super::sqlite_ro::{open_sqlite_ro, virtual_path};
+use super::sqlite_ro::{has_table, open_sqlite_ro, virtual_path};
 use super::AgentAdapter;
 use crate::models::*;
 use anyhow::{anyhow, Result};
@@ -13,7 +13,7 @@ use std::sync::Mutex;
 /// size 取 turns 正文总长,二者共同构成增量扫描的 dirty 判断。
 pub struct CopilotAdapter {
     db: PathBuf,
-    /// rows() 的全表聚合较贵,按 db mtime 缓存一轮扫描内的重复调用
+    /// rows() 的全表聚合较贵,按库戳(`db_cache_stamp`)缓存一轮扫描内的重复调用
     /// (list_session_files 与 quick_meta 各调一次)
     rows_cache: Mutex<Option<(i64, Vec<CopilotRow>)>>,
     /// 指令文件(项目根下的)与自定义来源按指纹缓存,每轮扫描只 stat
@@ -32,21 +32,26 @@ impl CopilotAdapter {
         }
     }
 
-    fn db_mtime(&self) -> i64 {
+    fn db_stamp(&self) -> i64 {
         super::sqlite_ro::db_cache_stamp(&self.db)
     }
 
     fn rows(&self) -> Option<Vec<CopilotRow>> {
-        let mtime = self.db_mtime();
+        let stamp = self.db_stamp();
         {
             let cache = self.rows_cache.lock().unwrap();
             if let Some((t, rows)) = cache.as_ref() {
-                if *t == mtime {
+                if *t == stamp {
                     return Some(rows.clone());
                 }
             }
         }
         let ro = open_sqlite_ro(&self.db, "copilot")?;
+        // 库在、表还没建 = 确实没有会话;读不出(None)才是不知道
+        if !(has_table(&ro.conn, "sessions").ok()? && has_table(&ro.conn, "turns").ok()?) {
+            *self.rows_cache.lock().unwrap() = Some((stamp, Vec::new()));
+            return Some(Vec::new());
+        }
         let mut stmt = ro
             .conn
             .prepare(
@@ -73,7 +78,7 @@ impl CopilotAdapter {
             .ok()?
             .collect::<rusqlite::Result<Vec<_>>>()
             .ok()?;
-        *self.rows_cache.lock().unwrap() = Some((mtime, rows.clone()));
+        *self.rows_cache.lock().unwrap() = Some((stamp, rows.clone()));
         Some(rows)
     }
 
@@ -199,9 +204,14 @@ impl AgentAdapter for CopilotAdapter {
     }
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
-        let Some(rows) = self.rows() else {
+        // 库不在 = 没有会话;库在却读不出报 Err,scanner 冻结这一家这一轮(不变量 8①)——
+        // 当成没有会话的话,这一轮会把整家会话当"磁盘已删"清掉
+        if !self.db.is_file() {
             return Ok(Vec::new());
-        };
+        }
+        let rows = self
+            .rows()
+            .ok_or_else(|| anyhow!("{} exists but could not be read", self.db.display()))?;
         Ok(rows
             .into_iter()
             .filter(|row| row.turn_count > 0)
