@@ -6943,6 +6943,55 @@ fn zcode_lists_project_memories() {
     assert!(all_memories(&fresh).unwrap().is_empty());
 }
 
+/// 用户在 Memory locations 里加的 `<project>/…`(#67):与内置的项目指令文件一样按每个项目根
+/// 展开,形状读时才看(文件读它自己、目录读直属 *.md)。库里记的是 `project_pattern` 的规范形,
+/// 也就是 `id()`——只认规范形,Settings 按 id 删改才对得上
+#[test]
+fn custom_project_patterns_expand_under_every_project() {
+    setup();
+    assert_eq!(
+        project_pattern("<project>//.codebuddy/rules/").as_deref(),
+        Some("<project>/.codebuddy/rules")
+    );
+    for bad in ["<project>/", "<project>/../x", "<project>CODEBUDDY.md"] {
+        assert_eq!(project_pattern(bad), None, "{bad}");
+    }
+    let messy = MemorySource::custom(AgentId::Codebuddy, PathBuf::from("<project>//CODEBUDDY.md"));
+    assert_eq!(
+        messy.kind,
+        MemorySourceKind::Custom,
+        "不是规范形的照旧是具体路径"
+    );
+
+    let project = tempfile::tempdir().unwrap();
+    fs::write(project.path().join("CODEBUDDY.md"), "# project rules\n").unwrap();
+    let rules = project.path().join(".codebuddy").join("rules");
+    fs::create_dir_all(&rules).unwrap();
+    fs::write(rules.join("style.md"), "# style\n").unwrap();
+    let ids = ["<project>/CODEBUDDY.md", "<project>/.codebuddy/rules"];
+    let sources: Vec<MemorySource> = ids
+        .iter()
+        .map(|id| MemorySource::custom(AgentId::Codebuddy, PathBuf::from(id)))
+        .collect();
+    assert_eq!(
+        sources.iter().map(MemorySource::id).collect::<Vec<_>>(),
+        ids
+    );
+    let adapter = CodebuddyAdapter::new().with_custom_root(project.path().join("nowhere"));
+    let docs = adapter
+        .list_memories(&sources, &[project.path().to_path_buf()])
+        .unwrap();
+    let got: Vec<(&str, &str)> = docs
+        .iter()
+        .map(|d| (d.title.as_str(), d.source.as_str()))
+        .collect();
+    assert_eq!(got, [("CODEBUDDY.md", ids[0]), ("style.md", ids[1])]);
+    let project_str = project.path().to_string_lossy();
+    assert!(docs
+        .iter()
+        .all(|d| d.scope == MemoryScope::Project && d.project_path == project_str));
+}
+
 /// 记忆可见层二期:用户写给 agent 的指令文件也进记忆层——各家 home 里的全局文件
 /// (`~/.claude/CLAUDE.md`、`~/.codex/AGENTS.md` + `rules/*.rules`、`~/.gemini/GEMINI.md`)
 /// 由各家 `memory_sources` 报,项目根下的(CLAUDE.md / AGENTS.md / GEMINI.md /

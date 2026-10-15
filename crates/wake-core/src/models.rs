@@ -900,6 +900,9 @@ pub enum MemorySourceKind {
     ProjectFile,
     /// 每个已索引的本地项目根下的一个目录:`<project>/<rel>/*.<ext>`
     ProjectDir { ext: &'static str },
+    /// 用户添加的项目模式(`<project>/CODEBUDDY.md`):每个项目根下的这条路径,形状读时才看,
+    /// 同 `Custom`(#67)
+    ProjectCustom,
 }
 
 /// 记忆的一个来源 = Settings → Memory locations 的一行。各家 adapter 按自己的根报默认
@@ -919,7 +922,9 @@ impl MemorySource {
     pub fn is_pattern(&self) -> bool {
         matches!(
             self.kind,
-            MemorySourceKind::ProjectFile | MemorySourceKind::ProjectDir { .. }
+            MemorySourceKind::ProjectFile
+                | MemorySourceKind::ProjectDir { .. }
+                | MemorySourceKind::ProjectCustom
         )
     }
 
@@ -933,7 +938,8 @@ impl MemorySource {
             }
             MemorySourceKind::ProjectTree
             | MemorySourceKind::ProjectFile
-            | MemorySourceKind::ProjectDir { .. } => MemoryScope::Project,
+            | MemorySourceKind::ProjectDir { .. }
+            | MemorySourceKind::ProjectCustom => MemoryScope::Project,
             MemorySourceKind::ThreadDb => MemoryScope::Thread,
         }
     }
@@ -943,20 +949,51 @@ impl MemorySource {
     pub fn id(&self) -> String {
         let path = self.path.to_string_lossy();
         if self.is_pattern() {
-            format!("<project>/{path}")
+            format!("{PROJECT_PATTERN}/{path}")
         } else {
             path.to_string()
         }
     }
 
-    /// 用户添加的来源(Settings → Memory locations 的 Add location):目录或文件,读时才看
+    /// 用户添加的来源(Settings → Memory locations 的 Add location):目录或文件,读时才看;
+    /// 写成 `<project>/…` 规范形的是项目模式。只认规范形:库里记的必须就是 `id()`,
+    /// Settings 才能按它删改(表单存的就是 `project_pattern` 给的规范形)
     pub fn custom(agent: AgentId, path: std::path::PathBuf) -> Self {
-        Self {
-            agent,
-            kind: MemorySourceKind::Custom,
-            path,
+        let raw = path.to_str();
+        match raw.and_then(|raw| project_pattern(raw).filter(|canon| canon == raw)) {
+            Some(canon) => Self {
+                agent,
+                kind: MemorySourceKind::ProjectCustom,
+                path: std::path::PathBuf::from(&canon[PROJECT_PATTERN.len() + 1..]),
+            },
+            None => Self {
+                agent,
+                kind: MemorySourceKind::Custom,
+                path,
+            },
         }
     }
+}
+
+/// 项目模式写法的开头:`<project>/CLAUDE.md` = 每个项目根下的 CLAUDE.md
+pub const PROJECT_PATTERN: &str = "<project>";
+
+/// `<project>/…` 写法的规范形:相对项目根的那段逐段都得是普通名字(`..`、盘符、根都不收,
+/// 免得读到项目根外面去),一律用 `/` 连(Windows 上手输的 `\`、多余的分隔符都规整掉);
+/// 不是这种写法给 None
+pub fn project_pattern(text: &str) -> Option<String> {
+    let rest = text.strip_prefix(PROJECT_PATTERN)?;
+    if !rest.starts_with(std::path::is_separator) {
+        return None;
+    }
+    let parts = std::path::Path::new(rest.trim_start_matches(std::path::is_separator))
+        .components()
+        .map(|c| match c {
+            std::path::Component::Normal(part) => part.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    (!parts.is_empty()).then(|| format!("{PROJECT_PATTERN}/{}", parts.join("/")))
 }
 
 /// 用户记忆(对每个项目都成立)在一次筛选里怎么算——它是唯一带特殊语义的层级

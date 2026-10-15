@@ -148,19 +148,15 @@ pub trait AgentAdapter: Send + Sync {
     /// 缺根返回 Ok(空)、读失败报 Err(scanner 只冻结这些来源的行);scanner 在每轮
     /// 扫描收尾按 (agent, host) 整组替换入库,消失的文件随之出库。项目归属不在这里
     /// 算:填 `session_key` 指向所属会话,读库时按它连 sessions 表解析(见 MemoryDoc)。
-    /// 默认实现读通用形态(目录 / 文件 / 项目模式)、不缓存——没有自家记忆的 agent
-    /// 只有被用户加了自定义来源或有项目指令文件时才走到。远程装饰器必须转发并改写
-    /// key / host / session_key
+    /// 默认实现读通用形态(目录 / 文件 / 项目模式),缓存用共用的 `SHARED_MEMORY_CACHE`——
+    /// 没有自家记忆的 agent 只有被用户加了自定义来源或有项目指令文件时才走到。远程装饰器
+    /// 必须转发并改写 key / host / session_key
     fn list_memories(
         &self,
         sources: &[MemorySource],
         projects: &[std::path::PathBuf],
     ) -> Result<Vec<MemoryDoc>> {
-        cached_memory_docs(
-            &MemoryCache::new(),
-            self.agent(),
-            &generic_units(sources, projects),
-        )
+        generic_memory_docs(&SHARED_MEMORY_CACHE, self.agent(), sources, projects)
     }
     /// 本实例默认读记忆的来源(Settings → Memory locations 的行):按实例的根派生,
     /// 不看存不存在。项目模式(`<project>/CLAUDE.md` 一类)不在这里报——那是 agent 级
@@ -807,7 +803,9 @@ fn unit_place(source: &MemorySource) -> Option<UnitPlace> {
             UnitPlace::Dir { dir: path, ext }
         }
         MemorySourceKind::File | MemorySourceKind::ProjectFile => UnitPlace::File(path),
-        MemorySourceKind::Custom => UnitPlace::Path { path, ext: "md" },
+        MemorySourceKind::Custom | MemorySourceKind::ProjectCustom => {
+            UnitPlace::Path { path, ext: "md" }
+        }
         MemorySourceKind::ProjectTree | MemorySourceKind::ThreadDb => return None,
     })
 }
@@ -1048,6 +1046,12 @@ pub(crate) struct MemoryCache(
     std::sync::Mutex<std::collections::HashMap<String, (i64, Vec<MemoryDoc>)>>,
 );
 
+/// 没有自家缓存的 agent 共用的一份(默认 `list_memories`、scanner 里没有实例的那一家):
+/// 用户加的 `<project>/…` 会在每个项目根下展开,不缓存就是每轮把匹配到的文件整份重读。
+/// 槽按 agent + 来源分(`cached_memory_docs`),两家同名的来源不会互相顶替
+pub(crate) static SHARED_MEMORY_CACHE: std::sync::LazyLock<MemoryCache> =
+    std::sync::LazyLock::new(MemoryCache::new);
+
 impl MemoryCache {
     pub(crate) fn new() -> Self {
         Self(std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -1146,11 +1150,12 @@ pub(crate) fn cached_memory_docs(
     units: &[MemoryUnit],
 ) -> Result<Vec<MemoryDoc>> {
     use std::hash::{Hash as _, Hasher as _};
-    // 缓存槽按这次读的来源分:scanner 逐来源调,各来源的指纹互不干扰
+    // 缓存槽按 agent + 这次读的来源分:scanner 逐来源调,各来源的指纹互不干扰;共用的
+    // 那份缓存里两家可能有同名的来源(`<project>/AGENTS.md`)
     let mut key: Vec<&str> = units.iter().map(|u| u.source.as_str()).collect();
     key.sort_unstable();
     key.dedup();
-    let key = key.join("\n");
+    let key = format!("{}\n{}", agent.as_str(), key.join("\n"));
     let mut listing: Vec<(&MemoryUnit, Vec<FileStamp>)> = Vec::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     for unit in units {

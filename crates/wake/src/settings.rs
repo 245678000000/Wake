@@ -1582,7 +1582,7 @@ impl SettingsView {
                 });
             }) as RowAction
         });
-        let reveal = (!row.pattern && row.exists).then(|| row.raw.clone());
+        let reveal = row.reveal();
         let remove: Option<RowAction> = row.custom.then(|| {
             let workbench = workbench.clone();
             let (agent, stored) = (row.agent, row.raw.clone());

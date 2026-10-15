@@ -807,10 +807,9 @@ fn sync_memories(adapters: &[Box<dyn AgentAdapter>], store: &Arc<Store>) -> bool
             let one = std::slice::from_ref(&source);
             let read = match planned.adapter {
                 Some(ix) => adapters[ix].list_memories(one, &projects),
-                // 该家没有本地实例(会话 location 全停用):项目指令文件与自定义路径照读;
-                // 没有实例就没处放缓存,这种配置少见、每轮重读
+                // 该家没有本地实例(会话 location 全停用):项目指令文件与自定义路径照读
                 None => crate::adapters::generic_memory_docs(
-                    &crate::adapters::MemoryCache::new(),
+                    &crate::adapters::SHARED_MEMORY_CACHE,
                     planned.agent,
                     one,
                     &projects,

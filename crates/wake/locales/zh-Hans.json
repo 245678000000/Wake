@@ -117,6 +117,7 @@
   "Enable host": "启用主机",
   "Enable location": "启用位置",
   "Enter an absolute folder path": "请输入绝对路径",
+  "Enter an absolute path, or a path under <project>/": "请输入绝对路径，或 <project>/ 开头的项目内路径",
   "Export failed": "导出失败",
   "Exported": "已导出",
   "Failed": "失败",

@@ -2486,6 +2486,13 @@ pub(crate) struct MemoryLocationRow {
     pub(crate) enabled: bool,
 }
 
+impl MemoryLocationRow {
+    /// Show in Finder 挂的路径:具体路径且当下存在才有(项目模式不对应某一个路径)
+    pub(crate) fn reveal(&self) -> Option<SharedString> {
+        (self.exists && !self.pattern).then(|| self.raw.clone())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct MemoryLocationSettingsSnapshot {
     pub(crate) rows: Vec<MemoryLocationRow>,
@@ -3944,13 +3951,8 @@ impl Workbench {
     /// 先判、只判一次(is_absolute 三端同判据,空串它也判 false;**必须判在剪尾之前**:
     /// `//` 剪完是空串,拿剪后的去判会退回未剪形态放行,2026-08-25 review);尾分隔符
     /// 剪掉(展示与重叠判定都吃这份),裸根("/"、"C:\")剪完会失去绝对性、原样保留。
-    /// 不是绝对路径就弹提示、给 None
-    fn absolute_form_path(
-        &self,
-        raw: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<String> {
+    /// 不是绝对路径给 None,提示由调用方弹
+    fn absolute_form_path(raw: &str) -> Option<String> {
         let expanded = expand_tilde(raw.trim());
         let expanded = if cfg!(target_os = "windows") {
             expanded.replace('/', "\\")
@@ -3958,10 +3960,6 @@ impl Workbench {
             expanded
         };
         if !std::path::Path::new(&expanded).is_absolute() {
-            window.push_notification(
-                Notification::warning(t("Enter an absolute folder path")),
-                cx,
-            );
             return None;
         }
         let trimmed = expanded.trim_end_matches(std::path::is_separator);
@@ -3983,7 +3981,11 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(path) = self.absolute_form_path(&raw_text, window, cx) else {
+        let Some(path) = Self::absolute_form_path(&raw_text) else {
+            window.push_notification(
+                Notification::warning(t("Enter an absolute folder path")),
+                cx,
+            );
             return false;
         };
         // 各家归一化(codex:直选 sessions 树/平铺 archived 上提到家层,侧档
@@ -4294,7 +4296,7 @@ impl Workbench {
                 init_agent: row.agent,
                 init_path: row.raw.clone(),
                 pick_files: true,
-                reveal: row.exists.then(|| row.raw.clone()),
+                reveal: row.reveal(),
                 remove: Some(Rc::new(move |this, window, cx| {
                     this.delete_memory_source(remove_old.0, remove_old.1.clone(), window, cx)
                 })),
@@ -4317,7 +4319,18 @@ impl Workbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(path) = self.absolute_form_path(&raw_text, window, cx) else {
+        // `<project>/…` 是项目模式(#67):存规范形,与 `MemorySource::id()` 同一个写法
+        let raw = raw_text.trim();
+        let path = if raw.starts_with(PROJECT_PATTERN) {
+            project_pattern(raw)
+        } else {
+            Self::absolute_form_path(raw)
+        };
+        let Some(path) = path else {
+            window.push_notification(
+                Notification::warning(t("Enter an absolute path, or a path under <project>/")),
+                cx,
+            );
             return false;
         };
         if old
@@ -4326,17 +4339,14 @@ impl Workbench {
         {
             return true;
         }
-        // 与面板同一份来源清单查重:该家的默认具体路径(项目模式不算)与已有的自定义
+        // 与面板同一份来源清单查重(按来源 id:具体路径就是路径,项目模式是 `<project>/…`):
+        // 该家的默认来源与已有的自定义
         let (customs, disabled) = self.store.memory_source_overrides().unwrap_or_default();
         let duplicate =
             wake_core::adapters::memory_source_plan(&self.adapters, &customs, &disabled)
                 .into_iter()
                 .flat_map(|p| p.sources)
-                .any(|p| {
-                    p.source.agent == agent_new
-                        && !p.source.is_pattern()
-                        && p.source.path.to_string_lossy() == path
-                });
+                .any(|p| p.source.agent == agent_new && p.source.id() == path);
         if duplicate {
             window.push_notification(
                 Notification::info(t("This path is already in Wake's memory locations")),
