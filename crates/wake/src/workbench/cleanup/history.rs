@@ -175,7 +175,6 @@ impl Workbench {
             .px(SPACE_XXL)
             .gap(SPACE_MD)
             .items_start()
-            .window_control_area(WindowControlArea::Drag)
             .child(
                 div().pt(zpx(24.)).child(
                     Button::new("cleanup-history-back")

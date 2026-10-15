@@ -6,6 +6,7 @@
 - Fix: On Windows and Linux, adding a memory location offers a file picker next to the folder picker, so a single file no longer has to be typed in by hand (#68, thanks @lin-code-world)
 - New: A memory location can be written as `<project>/CODEBUDDY.md`, like the built-in project files, to read that file or folder in every project (#67, thanks @lin-code-world)
 - Fix: Clean Up no longer refuses CodeBuddy and WorkBuddy sessions written by recent versions (#66, thanks @lin-code-world)
+- Fix: On Windows, buttons at the top of pages and sessions, such as Back, Refresh and Open In, respond to clicks (#65, thanks @lin-code-world)
 
 ## [0.9.3] — 2026-10-13
 

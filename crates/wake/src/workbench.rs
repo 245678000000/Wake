@@ -152,7 +152,6 @@ fn library_header(
         .w_full()
         .h(LIBRARY_IDENTITY_HEIGHT)
         .flex_shrink_0()
-        .window_control_area(WindowControlArea::Drag)
         .px(inset)
         .justify_center()
         .child(
@@ -6891,8 +6890,7 @@ impl Workbench {
 
     // ---------------- Insights ----------------
 
-    /// Insights 整页(替换中栏+右栏)。头部沿用中栏 88px 标题节奏兼窗口
-    /// 拖拽区;内容 720px 阅读宽居中,区块只用留白与组头分隔,不做卡片墙
+    /// Insights 整页(替换中栏+右栏)。头部沿用中栏 88px 标题节奏;内容 720px 阅读宽居中,区块只用留白与组头分隔,不做卡片墙
     fn render_insights(&self, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
         // 副标题只说 "Since {首会话月份}"(用户定稿);拿不到时间时回落默认句
@@ -9847,7 +9845,9 @@ fn project_badge(
 
 /// 阅读面头部的骨架(会话详情与记忆阅读面共用):44px 上下文行(左 `lead`:Label muted
 /// 的品牌图 + agent + 归属;右 `actions`)→ 可换行的 22px 标题(整题挂 tooltip)→
-/// Label 的元信息行。整块是窗口拖拽区
+/// Label 的元信息行。不挂 `window_control_area(Drag)`:它只在 Windows 上起作用,而 Windows 用的是系统
+/// 标题栏,挂上只会在下面多出一块拖窗区、吞掉里面按钮的点击(gpui 只要鼠标下有拖拽区就回 HTCAPTION,#65);
+/// macOS / Linux 的后端本来就不理它
 fn detail_header_frame(
     id: &'static str,
     lead: Vec<AnyElement>,
@@ -9860,7 +9860,6 @@ fn detail_header_frame(
     v_flex()
         .id(id)
         .flex_shrink_0()
-        .window_control_area(WindowControlArea::Drag)
         .px(SPACE_XXL)
         .pb(SPACE_SM)
         .border_b_1()
