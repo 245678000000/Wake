@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.4] — 2026-10-15
 
 - Fix: Refresh picks up sessions you deleted in OpenCode while it was still running, instead of listing them until Wake restarts (#70, thanks @lin-code-world)
 - Fix: On Windows and Linux, adding a memory location offers a file picker next to the folder picker, so a single file no longer has to be typed in by hand (#68, thanks @lin-code-world)
