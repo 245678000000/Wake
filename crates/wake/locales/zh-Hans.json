@@ -56,6 +56,7 @@
   "Checking…": "正在检查…",
   "Choose": "选择",
   "Choose a folder": "选择文件夹",
+  "Choose a file": "选择文件",
   "Choose a folder or file": "选择文件夹或文件",
   "Choose where Wake looks for local agent sessions.": "选择 Wake 查找本地 agent 会话的位置。",
   "Choose which memory and instruction files Wake indexes.": "选择 Wake 索引哪些记忆与指令文件。",

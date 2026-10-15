@@ -2542,6 +2542,26 @@ enum FormTarget {
     },
 }
 
+/// 路径表单的一颗选择按钮选什么
+#[derive(Clone, Copy)]
+enum LocationPick {
+    Folder,
+    File,
+    Either,
+}
+
+impl LocationPick {
+    /// 收文件的表单(记忆来源)在系统选择器不能一个对话框里两样都选时给两颗按钮:Windows
+    /// 一要文件夹就只认文件夹,Linux 的 portal 也是二选一(#68)
+    fn buttons(pick_files: bool, mixed: bool) -> &'static [LocationPick] {
+        match (pick_files, mixed) {
+            (false, _) => &[LocationPick::Folder],
+            (true, true) => &[LocationPick::Either],
+            (true, false) => &[LocationPick::Folder, LocationPick::File],
+        }
+    }
+}
+
 /// 路径表单的一份规格:Session locations 与 Memory locations 共用同一个表单(agent
 /// 下拉 + 路径输入 + 选择钮,Cancel/Save 只在有改动时出现;编辑态动作行左 Remove、
 /// 右 Show in Finder),两页的差别全在这里
@@ -3743,28 +3763,48 @@ impl Workbench {
                                         .child(field_label),
                                 )
                                 .child(div().flex_1().min_w_0().child(Input::new(&browse_input)))
-                                .child(
-                                    Button::new("loc-browse")
-                                        .outline()
-                                        .rounded(RADIUS_BUTTON)
-                                        .icon(icon("icons/folder.svg").with_size(zpx(13.)))
-                                        .tooltip(if pick_files {
-                                            t("Choose a folder or file")
-                                        } else {
-                                            t("Choose a folder")
-                                        })
-                                        .on_click({
-                                            let entity = browse_entity.clone();
-                                            let input = browse_input.clone();
-                                            move |_, window, cx| {
-                                                let input = input.clone();
-                                                entity.update(cx, |this, cx| {
-                                                    this.browse_for_location(
-                                                        input, pick_files, window, cx,
-                                                    )
-                                                });
-                                            }
-                                        }),
+                                .children(
+                                    LocationPick::buttons(
+                                        pick_files,
+                                        cx.can_select_mixed_files_and_dirs(),
+                                    )
+                                    .iter()
+                                    .map(|&pick| {
+                                        let (id, glyph, tooltip) = match pick {
+                                            LocationPick::Folder => (
+                                                "loc-browse",
+                                                "icons/folder.svg",
+                                                t("Choose a folder"),
+                                            ),
+                                            LocationPick::Either => (
+                                                "loc-browse",
+                                                "icons/folder.svg",
+                                                t("Choose a folder or file"),
+                                            ),
+                                            LocationPick::File => (
+                                                "loc-browse-file",
+                                                "icons/file-text.svg",
+                                                t("Choose a file"),
+                                            ),
+                                        };
+                                        Button::new(id)
+                                            .outline()
+                                            .rounded(RADIUS_BUTTON)
+                                            .icon(icon(glyph).with_size(zpx(13.)))
+                                            .tooltip(tooltip)
+                                            .on_click({
+                                                let entity = browse_entity.clone();
+                                                let input = browse_input.clone();
+                                                move |_, window, cx| {
+                                                    let input = input.clone();
+                                                    entity.update(cx, |this, cx| {
+                                                        this.browse_for_location(
+                                                            input, pick, window, cx,
+                                                        )
+                                                    });
+                                                }
+                                            })
+                                    }),
                                 ),
                         )
                         .when(remove.is_some() || reveal.is_some(), |el| {
@@ -3869,18 +3909,17 @@ impl Workbench {
         });
     }
 
-    /// 表单的选择按钮:系统选择器,选中即回填输入框(取消无事发生);记忆来源的
-    /// 表单也收文件
+    /// 表单的选择按钮:系统选择器,选中即回填输入框(取消无事发生)
     fn browse_for_location(
         &mut self,
         input: Entity<InputState>,
-        files: bool,
+        pick: LocationPick,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
-            files,
-            directories: true,
+            files: !matches!(pick, LocationPick::Folder),
+            directories: !matches!(pick, LocationPick::File),
             multiple: false,
             prompt: Some(t("Choose").into()),
         });
