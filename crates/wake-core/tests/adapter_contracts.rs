@@ -6693,7 +6693,8 @@ fn codebuddy_parse_contract() {
 }
 
 /// 没有 custom/ai 标题时退到 topic;reasoning 的 content.text 形也收进 thinking;
-/// 只有 model id 时就显示 id;rawUsage 缺 total_tokens 时按 prompt+completion 计
+/// 只有 model id 时就显示 id;rawUsage 缺 total_tokens 时按 prompt+completion 计。fixture 末尾的
+/// 新版非消息行(#66)都认得、不出消息,`model-usage` 的用量不计
 #[test]
 fn codebuddy_topic_title_and_model_id_fallback() {
     let _env = setup();

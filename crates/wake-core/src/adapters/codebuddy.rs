@@ -25,8 +25,7 @@ use std::path::{Path, PathBuf};
 /// `<image_local_path>…`),CodeBuddy 自己的 getEffectiveSessionTitle 也跳过
 /// 它们。模型取 providerData.requestModelName(人类可读)回退 model(id);
 /// token 取 providerData.rawUsage(OpenAI completions 形)按调用累加。
-/// `file-history-snapshot` / `summary` / `turn-metrics` 是已知元数据行,表外
-/// 计 unknown。`CODEBUDDY_CONFIG_DIR` 覆盖数据根(与 Qoder 的 QODER_CONFIG_DIR
+/// 已知的元数据行见 `KNOWN_SKIP`,表外计 unknown。`CODEBUDDY_CONFIG_DIR` 覆盖数据根(与 Qoder 的 QODER_CONFIG_DIR
 /// 同款:探到会话才采信)。
 ///
 /// 格式来源:官方 CLI 文档 + 三家独立实现(cc-switch / codex-host / codeg)
@@ -67,8 +66,22 @@ impl CodebuddyAdapter {
     }
 }
 
-/// 已知的非消息行:静默跳过、不计 unknown。表外类型计数(漂移金丝雀)
-const KNOWN_SKIP: &[&str] = &["file-history-snapshot", "summary", "turn-metrics"];
+/// 已知的非消息行:静默跳过、不计 unknown。表外类型计数(漂移金丝雀)。照 CodeBuddy 2.167
+/// `isCustomInputItem` 的清单(标题行在解析循环里另处理)加它追加进转录的 `session-meta`
+/// 快照。`model-usage` 是用量没落到消息行上的那次调用的账,是否与消息行上的 rawUsage 互斥
+/// 从打包后的代码里判不准,先不计 token
+const KNOWN_SKIP: &[&str] = &[
+    "file-history-snapshot",
+    "summary",
+    "turn-metrics",
+    "goal-result",
+    "goal-progress",
+    "resend-fork-notice",
+    "acp-terminal-state",
+    "model-usage",
+    "credit-usage",
+    "session-meta",
+];
 
 /// CodeBuddy 的 isGeneratedPlaceholderTitle:自动标题没东西可总结时写的占位,
 /// 显示它比回退到首条用户消息更糟
