@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.5] — 2026-10-16
 
 - New: Sessions you start from another session in the Claude desktop app are listed under that session, as they are in the app
 - Fix: Claude Code sessions you archive in the Claude desktop app are archived in Wake too
