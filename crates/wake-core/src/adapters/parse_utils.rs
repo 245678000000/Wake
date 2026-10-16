@@ -319,8 +319,8 @@ pub fn subagent_parent(path: &std::path::Path) -> Option<String> {
     )
 }
 
-/// 一个会话目录里全部子代理转录的引用(Task / Agent 派的与 Workflow 跑出来的),读不出的目录跳过
-pub fn subagent_refs(agent: AgentId, session_dir: &std::path::Path) -> Vec<SessionFileRef> {
+/// 一个会话目录里全部子代理转录(Task / Agent 派的与 Workflow 跑出来的),读不出的目录跳过
+pub fn subagent_transcripts(session_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let files = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
         std::fs::read_dir(dir)
             .map(|entries| entries.flatten().map(|entry| entry.path()).collect())
@@ -334,9 +334,14 @@ pub fn subagent_refs(agent: AgentId, session_dir: &std::path::Path) -> Vec<Sessi
             transcripts.push(path);
         }
     }
+    transcripts.retain(|path| subagent_session_dir(path).is_some());
     transcripts
+}
+
+/// 一个会话目录里全部子代理转录的引用
+pub fn subagent_refs(agent: AgentId, session_dir: &std::path::Path) -> Vec<SessionFileRef> {
+    subagent_transcripts(session_dir)
         .iter()
-        .filter(|path| subagent_session_dir(path).is_some())
         .filter_map(|path| subagent_ref(agent, path))
         .collect()
 }

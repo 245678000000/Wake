@@ -242,8 +242,10 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 ///       它),老行靠这轮重解析写对;
 /// "16" = 会话目录里的子代理转录(Claude Code 含 Workflow、Cursor CLI、CodeBuddy / WorkBuddy、
 ///       Qoder、Kimi)作为子会话入库、标 spawned,`<git-context>` 不进标题;旧版监听当顶层会话收进来
-///       的 Workflow 转录(sidechain 行被滤掉、零消息)文件没变、引用也没变,靠这轮重解析写对。
-pub const FTS_FORMAT: &str = "16";
+///       的 Workflow 转录(sidechain 行被滤掉、零消息)文件没变、引用也没变,靠这轮重解析写对;
+/// "17" = Claude Code 转录里桌面端的占位标题 "New session" 不算名字(退回桌面会话的名字或首条
+///       提问);桌面端已经没有记录的老会话引用不变,靠这轮重解析写对。
+pub const FTS_FORMAT: &str = "17";
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把

@@ -6,6 +6,7 @@ use super::{
     cli_not_found_error, percent_encode, pipe_to, resolve_cli, resume_args, session_bin, sh_quote,
     spawn_and_reap, ResumeOutcome,
 };
+use crate::adapters::claude_desktop;
 use crate::models::{AgentId, SessionMeta};
 use std::collections::HashMap;
 use std::path::Path;
@@ -501,25 +502,21 @@ fn launch_claude_desktop(meta: &SessionMeta) -> ResumeOutcome {
 }
 
 /// 在 desktop 会话索引里找拥有 `cli_id` 的会话,返回其 stem uuid。
-/// 索引是数百个 KB 级 json,每次点击现扫(读几 ms,别缓存——desktop
-/// 侧随时在写)。解析失败/结构不符的文件跳过,扫不到回 None 走原 id。
+/// 每次点击现扫(几十份 KB 级 json,读几 ms,别缓存——desktop 侧随时在写)。
+/// 解析失败/结构不符的文件跳过,扫不到回 None 走原 id。记录的读法与归档位共用
+/// `adapters::claude_desktop`
 fn claude_desktop_owned_stem(cli_id: &str) -> Option<String> {
-    // home_dir 走 adapters 的 WAKE_HOME 改道,fixture 测试可以铺假索引
-    let root = crate::adapters::home_dir()?
-        .join("Library/Application Support/Claude/claude-code-sessions");
-    let sub = |d: std::fs::DirEntry| std::fs::read_dir(d.path()).into_iter().flatten().flatten();
+    // sessions_root 走 adapters 的 WAKE_HOME 改道,fixture 测试可以铺假索引
+    // 读不出的账号 / 组织目录跳过,别让它连累读得出的那几份
+    let files = claude_desktop::readable_record_files(&claude_desktop::sessions_root());
     // desktop 可能留有多个 <acct>/<org> 目录,而 claude://resume 只在当前
     // 登录账户下找 local_<stem>;当前账户 Wake 无从得知,多份命中时取
     // mtime 最新的记录(基本即活跃账户),别听目录枚举顺序的
-    std::fs::read_dir(root)
-        .ok()?
-        .flatten()
-        .flat_map(sub)
-        .flat_map(sub)
-        .filter_map(|f| {
-            let p = f.path();
-            let stem = owned_stem_in(&p, cli_id)?;
-            let mtime = std::fs::metadata(&p).and_then(|m| m.modified()).ok();
+    files
+        .iter()
+        .filter_map(|p| {
+            let stem = owned_stem_in(p, cli_id)?;
+            let mtime = crate::adapters::parse_utils::stat_stamp(p).map(|(mtime, _)| mtime);
             Some((mtime, stem))
         })
         .max_by_key(|(mtime, _)| *mtime)
@@ -530,35 +527,16 @@ fn claude_desktop_owned_stem(cli_id: &str) -> Option<String> {
 /// 省掉整篇 json 解析(命中的通常恰一份)。调用方保证 cli_id 非空
 /// (空 needle 会 panic)
 fn owned_stem_in(p: &Path, cli_id: &str) -> Option<String> {
-    if p.extension().and_then(|e| e.to_str()) != Some("json") {
-        return None;
-    }
     let data = std::fs::read(p).ok()?;
     let needle = cli_id.as_bytes();
     if !data.windows(needle.len()).any(|w| w == needle) {
         return None;
     }
-    let v = serde_json::from_slice::<serde_json::Value>(&data).ok()?;
-    // 标量三字段 + 历史数组(多次 clear/resume 后旧 CLI id 归档在
-    // priorCliSessionIds 里,漏了它老会话又会被重复导入)
-    let owns = [
-        "cliSessionId",
-        "unarchivedCliSessionId",
-        "preClearCliSessionId",
-    ]
-    .iter()
-    .any(|k| v.get(k).and_then(|x| x.as_str()) == Some(cli_id))
-        || v.get("priorCliSessionIds")
-            .and_then(|x| x.as_array())
-            .is_some_and(|a| a.iter().any(|x| x.as_str() == Some(cli_id)));
-    owns.then(|| {
-        v.get("sessionId")?
-            .as_str()?
-            .strip_prefix("local_")
-            .filter(|s| is_uuid(s))
-            .map(str::to_string)
-    })
-    .flatten()
+    let record = claude_desktop::Record::parse(&data)?;
+    if !record.cli_ids.iter().any(|id| id == cli_id) {
+        return None;
+    }
+    record.stem.filter(|s| is_uuid(s))
 }
 
 fn launch_desktop_id(id: &str, prefix: &str, term: TerminalApp) -> ResumeOutcome {

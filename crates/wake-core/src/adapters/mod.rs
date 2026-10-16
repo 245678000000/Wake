@@ -23,6 +23,7 @@ pub mod zcode;
 
 pub mod remote;
 
+pub(crate) mod claude_desktop;
 pub(crate) mod grok_group;
 pub(crate) mod parse_utils;
 pub(crate) mod pi_format;

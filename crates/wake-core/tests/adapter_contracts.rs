@@ -3240,7 +3240,9 @@ fn watch_paths_derive_from_data_roots() {
         let tag = a.agent().as_str();
         let watched = a.watch_paths();
         // 唯一的例外:Kilo 旧版扩展的任务目录不进监听(每个任务里一整份 checkpoints 影子
-        // git 仓库,见 adapters::kilo);它的新版实例是库文件,本来就没有监听目录
+        // git 仓库,见 adapters::kilo);它的新版实例是库文件,本来就没有监听目录。
+        // Claude Code 的默认实例另听桌面端的会话记录(见 adapters::claude_desktop),假 HOME
+        // 里没有那个目录,所以这里照常相等;它由 claude.rs 的单测卡着
         let expect: Vec<std::path::PathBuf> = if a.agent() == AgentId::Kilo {
             Vec::new()
         } else {

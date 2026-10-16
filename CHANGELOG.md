@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+- New: Sessions you start from another session in the Claude desktop app are listed under that session, as they are in the app
+- Fix: Claude Code sessions you archive in the Claude desktop app are archived in Wake too
+- Fix: Claude Code sessions left as "New session" take the name you gave them in the Claude desktop app, or else their first message
+
 ## [0.9.4] — 2026-10-15
 
 - Fix: Refresh picks up sessions you deleted in OpenCode while it was still running, instead of listing them until Wake restarts (#70, thanks @lin-code-world)

@@ -337,6 +337,7 @@ pub fn start_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::claude_desktop::write_test_record;
     use crate::adapters::craft::CraftAdapter;
     use crate::scanner::NullEvents;
     use notify::event::{CreateKind, EventKind, ModifyKind, RemoveKind, RenameMode};
@@ -447,6 +448,127 @@ mod tests {
         fx.batch(EventKind::Remove(RemoveKind::File), &fx.file);
         let claimed = fx.store.claimed_keys().unwrap();
         assert!(!claimed.contains("claude-code:sdk-1"), "{claimed:?}");
+    }
+
+    /// 在 Claude 桌面端归档、取消归档、删掉桌面会话:只有桌面端那份记录变了,转录没动。
+    /// watcher 听着记录所在的目录,经 `ref_dependents` 把名下的转录补进同一批,库里那行当场跟上
+    #[test]
+    fn claude_desktop_archive_reaches_the_index_live() {
+        use crate::adapters::claude::ClaudeAdapter;
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let dir = projects.join("-w");
+        std::fs::create_dir_all(&dir).unwrap();
+        let id = "c1a0de00-0000-4000-8000-0000000000c3";
+        let row = serde_json::json!({
+            "type": "user", "uuid": "u1", "isSidechain": false, "cwd": "/w", "sessionId": id,
+            "timestamp": "2026-09-01T08:00:01.000Z",
+            "message": { "role": "user", "content": "Why does login time out?" },
+        });
+        std::fs::write(dir.join(format!("{id}.jsonl")), row.to_string() + "\n").unwrap();
+
+        let desktop = tmp.path().join("desktop");
+        let write_record = |archived: bool| {
+            let fields = serde_json::json!({ "cliSessionId": id, "isArchived": archived });
+            write_test_record(&desktop, "d", fields)
+        };
+        let record = write_record(false);
+
+        let store = Arc::new(Store::open(&tmp.path().join("wake.db")).unwrap());
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ClaudeAdapter::with_desktop(
+            projects,
+            desktop.clone(),
+        ))];
+        let roots: Vec<(PathBuf, usize)> = adapters[0]
+            .watch_paths()
+            .into_iter()
+            .map(|p| (p, 0))
+            .collect();
+        crate::scanner::run_scan(&adapters, &store, &NullEvents, true).unwrap();
+        let key = format!("claude-code:{id}");
+        let archived = || store.get_session(&key).unwrap().unwrap().archived;
+        let event = |kind: EventKind| {
+            let batch = vec![Ok(notify::Event::new(kind).add_path(record.clone()))];
+            process_batch(&adapters, &store, &NullEvents, &roots, batch);
+        };
+        assert!(!archived());
+
+        write_record(true);
+        event(EventKind::Modify(ModifyKind::Any));
+        assert!(archived(), "在桌面端归档");
+
+        write_record(false);
+        event(EventKind::Modify(ModifyKind::Any));
+        assert!(!archived(), "取消归档");
+
+        write_record(true);
+        event(EventKind::Modify(ModifyKind::Any));
+        std::fs::remove_file(&record).unwrap();
+        event(EventKind::Remove(RemoveKind::File));
+        assert!(!archived(), "桌面会话删掉了,转录还在");
+    }
+
+    /// Claude 桌面端从一个会话派出去的会话(侧栏里嵌在它下面):挂到派它的会话下面、跟着它
+    /// 的项目;记录里的 spawnedFrom 没了(或派它的会话没了),当场解挂、回到自己的项目
+    #[test]
+    fn claude_desktop_side_sessions_nest_under_the_session_that_started_them() {
+        use crate::adapters::claude::ClaudeAdapter;
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let (parent, child) = (
+            "c1a0de00-0000-4000-8000-0000000000d4",
+            "c1a0de00-0000-4000-8000-0000000000e5",
+        );
+        for (id, dir, cwd) in [(parent, "-w", "/w"), (child, "-w-wt", "/w/wt")] {
+            let dir = projects.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let row = serde_json::json!({
+                "type": "user", "uuid": format!("u-{id}"), "isSidechain": false, "cwd": cwd,
+                "sessionId": id, "timestamp": "2026-09-01T08:00:01.000Z",
+                "message": { "role": "user", "content": "Why does login time out?" },
+            });
+            std::fs::write(dir.join(format!("{id}.jsonl")), row.to_string() + "\n").unwrap();
+        }
+
+        let desktop = tmp.path().join("desktop");
+        write_test_record(&desktop, "p", serde_json::json!({ "cliSessionId": parent }));
+        let write_child = |spawned: bool| {
+            let mut fields = serde_json::json!({ "cliSessionId": child });
+            if spawned {
+                fields["spawnedFrom"] =
+                    serde_json::json!({ "sessionId": "local_p", "taskId": "t" });
+            }
+            write_test_record(&desktop, "c", fields)
+        };
+        let record = write_child(true);
+
+        let store = Arc::new(Store::open(&tmp.path().join("wake.db")).unwrap());
+        let adapters: Vec<Box<dyn AgentAdapter>> = vec![Box::new(ClaudeAdapter::with_desktop(
+            projects,
+            desktop.clone(),
+        ))];
+        let roots: Vec<(PathBuf, usize)> = adapters[0]
+            .watch_paths()
+            .into_iter()
+            .map(|p| (p, 0))
+            .collect();
+        crate::scanner::run_scan(&adapters, &store, &NullEvents, true).unwrap();
+        let (parent_key, child_key) = (
+            format!("claude-code:{parent}"),
+            format!("claude-code:{child}"),
+        );
+        let state = || {
+            let project = store.get_session(&child_key).unwrap().unwrap().project_path;
+            (store.parent_key_of(&child_key).unwrap(), project)
+        };
+        assert_eq!(state(), (Some(parent_key.clone()), "/w".to_string()));
+
+        write_child(false);
+        let batch = vec![Ok(
+            notify::Event::new(EventKind::Modify(ModifyKind::Any)).add_path(record.clone())
+        )];
+        process_batch(&adapters, &store, &NullEvents, &roots, batch);
+        assert_eq!(state(), (None, "/w/wt".to_string()));
     }
 
     /// Claude Code 的分支 B 开头原样复制了原件 A 的第一轮。A 在 Wake 之外消失(Claude 按
