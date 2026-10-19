@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- Fix: Conversations from the Antigravity CLI show their full messages, not just a summary (#71, thanks @dingtwo)
+
 ## [0.9.5] — 2026-10-16
 
 - New: Sessions you start from another session in the Claude desktop app are listed under that session, as they are in the app
