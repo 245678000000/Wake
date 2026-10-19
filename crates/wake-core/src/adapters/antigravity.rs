@@ -15,10 +15,10 @@ use std::sync::Arc;
 ///   ——标题在 preview 列(title 列常空)、时间、workspace、父会话、会话所在的 app 数据目录
 ///   (`app_data_dir`,老库没有这一列);正文另存为加密 .pb,读不到。
 /// - `<app 数据目录>/brain/<id>/.system_generated/logs/transcript.jsonl`:新版本写下的明文转录
-///   (`~/.gemini/antigravity/brain`、`~/.gemini/antigravity-ide/brain` 与 CLI 的
-///   `~/.gemini/antigravity-cli/brain`),用户贴图在同会话的
-///   `.user_uploaded/media_<毫秒>.<ext>`。格式来自 PR #52(@iroha3)对真实数据的整理;2026-10-09
-///   用本机 CLI 写下的转录核过同一形态。
+///   (桌面端 `~/.gemini/antigravity/brain`、IDE `~/.gemini/antigravity-ide/brain`、CLI
+///   `~/.gemini/antigravity-cli/brain`),用户贴图在同会话的 `.user_uploaded/media_<毫秒>.<ext>`。
+///   格式来自 PR #52(@iroha3)对桌面端与 IDE 真实数据的整理,CLI 那份由 PR #71(@dingtwo)
+///   用真实转录核过同一形态;本机的 brain 目录还没有转录,未经真机验证。
 ///
 /// 两种都如实列出,同一会话转录与卡片的胜负交给 scanner 的副本裁决(`dedup_rank`:转录恒胜,
 /// 转录读不出时卡片接得住);转录的标题、工作区与来自哪一端仍以索引为准。索引里记了父会话
