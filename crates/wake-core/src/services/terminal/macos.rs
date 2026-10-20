@@ -300,10 +300,20 @@ fn launch_terminal_app(command: &str) -> anyhow::Result<()> {
 
 fn launch_iterm(command: &str) -> anyhow::Result<()> {
     let esc = applescript_quote(command);
+    // `write text` 的直接参数是 session specifier。一行
+    // `tell current session of … to write text "…"` 会被编成
+    // `write text "…" current session …`，iTerm 词典里 `text` 是
+    // 命名参数，AppleScript 在 `session` 处报 -2741
+    // （Expected end of line but found identifier）。
+    // 先接住 create window 的返回值，再在 tell 块里 write。
     let out = osascript(&[
-        "tell application \"iTerm\" to activate".to_string(),
-        "tell application \"iTerm\" to create window with default profile".to_string(),
-        format!("tell current session of current window of application \"iTerm\" to write text \"{esc}\""),
+        "tell application \"iTerm\"".to_string(),
+        "activate".to_string(),
+        "set wakeWindow to (create window with default profile)".to_string(),
+        "tell current session of wakeWindow".to_string(),
+        format!("write text \"{esc}\""),
+        "end tell".to_string(),
+        "end tell".to_string(),
     ])?;
     if !out.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr));
