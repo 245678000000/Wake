@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fix: Codex sessions stored as `.jsonl.zst` are listed, searchable and readable alongside plain JSONL, keeping their titles and archived status
+
 - Fix: Conversations from the Antigravity CLI show their full messages, not just a summary (#71, thanks @dingtwo)
 
 ## [0.9.5] — 2026-10-16

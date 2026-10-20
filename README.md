@@ -37,7 +37,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 | Agent | Data source | Model | Via |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` | ✅ | — |
-| Codex CLI | `~/.codex/sessions` + `state_5.sqlite` | ✅ | ✅ |
+| Codex CLI | `~/.codex/sessions/**/*.jsonl[.zst]` + `state_5.sqlite` | ✅ | ✅ |
 | Qoder CLI | `~/.qoder/projects/*/*.jsonl` | ✅ | — |
 | Copilot CLI | `~/.copilot/session-store.db` | — | — |
 | Cursor | `~/.cursor/projects/**/agent-transcripts` + Cursor's `state.vscdb` (IDE chats) | ✅ | — |
