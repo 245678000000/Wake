@@ -300,10 +300,18 @@ fn launch_terminal_app(command: &str) -> anyhow::Result<()> {
 
 fn launch_iterm(command: &str) -> anyhow::Result<()> {
     let esc = applescript_quote(command);
+    // iTerm 词典里的词(current window / current session)要写在 `tell application "iTerm"`
+    // 块里:写在 `of application "iTerm"` 前面时编译器还没载入 iTerm 的词典,原先那一行
+    // `tell current session of current window of application "iTerm" to …` 因此在
+    // `session` 处报 -2741,整段一句都不执行。命令发给 create window 返回的那个窗口
     let out = osascript(&[
-        "tell application \"iTerm\" to activate".to_string(),
-        "tell application \"iTerm\" to create window with default profile".to_string(),
-        format!("tell current session of current window of application \"iTerm\" to write text \"{esc}\""),
+        "tell application \"iTerm\"".to_string(),
+        "activate".to_string(),
+        "set wakeWindow to (create window with default profile)".to_string(),
+        "tell current session of wakeWindow".to_string(),
+        format!("write text \"{esc}\""),
+        "end tell".to_string(),
+        "end tell".to_string(),
     ])?;
     if !out.status.success() {
         anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr));
