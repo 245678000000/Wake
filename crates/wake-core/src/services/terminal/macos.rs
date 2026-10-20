@@ -300,12 +300,10 @@ fn launch_terminal_app(command: &str) -> anyhow::Result<()> {
 
 fn launch_iterm(command: &str) -> anyhow::Result<()> {
     let esc = applescript_quote(command);
-    // `write text` 的直接参数是 session specifier。一行
-    // `tell current session of … to write text "…"` 会被编成
-    // `write text "…" current session …`，iTerm 词典里 `text` 是
-    // 命名参数，AppleScript 在 `session` 处报 -2741
-    // （Expected end of line but found identifier）。
-    // 先接住 create window 的返回值，再在 tell 块里 write。
+    // iTerm 词典里的词(current window / current session)要写在 `tell application "iTerm"`
+    // 块里:写在 `of application "iTerm"` 前面时编译器还没载入 iTerm 的词典,原先那一行
+    // `tell current session of current window of application "iTerm" to …` 因此在
+    // `session` 处报 -2741,整段一句都不执行。命令发给 create window 返回的那个窗口
     let out = osascript(&[
         "tell application \"iTerm\"".to_string(),
         "activate".to_string(),
