@@ -1564,6 +1564,94 @@ fn codex_usage_and_realtime_records_are_known() {
     );
 }
 
+/// 2025 年 9 月前后的老格式:首行 `{id, timestamp, instructions, git}` 没有信封,每轮之间夹着
+/// `{"record_type":"state"}`,条目是不带信封的 response item、也不带时间。原先整份落进未知行、
+/// 入库成 0 条消息的 Untitled(本机 17 条);工作目录只在 `<environment_context>` 里。这些会话
+/// 在 state DB 里没有行,标题全靠首条提问——IDE 扩展把编辑器上下文包在提问外面,标题只取
+/// 提问,正文原样保留(选中的代码是用户特意附上的)
+#[test]
+fn codex_legacy_rollouts_are_read() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2025/09/05");
+    fs::create_dir_all(&day).unwrap();
+    let id = "5aa9ab7a-0000-4000-8000-000000002025";
+    let lines = [
+        serde_json::json!({"id": id, "timestamp": "2025-09-05T02:54:37.123Z", "instructions": null,
+            "git": {"commit_hash": "abc123", "branch": "main", "repository_url": "git@example.com:me/legacy.git"}}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "<environment_context>\n  <cwd>/work/legacy-proj</cwd>\n  <approval_policy>on-request</approval_policy>\n</environment_context>"}]}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "# Context from my IDE setup:\n\n## Active file: src/login.rs\n\n## Active selection of the file:\nfn login() {}\n\n## My request for Codex:\nFix the login button\n"}]}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "reasoning", "id": "rs_1", "content": null, "encrypted_content": "gAAA",
+            "summary": [{"type": "summary_text", "text": "Looking at the click handler"}]}),
+        serde_json::json!({"type": "function_call", "id": "fc_1", "name": "shell",
+            "arguments": "{\"command\":[\"rg\",\"login\"]}", "call_id": "call_1"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "call_1",
+            "output": "{\"output\":\"src/login.rs:12\",\"metadata\":{\"exit_code\":0}}"}),
+        serde_json::json!({"type": "message", "id": "msg_1", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Fixed the handler in src/login.rs."}]}),
+        serde_json::json!({"record_type": "state"}),
+    ];
+    let path = day.join(format!("rollout-2025-09-05T10-54-37-{id}.jsonl"));
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&path, body).unwrap();
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("老格式照常列出");
+    assert_eq!(r.native_id, id);
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(transcript.unknown_line_count, 0);
+    let visible: Vec<&TranscriptMessage> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .collect();
+    let texts: Vec<&str> = visible
+        .iter()
+        .map(|m| m.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        texts[0].starts_with("# Context from my IDE setup:") && texts[0].contains("fn login() {}"),
+        "正文原样保留:{}",
+        texts[0]
+    );
+    assert_eq!(texts[1..], ["Fixed the handler in src/login.rs."]);
+    let tools: Vec<&ToolCallView> = visible.iter().flat_map(|m| &m.tool_calls).collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "shell");
+    assert!(
+        tools[0]
+            .output
+            .as_deref()
+            .unwrap_or("")
+            .contains("src/login.rs:12"),
+        "{:?}",
+        tools[0].output
+    );
+    assert!(visible
+        .iter()
+        .any(|m| m.thinking.as_deref() == Some("Looking at the click handler")));
+
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(session.meta.title, "Fix the login button");
+    assert_eq!(session.meta.project_path, "/work/legacy-proj");
+    assert_eq!(session.meta.git_branch.as_deref(), Some("main"));
+    assert_eq!(
+        session.meta.created_at,
+        ms("2025-09-05T02:54:37.123Z"),
+        "创建时间取首行"
+    );
+    assert_eq!(
+        session.meta.updated_at, r.mtime_ms,
+        "条目不带时间,活动时间退回文件 mtime"
+    );
+    assert_seq_contract(adapter.as_ref(), &r);
+}
+
 #[test]
 fn qoder_parse_contract() {
     setup();

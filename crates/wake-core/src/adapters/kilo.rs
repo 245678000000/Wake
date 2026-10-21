@@ -477,13 +477,6 @@ fn build_meta(
 
 // ---------------------------------------------------------------- 正文
 
-/// `<tag>…</tag>` 的内文(去首尾空白);没有或为空 = None
-fn tag_inner(text: &str, tag: &str) -> Option<String> {
-    extract_tag(text, tag)
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
 /// 截掉每轮附带的 `<environment_details>` 及其后的内容(它总在消息末尾)
 fn strip_env_details(text: &str) -> &str {
     text.find("<environment_details>")

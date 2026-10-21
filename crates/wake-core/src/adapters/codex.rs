@@ -517,6 +517,21 @@ fn format_review_json(text: &str) -> Option<String> {
     format_review_output(&review)
 }
 
+/// 2025 年 9 月前后的老格式首行:`{id, timestamp, instructions, git}`,没有 type 信封;之后是
+/// `{"record_type":"state"}` 标记与不带信封的 response item(message / reasoning / function_call …)
+fn is_legacy_header(row: &Value) -> bool {
+    row.get("type").is_none() && row.get("id").is_some() && row.get("timestamp").is_some()
+}
+
+/// `<environment_context>` 注入块里的工作目录:session_meta 与 turn_context 都没给 cwd 时的兜底
+/// (老格式只有它)。认块的写法与 `is_injected_user_content` 一致
+fn environment_cwd(text: &str) -> Option<String> {
+    text.trim_start()
+        .starts_with("<environment_context")
+        .then(|| tag_inner(text, "cwd"))
+        .flatten()
+}
+
 fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let _image_budget = transcript_image_decode_budget(decode_images);
     let file = fs::File::open(path)?;
@@ -540,15 +555,24 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let mut history_start: Option<i64> = None;
     // 子线程里"父线程历史到此为止"的下标(messages / event_fallback 各一)
     let mut inherited: Option<(usize, usize)> = None;
+    // 老格式(is_legacy_header):条目本身就是 response_item 的 payload
+    let mut legacy = false;
     // 用量记录里整个线程的累计,只在文件里没有 token_count 时用
     let mut usage_record_tokens: i64 = 0;
 
-    for row in jsonl_values(reader) {
+    for (i, row) in jsonl_values(reader).enumerate() {
         let Some(row) = row? else {
             unknown_lines += 1;
             continue;
         };
         let ts = row.get("timestamp").map(to_epoch_ms).unwrap_or(0);
+        if i == 0 && is_legacy_header(&row) {
+            legacy = true;
+            // 条目都不带时间,只有首行有;updated_at 留给文件 mtime(build_meta 的兜底)
+            created_at = ts;
+            git_branch = optional_string(row.pointer("/git/branch"));
+            continue;
+        }
         if ts > 0 {
             if created_at == 0 {
                 created_at = ts;
@@ -569,12 +593,21 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                 inherited = Some((messages.len(), event_fallback.len()));
             }
         }
-        let typ = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let Some(payload) = row.get("payload") else {
-            if typ != "compacted" && typ != "world_state" {
-                unknown_lines += 1;
+        let (typ, payload) = if legacy {
+            // 每轮之间的 `{"record_type":"state"}` 是写端的状态标记
+            if row.get("record_type").is_some() {
+                continue;
             }
-            continue;
+            ("response_item", &row)
+        } else {
+            let typ = row.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(payload) = row.get("payload") else {
+                if typ != "compacted" && typ != "world_state" {
+                    unknown_lines += 1;
+                }
+                continue;
+            };
+            (typ, payload)
         };
 
         match typ {
@@ -631,6 +664,9 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
                         for block in blocks {
                             let mut parsed = content_parts(block, decode_images);
                             let text = if role == "user" {
+                                if cwd.is_empty() {
+                                    cwd = environment_cwd(&parsed.text).unwrap_or_default();
+                                }
                                 clean_user_text(&parsed.text)
                             } else {
                                 parsed.text.trim().to_string()
