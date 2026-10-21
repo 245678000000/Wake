@@ -540,6 +540,8 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let mut history_start: Option<i64> = None;
     // 子线程里"父线程历史到此为止"的下标(messages / event_fallback 各一)
     let mut inherited: Option<(usize, usize)> = None;
+    // 用量记录里整个线程的累计,只在文件里没有 token_count 时用
+    let mut usage_record_tokens: i64 = 0;
 
     for row in jsonl_values(reader) {
         let Some(row) = row? else {
@@ -875,8 +877,29 @@ fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
             }
             // 子线程每收一次派活就有一行,内容只有 {"trigger_turn":true}
             "world_state" | "inter_agent_communication_metadata" => {}
+            // 0.156 起每次模型调用记一行用量(这一次 / 这一轮 / 整个线程三份)。token 仍以
+            // event_msg 的 token_count 为准:两种在同一文件里同时出现(本机 51 份全是),整个线程
+            // 那份又与 token_count 不总相等(14 份多出约 2%)。一份文件只认一个来源,这里只记下
+            // 来,哪天 Codex 不写 token_count 了才用它
+            "token_usage_record" => {
+                if let Some(total) = payload
+                    .pointer("/thread_token_usage/total_tokens")
+                    .and_then(Value::as_i64)
+                {
+                    usage_record_tokens = total;
+                }
+            }
+            // 语音会话的起止标记;transcript_segment 这类带内容的子类型还没见过样本,照旧计未知行
+            "realtime_item"
+                if matches!(
+                    payload.get("type").and_then(Value::as_str),
+                    Some("realtime_session_started" | "realtime_session_closed")
+                ) => {}
             _ => unknown_lines += 1,
         }
+    }
+    if tokens_used == 0 {
+        tokens_used = usage_record_tokens;
     }
 
     // fork 段先折叠再判 has_real:折完只剩一条 Meta 的子线程要走得到
