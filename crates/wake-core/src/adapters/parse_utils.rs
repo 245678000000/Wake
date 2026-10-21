@@ -1351,6 +1351,7 @@ pub fn clean_prompt_line(raw: &str) -> String {
 /// 两者共用的清洗;`whole_command` 定 slash 命令写成 `/name args`,还是只留参数(没有参数退
 /// 命令名)
 fn clean_user_text(raw: &str, whole_command: bool) -> String {
+    let raw = codex_ide_request(raw).unwrap_or(raw);
     let mut s = strip_tag_block(raw, "system-reminder");
     s = strip_tag_block(&s, "local-command-caveat");
     s = strip_tag_block(&s, "local-command-stdout");
@@ -1396,6 +1397,17 @@ fn clean_user_text(raw: &str, whole_command: bool) -> String {
     crate::text::one_line(&out.replace(IMAGE_PLACEHOLDER, " "), MAX_TITLE)
 }
 
+/// Codex IDE 扩展把编辑器上下文(活动文件、打开的标签页、选中的代码)包在提问外面,
+/// `## My request for Codex:` 之后才是用户的话。只给标题与交接用:正文原样保留,选中的
+/// 代码是用户特意附上的
+fn codex_ide_request(text: &str) -> Option<&str> {
+    let (_, request) = text
+        .trim_start()
+        .strip_prefix("# Context from my IDE setup:")?
+        .split_once("## My request for Codex:")?;
+    Some(request)
+}
+
 fn strip_tag_block(s: &str, tag: &str) -> String {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
@@ -1425,6 +1437,13 @@ pub(crate) fn extract_tag(s: &str, tag: &str) -> Option<String> {
     let i = s.find(&open)?;
     let j = s[i + open.len()..].find(&close)?;
     Some(s[i + open.len()..i + open.len() + j].to_string())
+}
+
+/// `<tag>…</tag>` 的内文(去首尾空白);没有或为空 = None
+pub(crate) fn tag_inner(text: &str, tag: &str) -> Option<String> {
+    extract_tag(text, tag)
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// IDE/CLI 注入型"用户"消息:非用户手打,详情里应归 Meta 折叠,不参与标题推导。
@@ -1766,6 +1785,17 @@ mod tests {
         );
         let request = unwrap_file_preamble(wrapped).expect("wrapped request");
         assert_eq!(strip_image_tags(&request), "看看这里  怎么了");
+        // IDE 扩展的编辑器上下文只在标题与交接里拆掉;正文不经这里,选中的代码还在
+        let ide = concat!(
+            "# Context from my IDE setup:\n\n",
+            "## Active file: src/login.rs\n\n",
+            "## Active selection of the file:\nfn login() {}\n\n",
+            "## My request for Codex:\n",
+            "修一下登录按钮\n"
+        );
+        assert_eq!(unwrap_file_preamble(ide), None);
+        assert_eq!(clean_title_candidate(ide), "修一下登录按钮");
+        assert_eq!(clean_prompt_line(ide), "修一下登录按钮");
         let ordinary = "为什么 <image src=\"avatar.png\"></image> 没有显示？";
         assert_eq!(strip_image_tags(ordinary), ordinary);
         assert_eq!(clean_title_candidate("[image] 看看这里"), "看看这里");

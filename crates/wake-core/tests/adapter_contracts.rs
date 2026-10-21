@@ -1483,6 +1483,175 @@ fn codex_review_output_is_readable_and_not_duplicated() {
     assert!(session.units[0].text.contains("Keep the selected row"));
 }
 
+/// 0.156 起的两种记录:`token_usage_record` 每次模型调用一行,`realtime_item` 的起止
+/// 标记是语音会话的元数据,都不算未知行(Clean Up 移动前要求整份读懂,否则拒清)。
+/// token 以 event_msg 的 token_count 为准,用量记录里整个线程的累计只在文件里没有
+/// token_count 时才用;带内容的语音子类型(transcript_segment 等)还没见过样本,照旧计未知行
+#[test]
+fn codex_usage_and_realtime_records_are_known() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2026/10/19");
+    fs::create_dir_all(&day).unwrap();
+    let id = "01a12345-0000-7000-8000-000000000156";
+    let usage = |input: i64| {
+        serde_json::json!({
+            "input_tokens": input, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": input + 10
+        })
+    };
+    let realtime = |kind: &str| {
+        serde_json::json!({"timestamp": "2026-10-19T00:00:05.000Z", "type": "realtime_item",
+            "payload": {"realtime_session_id": "rs-1", "type": kind}})
+    };
+    let token_count = serde_json::json!({"timestamp": "2026-10-19T00:00:04.000Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": usage(3000),
+            "last_token_usage": usage(100), "model_context_window": 272000}}});
+    let lines = vec![
+        serde_json::json!({"timestamp": "2026-10-19T00:00:00.000Z", "type": "session_meta",
+            "payload": {"id": id, "timestamp": "2026-10-19T00:00:00.000Z", "cwd": "/work/wake",
+                "originator": "codex_cli_rs", "source": "cli", "cli_version": "0.156.0"}}),
+        realtime("realtime_session_started"),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:02.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Count the tokens"}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.500Z", "type": "token_usage_record",
+            "payload": {"thread_id": id, "turn_id": "t-1", "session_id": id, "root_turn_id": "t-1",
+                "response_id": "resp_1", "usage": usage(100), "turn_token_usage": usage(100),
+                "thread_token_usage": usage(4000)}}),
+        token_count.clone(),
+        realtime("realtime_session_closed"),
+        realtime("transcript_segment"),
+    ];
+    let path = day.join(format!("rollout-2026-10-19T00-00-00-{id}.jsonl"));
+    let write = |lines: &[serde_json::Value]| {
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(&path, body).unwrap();
+    };
+    write(&lines);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("用户线程照常列出");
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(
+        transcript.unknown_line_count, 1,
+        "只有 transcript_segment 计未知行"
+    );
+    let texts: Vec<&str> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Count the tokens", "Done."]);
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(
+        session.meta.tokens_used,
+        Some(3010),
+        "token 以 token_count 的累计为准"
+    );
+
+    // 哪天 Codex 不写 token_count 了:退回用量记录里整个线程的累计,不至于没有 token
+    let without: Vec<serde_json::Value> = lines.into_iter().filter(|l| *l != token_count).collect();
+    write(&without);
+    let r = adapter.file_ref(&path).unwrap();
+    assert_eq!(
+        adapter.parse_session(&r).unwrap().meta.tokens_used,
+        Some(4010)
+    );
+}
+
+/// 2025 年 9 月前后的老格式:首行 `{id, timestamp, instructions, git}` 没有信封,每轮之间夹着
+/// `{"record_type":"state"}`,条目是不带信封的 response item、也不带时间。原先整份落进未知行、
+/// 入库成 0 条消息的 Untitled(本机 17 条);工作目录只在 `<environment_context>` 里。这些会话
+/// 在 state DB 里没有行,标题全靠首条提问——IDE 扩展把编辑器上下文包在提问外面,标题只取
+/// 提问,正文原样保留(选中的代码是用户特意附上的)
+#[test]
+fn codex_legacy_rollouts_are_read() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2025/09/05");
+    fs::create_dir_all(&day).unwrap();
+    let id = "5aa9ab7a-0000-4000-8000-000000002025";
+    let lines = [
+        serde_json::json!({"id": id, "timestamp": "2025-09-05T02:54:37.123Z", "instructions": null,
+            "git": {"commit_hash": "abc123", "branch": "main", "repository_url": "git@example.com:me/legacy.git"}}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "<environment_context>\n  <cwd>/work/legacy-proj</cwd>\n  <approval_policy>on-request</approval_policy>\n</environment_context>"}]}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "# Context from my IDE setup:\n\n## Active file: src/login.rs\n\n## Active selection of the file:\nfn login() {}\n\n## My request for Codex:\nFix the login button\n"}]}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "reasoning", "id": "rs_1", "content": null, "encrypted_content": "gAAA",
+            "summary": [{"type": "summary_text", "text": "Looking at the click handler"}]}),
+        serde_json::json!({"type": "function_call", "id": "fc_1", "name": "shell",
+            "arguments": "{\"command\":[\"rg\",\"login\"]}", "call_id": "call_1"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "call_1",
+            "output": "{\"output\":\"src/login.rs:12\",\"metadata\":{\"exit_code\":0}}"}),
+        serde_json::json!({"type": "message", "id": "msg_1", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Fixed the handler in src/login.rs."}]}),
+        serde_json::json!({"record_type": "state"}),
+    ];
+    let path = day.join(format!("rollout-2025-09-05T10-54-37-{id}.jsonl"));
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&path, body).unwrap();
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("老格式照常列出");
+    assert_eq!(r.native_id, id);
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(transcript.unknown_line_count, 0);
+    let visible: Vec<&TranscriptMessage> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .collect();
+    let texts: Vec<&str> = visible
+        .iter()
+        .map(|m| m.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        texts[0].starts_with("# Context from my IDE setup:") && texts[0].contains("fn login() {}"),
+        "正文原样保留:{}",
+        texts[0]
+    );
+    assert_eq!(texts[1..], ["Fixed the handler in src/login.rs."]);
+    let tools: Vec<&ToolCallView> = visible.iter().flat_map(|m| &m.tool_calls).collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "shell");
+    assert!(
+        tools[0]
+            .output
+            .as_deref()
+            .unwrap_or("")
+            .contains("src/login.rs:12"),
+        "{:?}",
+        tools[0].output
+    );
+    assert!(visible
+        .iter()
+        .any(|m| m.thinking.as_deref() == Some("Looking at the click handler")));
+
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(session.meta.title, "Fix the login button");
+    assert_eq!(session.meta.project_path, "/work/legacy-proj");
+    assert_eq!(session.meta.git_branch.as_deref(), Some("main"));
+    assert_eq!(
+        session.meta.created_at,
+        ms("2025-09-05T02:54:37.123Z"),
+        "创建时间取首行"
+    );
+    assert_eq!(
+        session.meta.updated_at, r.mtime_ms,
+        "条目不带时间,活动时间退回文件 mtime"
+    );
+    assert_seq_contract(adapter.as_ref(), &r);
+}
+
 #[test]
 fn qoder_parse_contract() {
     setup();

@@ -3,7 +3,9 @@
 ## [Unreleased]
 
 - Fix: Codex sessions stored as `.jsonl.zst` are listed, searchable and readable alongside plain JSONL, keeping their titles and archived status
-
+- Fix: Sessions recorded by older Codex versions show their messages and titles instead of appearing empty
+- Fix: Clean Up no longer refuses Codex sessions written by recent versions
+- Fix: Open In → iTerm resumes the session in a new iTerm window instead of failing with an AppleScript error (#73, thanks @quintus-lab)
 - Fix: Conversations from the Antigravity CLI show their full messages, not just a summary (#71, thanks @dingtwo)
 
 ## [0.9.5] — 2026-10-16
