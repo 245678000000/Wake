@@ -118,14 +118,14 @@ impl SpawnMeta {
     }
 }
 
-/// Keep the uncompressed rollout name for both native IDs and state-DB lookup.
+/// rollout 去掉 `.zst` 后的文件名:Codex 0.156 的后台任务把旧会话压成 `rollout-*.jsonl.zst`,
+/// state DB 里记的仍是原来的 `.jsonl`,会话 id 与 state DB 的文件名匹配都按这个名字算
 fn rollout_name(name: &str) -> Option<&str> {
     let name = name.strip_suffix(".zst").unwrap_or(name);
     name.ends_with(".jsonl").then_some(name)
 }
 
-/// Decode in memory; never expand or rewrite Codex's original files. The decoder
-/// reads concatenated frames as well as a single compressed rollout.
+/// 在内存里流式解压,不展开、不改写 Codex 的原文件;单帧与多帧拼接的压缩文件都读得了
 fn open_rollout(path: &Path, capacity: usize) -> std::io::Result<Box<dyn BufRead>> {
     let file = fs::File::open(path)?;
     if path.extension().is_some_and(|ext| ext == "zst") {
@@ -1395,8 +1395,7 @@ impl AgentAdapter for CodexAdapter {
 
     fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
         let mut paths = vec![meta.file_path.clone()];
-        // A retained sibling is the same session, so deleting one encoding must
-        // not make the other encoding reappear on the next refresh.
+        // 两种编码并存时是同一个会话,一起移进废纸篓,不在原处留一份
         let sibling = if meta.file_path.ends_with(".jsonl.zst") {
             meta.file_path.strip_suffix(".zst").unwrap().to_string()
         } else {
