@@ -118,14 +118,33 @@ impl SpawnMeta {
     }
 }
 
+/// rollout 去掉 `.zst` 后的文件名:Codex 0.156 的后台任务把旧会话压成 `rollout-*.jsonl.zst`,
+/// state DB 里记的仍是原来的 `.jsonl`,会话 id 与 state DB 的文件名匹配都按这个名字算
+fn rollout_name(name: &str) -> Option<&str> {
+    let name = name.strip_suffix(".zst").unwrap_or(name);
+    name.ends_with(".jsonl").then_some(name)
+}
+
+/// 在内存里流式解压,不展开、不改写 Codex 的原文件;单帧与多帧拼接的压缩文件都读得了
+fn open_rollout(path: &Path, capacity: usize) -> std::io::Result<Box<dyn BufRead>> {
+    let file = fs::File::open(path)?;
+    if path.extension().is_some_and(|ext| ext == "zst") {
+        let decoder =
+            zstd::stream::read::Decoder::with_buffer(BufReader::with_capacity(capacity, file))?;
+        Ok(Box::new(BufReader::with_capacity(capacity, decoder)))
+    } else {
+        Ok(Box::new(BufReader::with_capacity(capacity, file)))
+    }
+}
+
 fn read_thread_kind(path: &Path) -> ThreadKind {
-    let Ok(file) = fs::File::open(path) else {
+    let Ok(mut reader) = open_rollout(path, 1 << 16) else {
         return ThreadKind::User;
     };
     // payload 还带 base_instructions:实测首行中位数 18 KB、最大 49 KB
     // (2026-09-15),预留容量免得 read_line 反复倍增
     let mut first_line = String::with_capacity(1 << 16);
-    if BufReader::new(file).read_line(&mut first_line).unwrap_or(0) == 0 {
+    if reader.read_line(&mut first_line).unwrap_or(0) == 0 {
         return ThreadKind::User;
     }
     let Ok(head) = serde_json::from_str::<SessionMetaHead>(&first_line) else {
@@ -190,7 +209,7 @@ fn is_rollout_store(dir: &Path) -> bool {
                     let name = e.file_name();
                     let Some(n) = name.to_str() else { return false };
                     (e.path().is_dir() && n.len() == 4 && n.bytes().all(|b| b.is_ascii_digit()))
-                        || (n.starts_with("rollout-") && n.ends_with(".jsonl"))
+                        || (n.starts_with("rollout-") && rollout_name(n).is_some())
                 })
             })
             .unwrap_or(false)
@@ -534,8 +553,7 @@ fn environment_cwd(text: &str) -> Option<String> {
 
 fn parse_rollout(path: &Path, decode_images: bool) -> Result<CodexParse> {
     let _image_budget = transcript_image_decode_budget(decode_images);
-    let file = fs::File::open(path)?;
-    let reader = BufReader::with_capacity(1 << 20, file);
+    let reader = open_rollout(path, 1 << 20)?;
 
     let mut messages: Vec<TranscriptMessage> = Vec::new();
     let mut event_fallback: Vec<TranscriptMessage> = Vec::new();
@@ -1175,11 +1193,17 @@ impl AgentAdapter for CodexAdapter {
 
     fn list_session_files(&self) -> Result<Vec<SessionFileRef>> {
         // 全量枚举与 watcher 同走 file_ref 这一个漏斗(dsh 同款):native id 剥离
-        // 与内部线程判定只存在一处,两条入口不可能分家;缺根时 jsonl_entries 给空
+        // 与内部线程判定只存在一处,两条入口不可能分家;缺根时 WalkDir 给空
         Ok(self
             .data_roots()
             .iter()
-            .flat_map(|root| jsonl_entries(root))
+            .flat_map(|root| {
+                walkdir::WalkDir::new(root)
+                    .min_depth(1)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|entry| entry.file_type().is_file())
             .filter_map(|entry| self.file_ref(entry.path()))
             .collect())
     }
@@ -1191,11 +1215,13 @@ impl AgentAdapter for CodexAdapter {
         // uuid)全局唯一,按文件名匹配即可,与根/host/平台分隔符都无关
         let by_name: HashMap<&str, &ThreadRow> = rows
             .iter()
-            .map(|r| (path_tail(&r.rollout_path), r))
+            .filter_map(|r| rollout_name(path_tail(&r.rollout_path)).map(|name| (name, r)))
             .collect();
         let mut out = HashMap::new();
         for r in refs {
-            let Some(row) = by_name.get(path_tail(&r.file_path)) else {
+            let Some(row) =
+                rollout_name(path_tail(&r.file_path)).and_then(|name| by_name.get(name))
+            else {
                 continue;
             };
             // 结构化 source(对象)= 子代理线程(列得出来的只剩 spawn_agent 派的,内部
@@ -1258,12 +1284,22 @@ impl AgentAdapter for CodexAdapter {
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        let mut r = default_file_ref(self.agent(), path)?;
+        let name = path.file_name()?.to_str()?;
+        if name.starts_with('.') {
+            return None;
+        }
+        let stem = rollout_name(name)?.strip_suffix(".jsonl")?;
+        let (mtime_ms, size) = stat_stamp(path).filter(|(_, size)| *size > 0)?;
         if matches!(read_thread_kind(path), ThreadKind::Internal) {
             return None;
         }
-        r.native_id = rollout_native_id(&r.native_id);
-        Some(r)
+        Some(SessionFileRef {
+            agent: self.agent(),
+            native_id: rollout_native_id(stem),
+            file_path: path.to_string_lossy().into_owned(),
+            mtime_ms,
+            size,
+        })
     }
 
     fn parent_links_global(&self) -> bool {
@@ -1355,6 +1391,20 @@ impl AgentAdapter for CodexAdapter {
             sidechains: Vec::new(),
             unknown_line_count: parsed.unknown_lines,
         })
+    }
+
+    fn session_paths(&self, meta: &SessionMeta) -> Vec<String> {
+        let mut paths = vec![meta.file_path.clone()];
+        // 两种编码并存时是同一个会话,一起移进废纸篓,不在原处留一份
+        let sibling = if meta.file_path.ends_with(".jsonl.zst") {
+            meta.file_path.strip_suffix(".zst").unwrap().to_string()
+        } else {
+            format!("{}.zst", meta.file_path)
+        };
+        if Path::new(&sibling).is_file() {
+            paths.push(sibling);
+        }
+        paths
     }
 
     fn cleanup_paths(&self, meta: &SessionMeta) -> Option<Vec<String>> {
