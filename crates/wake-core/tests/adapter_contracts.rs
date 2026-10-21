@@ -506,7 +506,7 @@ fn claude_parse_contract() {
         .parse_transcript(&r)
         .expect("claude parse_transcript");
 
-    // 标题=最后一条 custom-title,压过首条用户消息推导
+    // 标题=最后一条 custom-title,压过首条用户消息推导(agent-name 的会话名不当标题)
     assert_eq!(s.meta.title, "QR login revamp");
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s.meta.project_name, "wakefx");
@@ -516,7 +516,8 @@ fn claude_parse_contract() {
     assert_eq!(s.meta.message_count, 3);
     assert_eq!(s.meta.created_at, ms("2026-08-01T09:59:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-01T10:02:00Z"));
-    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 不计
+    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 与 2.1 起的 agent-name /
+    // cost-state / api-request* / relocated / worktree-state 不计——项目也不随 relocated 去 worktree
     assert_eq!(s.unknown_line_count, 1);
     assert_eq!(t.unknown_line_count, 1);
 

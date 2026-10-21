@@ -4,7 +4,7 @@
 
 - Fix: Codex sessions that Codex has compressed show up again, with their titles and archived status (#72, thanks @suiyun08)
 - Fix: Sessions recorded by older Codex versions show their messages and titles instead of appearing empty
-- Fix: Clean Up no longer refuses Codex sessions written by recent versions
+- Fix: Clean Up no longer refuses Codex and Claude Code sessions written by recent versions
 - Fix: Open In → iTerm resumes the session in a new iTerm window instead of failing with an AppleScript error (#73, thanks @quintus-lab)
 - Fix: Conversations from the Antigravity CLI show their full messages, not just a summary (#71, thanks @dingtwo)
 
