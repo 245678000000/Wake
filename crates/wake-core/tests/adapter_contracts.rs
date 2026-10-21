@@ -981,6 +981,113 @@ fn claude_branches_fold_the_copied_history_and_nest_under_the_original() {
     assert_eq!(adapter.parent_links(), Some(Vec::new()));
 }
 
+/// Claude Code 2.1 起命令行自己给会话起名(`ai-title`,#74):没有 custom-title 时它就是标题,
+/// 不算未知行;分支照抄原件的 AI 标题与 custom-title 一样不用;用户改过的名字照旧压过它
+#[test]
+fn claude_ai_titles_name_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let (dir, a, b) = common::stage_claude_branch(&projects);
+    // 两份文件里的自定义标题都换成 AI 标题:命令行起的名字,分支照抄了原件那一条
+    let path = |id: &str| dir.join(format!("{id}.jsonl"));
+    for id in [&a, &b] {
+        let text = fs::read_to_string(path(id))
+            .unwrap()
+            .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+            .replace(r#""customTitle":"#, r#""aiTitle":"#);
+        fs::write(path(id), text).unwrap();
+    }
+    let adapter = ClaudeAdapter::new().with_custom_root(projects);
+    let parse = |id: &str| {
+        adapter
+            .parse_session(&adapter.file_ref(&path(id)).unwrap())
+            .unwrap()
+    };
+
+    let sa = parse(&a);
+    assert_eq!(sa.meta.title, "修复登录超时");
+    assert_eq!(sa.unknown_line_count, 0);
+    assert_eq!(
+        parse(&b).meta.title,
+        "换个思路:登录改成异步队列",
+        "照抄的 AI 标题不用"
+    );
+
+    let renamed =
+        serde_json::json!({"type": "custom-title", "customTitle": "登录超时排查", "sessionId": a});
+    let text = fs::read_to_string(path(&a)).unwrap() + &format!("{renamed}\n");
+    fs::write(path(&a), text).unwrap();
+    assert_eq!(
+        parse(&a).meta.title,
+        "登录超时排查",
+        "改过的名字压过 AI 标题"
+    );
+}
+
+/// 分支的分支:A 分出 B、B 改了名再分出 C,C 开头照抄的是 B 的名字——只和原件 A 比去不掉,
+/// C 就和 B 同名。要与每一份更早的同根文件比。自定义标题与 AI 标题同一条规则,各搭一遍
+/// (Codex review 2026-10-21)
+#[test]
+fn claude_branch_of_a_branch_drops_the_title_it_copied() {
+    for (kind, field) in [("custom-title", "customTitle"), ("ai-title", "aiTitle")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let (dir, a, b) = common::stage_claude_branch(&projects);
+        let path = |id: &str| dir.join(format!("{id}.jsonl"));
+        let renamed = |session: &str| serde_json::json!({ "type": kind, field: "登录改成异步队列", "sessionId": session });
+        if kind == "ai-title" {
+            for id in [&a, &b] {
+                let text = fs::read_to_string(path(id))
+                    .unwrap()
+                    .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+                    .replace(r#""customTitle":"#, r#""aiTitle":"#);
+                fs::write(path(id), text).unwrap();
+            }
+        }
+        let text = fs::read_to_string(path(&b)).unwrap() + &format!("{}\n", renamed(&b));
+        fs::write(path(&b), text).unwrap();
+
+        // C 从 B 分出:开头照抄 B 的名字与 B 的消息行,之后问了自己的一句;照抄来的名字在分叉点
+        // 之后还会再写(本机的分支文件里就是这样)
+        let c = "c1a0de00-0000-4000-8000-0000000000c3";
+        let mut rows = vec![
+            renamed(c),
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-03T10:00:00.000Z", "sessionId": c }),
+        ];
+        for line in fs::read_to_string(path(&b)).unwrap().lines() {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row.get("uuid").is_some() {
+                row["sessionId"] = c.into();
+                rows.push(row);
+            }
+        }
+        rows.push(serde_json::json!({
+            "parentUuid": "c1a0de00-2222-4000-8000-000000000004",
+            "isSidechain": false,
+            "cwd": "/Users/tester/Github/branchfx",
+            "sessionId": c,
+            "type": "user",
+            "message": { "role": "user", "content": "队列满了怎么办" },
+            "uuid": "c1a0de00-3333-4000-8000-000000000005",
+            "timestamp": "2026-09-03T10:00:10.000Z",
+        }));
+        rows.push(renamed(c));
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        fs::write(path(c), text).unwrap();
+
+        let adapter = ClaudeAdapter::new().with_custom_root(projects);
+        let title = |id: &str| {
+            adapter
+                .parse_session(&adapter.file_ref(&path(id)).unwrap())
+                .unwrap()
+                .meta
+                .title
+        };
+        assert_eq!(title(&b), "登录改成异步队列", "{kind}: B 自己改的名字照用");
+        assert_eq!(title(c), "队列满了怎么办", "{kind}: C 照抄 B 的名字不用");
+    }
+}
+
 #[test]
 fn codex_parse_contract() {
     setup();

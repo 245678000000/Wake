@@ -2,6 +2,7 @@
 
 ## [Unreleased]
 
+- Fix: Claude Code sessions take the title Claude Code gave them instead of their first message (#74, thanks @hoixding)
 - Fix: Codex sessions that Codex has compressed show up again, with their titles and archived status (#72, thanks @suiyun08)
 - Fix: Sessions recorded by older Codex versions show their messages and titles instead of appearing empty
 - Fix: Clean Up no longer refuses Codex and Claude Code sessions written by recent versions

@@ -247,8 +247,12 @@ CREATE TABLE IF NOT EXISTS claimed_sessions (
 ///       提问);桌面端已经没有记录的老会话引用不变,靠这轮重解析写对;
 /// "18" = Codex 2025 年的老格式 rollout(首行没有信封、条目不带 payload)读得出消息、标题与工作
 ///       目录;标题不再是 IDE 扩展的编辑器上下文包装(`# Context from my IDE setup`),取其后的
-///       提问。文件早就不再变,原先入库的是空会话,靠这轮重解析写对。
-pub const FTS_FORMAT: &str = "18";
+///       提问。文件早就不再变,原先入库的是空会话,靠这轮重解析写对;
+/// "19" = Claude Code 命令行自己起的标题(`ai-title`,#74)在没有 custom-title 时当标题(原先退回
+///       首条提问);分支照抄来的标题与每一份更早的同根文件比,不只比原件——分支的分支抄的是
+///       中间那份的名字;2.1 起的记账记录(agent-name、cost-state 等)不再计未知行。"18" 推上
+///       main 时还没有这几条,跑过那时构建的库已经戳着它,所以另起一档
+pub const FTS_FORMAT: &str = "19";
 
 /// FTS 压缩的节奏(见 `Store::compact_fts`):距上次压缩满一天、或从没压过才压。没有记录
 /// 就算到期——老库升级后、新建库首轮扫描收尾各压一次;`FTS_FORMAT` 换代时 open_conn 把
