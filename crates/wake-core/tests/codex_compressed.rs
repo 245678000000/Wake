@@ -3,7 +3,7 @@
 mod common;
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -24,6 +24,14 @@ fn rollout() -> String {
     .unwrap()
 }
 
+/// Joins segments with the platform separator: `join("a/b/c")` keeps the `/` on Windows,
+/// so it would not match the paths the scanner builds while walking the tree.
+fn under(root: &Path, segments: &[&str]) -> PathBuf {
+    segments
+        .iter()
+        .fold(root.to_path_buf(), |path, s| path.join(s))
+}
+
 fn write(path: &Path, bytes: impl AsRef<[u8]>) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, bytes).unwrap();
@@ -41,7 +49,7 @@ fn modified_after(path: &Path, seconds: u64) {
 #[test]
 fn compressed_rollouts_preserve_transcripts_and_state_metadata() {
     let home = tempfile::tempdir().unwrap();
-    let plain = home.path().join("sessions/2026/08/02").join(NAME);
+    let plain = under(home.path(), &["sessions", "2026", "08", "02", NAME]);
     write(&plain, rollout());
     let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
     let original = adapter
@@ -128,7 +136,7 @@ fn compressed_archives_and_thread_filtering_use_the_same_boundary() {
     );
 
     let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
-    let day = home.path().join("sessions/2026/10/19");
+    let day = under(home.path(), &["sessions", "2026", "10", "19"]);
     for (id, source, visible) in [
         ("user", json!("cli"), true),
         ("guardian", json!({"subagent":{"other":"guardian"}}), false),
@@ -161,7 +169,7 @@ fn compressed_archives_and_thread_filtering_use_the_same_boundary() {
 #[test]
 fn compression_transitions_keep_one_searchable_session() {
     let home = tempfile::tempdir().unwrap();
-    let plain = home.path().join("sessions/2026/08/02").join(NAME);
+    let plain = under(home.path(), &["sessions", "2026", "08", "02", NAME]);
     write(&plain, rollout());
     let adapters = vec![CodexAdapter::new().with_custom_root(home.path().to_path_buf())];
     let store = Arc::new(Store::open(&home.path().join("index.db")).unwrap());
