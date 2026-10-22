@@ -1084,6 +1084,10 @@ impl AgentAdapter for ClaudeAdapter {
         Some(self.session_paths(meta))
     }
 
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
+    }
+
     fn memory_sources(&self) -> Vec<MemorySource> {
         // auto-memory 树(agent 记的、按项目)+ 全局 CLAUDE.md(用户写的指令,对每个
         // 项目都成立);项目根下的 CLAUDE.md 由 project_instruction_sources 给

@@ -17,6 +17,7 @@
 use crate::i18n::t;
 mod cleanup;
 mod memory;
+mod skills;
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -2168,6 +2169,7 @@ enum Page {
     Sessions,
     Insights,
     Memory,
+    Skills,
 }
 
 pub struct Workbench {
@@ -2254,6 +2256,8 @@ pub struct Workbench {
     cleanup: cleanup::CleanupState,
     /// Memory 页的数据与选中态(agent 自己写的记忆文档)
     memory: memory::MemoryState,
+    /// Skills 页的扫描结果与选中态(各家 agent 的 skill,只读总览)
+    skills: skills::SkillsState,
     /// Insights 页数据,Rc 免深拷贝
     insights: Option<Rc<InsightsData>>,
     insights_loading: bool,
@@ -2738,6 +2742,7 @@ impl Workbench {
             page: Page::Sessions,
             cleanup: cleanup::CleanupState::default(),
             memory: memory::MemoryState::default(),
+            skills: skills::SkillsState::default(),
             insights: None,
             insights_loading: false,
             insights_range: InsightsRange::Hour,
@@ -2918,6 +2923,7 @@ impl Workbench {
             detail.msg_list.remeasure();
         }
         self.memory.remeasure();
+        self.skills.remeasure();
     }
 
     fn refresh_session_group_date(&mut self, cx: &mut Context<Self>) {
@@ -2964,13 +2970,17 @@ impl Workbench {
             self.reset_memory_scope();
         }
         self.refresh(cx);
+        if page == Page::Skills {
+            self.enter_skills(cx);
+        }
     }
 
     /// 打开着的整页目的地顺带重载(refresh 与扫描终态都走这里);各页自己按住
     /// "扫描中且已有数据"的情形
     fn reload_page(&mut self, cx: &mut Context<Self>) {
         match self.page {
-            Page::Sessions => {}
+            // Skills:skill 与会话无关,会话扫描的事件不重扫,进页与页头 Refresh 才扫
+            Page::Sessions | Page::Skills => {}
             Page::Insights => self.reload_insights(cx),
             Page::Memory => self.reload_memories(cx),
         }
@@ -3358,6 +3368,8 @@ impl Workbench {
         self.watcher = None;
         (self.adapters, self.data_locations) = Self::build_roster(&self.store);
         self.remount_watcher();
+        // skill 目录从 roster 推:页开着就重扫(没开着下次进页本来就会扫)
+        self.rescan_open_skills(cx);
         cx.notify();
     }
 
@@ -5829,10 +5841,10 @@ impl Workbench {
     fn render_sidebar(&self, window: &Window, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         // Memory 页标题换成 Memory:侧栏顶上就说明现在管的是什么,不另加模式标题行(用户 2026-09-21)
-        let title = if self.page == Page::Memory {
-            t("Memory")
-        } else {
-            "Wake"
+        let title = match self.page {
+            Page::Memory => t("Memory"),
+            Page::Skills => t("Skills"),
+            _ => "Wake",
         };
         let all_active = self.selected_agent.is_none()
             && self.selected_project.is_none()
@@ -5948,6 +5960,7 @@ impl Workbench {
             // 计数),其余是会话的(搜索框 + All Sessions / Starred + Agents / Projects)
             .child(match self.page {
                 Page::Memory => self.render_memory_nav(cx),
+                Page::Skills => self.render_skills_nav(cx),
                 _ => self.render_sessions_nav(all_active, cx),
             })
             // 底部工具条:次要操作(数据源、刷新)与扫描状态同处一区,与上方
@@ -6076,6 +6089,7 @@ impl Workbench {
             )
             .child(self.sidebar_groups(
                 "sidebar-scroll",
+                None,
                 self.agent_counts.iter().map(|(agent, count)| {
                     (
                         *agent,
@@ -6099,12 +6113,14 @@ impl Workbench {
             .into_any_element()
     }
 
-    /// 侧栏的 Agents / Projects 两组(会话导航与 Memory 导航同一套行组件、同一个单选
-    /// 模型,折叠状态两页共用)。每行给 (身份, 计数, 是否当前);点击回调收到切换后的
-    /// 目标——点当前项就是 None(回全部)
+    /// 侧栏的 Agents / Projects 两组(会话、Memory、Skills 三页的导航同一套行组件、同一个
+    /// 单选模型,折叠状态共用)。每行给 (身份, 计数, 是否当前);点击回调收到切换后的
+    /// 目标——点当前项就是 None(回全部)。`lead_agent_row` 排在 agent 行之前(Skills 页
+    /// 的共享目录那一行,它不是一家 agent)
     fn sidebar_groups(
         &self,
         id: &'static str,
+        lead_agent_row: Option<AnyElement>,
         agents: impl IntoIterator<Item = (AgentId, i64, bool)>,
         projects: impl IntoIterator<Item = (String, SharedString, i64, bool)>,
         on_agent: fn(&mut Self, Option<AgentId>, &mut Context<Self>),
@@ -6133,20 +6149,21 @@ impl Workbench {
                 cx,
             ))
             .when(!self.agents_collapsed, |this| {
-                this.children(agents.into_iter().map(|(agent, count, active)| {
-                    sidebar_row(
-                        agent.as_str(),
-                        RowLead::Brand(agent.brand_icon(dark)),
-                        agent.display_name(),
-                        Some(count),
-                        active,
-                        RowLevel::Sub,
-                        cx.listener(move |this, _, _window, cx| {
-                            on_agent(this, (!active).then_some(agent), cx)
-                        }),
-                        cx,
-                    )
-                }))
+                this.children(lead_agent_row)
+                    .children(agents.into_iter().map(|(agent, count, active)| {
+                        sidebar_row(
+                            agent.as_str(),
+                            RowLead::Brand(agent.brand_icon(dark)),
+                            agent.display_name(),
+                            Some(count),
+                            active,
+                            RowLevel::Sub,
+                            cx.listener(move |this, _, _window, cx| {
+                                on_agent(this, (!active).then_some(agent), cx)
+                            }),
+                            cx,
+                        )
+                    }))
             })
             .child(group_header(
                 "projects-header",
@@ -6178,9 +6195,9 @@ impl Workbench {
             })
     }
 
-    /// 侧栏底部左端的一组:三颗页切换 + Clean up,同尺寸图标钮,当前页那颗 `active`
+    /// 侧栏底部左端的一组:四颗页切换 + Clean up,同尺寸图标钮,当前页那颗 `active`
     /// (侧栏选中色圆角底)。Sessions 也是一颗——否则从 Memory 回来只能"再点一次
-    /// Memory"。Clean up 打开时三颗页都不亮、它自己亮(它是叠在会话视图上的模式,
+    /// Memory"。Clean up 打开时四颗页都不亮、它自己亮(它是叠在会话视图上的模式,
     /// 不是页;用户 2026-09-21 定它也靠左,右端只留 Settings)
     fn render_page_switch(&self, cx: &Context<Self>) -> AnyElement {
         let current = (!self.cleanup.open).then_some(self.page);
@@ -6207,6 +6224,12 @@ impl Workbench {
                 t("Memory"),
                 "icons/brain.svg",
                 Page::Memory,
+            ))
+            .child(button(
+                "page-skills",
+                t("Skills"),
+                "icons/puzzle.svg",
+                Page::Skills,
             ))
             .child(button(
                 "page-insights",
@@ -9802,6 +9825,247 @@ fn outline_badge(name: impl Into<SharedString>, color: Hsla) -> impl IntoElement
         .child(div().truncate().child(name.into()))
 }
 
+/// 记忆流与 Skills 列表的行盒(逐项照会话行:ListItem 自带 px_3 / py_1(12 / 4)再套行内容的
+/// SPACE_XS / SPACE_SM(4 / 8),高亮面 mx = SPACE_SM——这里没有 ListItem,两层加成一层写死同样
+/// 的数);选中 `list_active`、悬停 `list_hover`,内容由调用方给
+fn library_row(
+    id: impl Into<ElementId>,
+    selected: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    children: impl IntoIterator<Item = AnyElement>,
+    theme: &gpui_component::Theme,
+) -> AnyElement {
+    div()
+        .w_full()
+        .px(SPACE_SM)
+        .child(
+            v_flex()
+                .id(id)
+                .w_full()
+                .min_w_0()
+                .rounded(theme.radius)
+                .px(SPACE_MD + SPACE_XS)
+                .py(SPACE_XS + SPACE_SM)
+                .gap(SPACE_XS)
+                .cursor_pointer()
+                .when(selected, |row| row.bg(theme.list_active))
+                .when(!selected, |row| {
+                    row.hover(|style| style.bg(theme.list_hover))
+                })
+                .on_click(on_click)
+                .children(children),
+        )
+        .into_any_element()
+}
+
+/// 行盒里的标题:Body 14 medium 一行,按显示宽度截断,悬停看全名
+fn library_row_title(
+    id: impl Into<ElementId>,
+    title: &str,
+    theme: &gpui_component::Theme,
+) -> AnyElement {
+    let full: SharedString = title.to_string().into();
+    div()
+        .id(id)
+        .w_full()
+        .min_w_0()
+        .overflow_hidden()
+        .whitespace_nowrap()
+        .text_size(FONT_BODY)
+        .font_medium()
+        .text_color(theme.foreground)
+        .child(clip_display(title, SESSION_TITLE_MAX_WIDTH))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(full.clone()).build(window, cx)
+        })
+        .into_any_element()
+}
+
+/// 行盒元信息行右端的时间:智能时间,悬停看精确时间(悬停时才格式化)
+fn library_row_time(id: impl Into<ElementId>, ts: i64) -> AnyElement {
+    div()
+        .id(id)
+        .flex_shrink_0()
+        .child(smart_time(ts))
+        .tooltip(move |window, cx| {
+            gpui_component::tooltip::Tooltip::new(abs_date(ts)).build(window, cx)
+        })
+        .into_any_element()
+}
+
+/// 记忆流与 Skills 列表的虚拟化外壳(gpui::list,行高不等):行由 `row` 现画
+fn library_list(
+    state: &gpui::ListState,
+    row: fn(&mut Workbench, usize, &mut Context<Workbench>) -> AnyElement,
+    cx: &Context<Workbench>,
+) -> AnyElement {
+    let entity = cx.entity().downgrade();
+    div()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .relative()
+        .child(
+            gpui::list(state.clone(), move |ix, _window, cx| {
+                entity
+                    .upgrade()
+                    .map(|e| e.update(cx, |this, cx| row(this, ix, cx)))
+                    .unwrap_or_else(|| div().into_any_element())
+            })
+            .size_full(),
+        )
+        .vertical_scrollbar(state)
+        .into_any_element()
+}
+
+/// 列表整段换成 `new_len` 行:重载保滚动位置,`to_top` 回到顶部。splice 整段会把落在段内的
+/// 滚动锚点归零(gpui 只保段外的锚点),所以先记下再恢复
+fn replace_list_rows(state: &gpui::ListState, old_len: usize, new_len: usize, to_top: bool) {
+    let top = if to_top {
+        gpui::ListOffset {
+            item_ix: 0,
+            offset_in_item: px(0.),
+        }
+    } else {
+        state.logical_scroll_top()
+    };
+    state.splice(0..old_len, new_len);
+    state.scroll_to(top);
+}
+
+/// 阅读面头部右端的 Reveal / Copy path,与路径、更新时间两行元信息(记忆与 Skills 阅读面
+/// 共用;两页从不同时渲染,元素 id 共用一套)
+fn file_reader_parts(path: &str, updated_at: i64) -> (Vec<AnyElement>, Vec<AnyElement>) {
+    let reveal_path = path.to_string();
+    let copy_path = path.to_string();
+    let updated: SharedString = crate::tf!("Updated {}", smart_time(updated_at)).into();
+    let actions = vec![
+        Button::new("reader-reveal")
+            .ghost()
+            .rounded(RADIUS_BUTTON)
+            .icon(icon("icons/folder.svg").with_size(zpx(16.)))
+            .tooltip(reveal_in_fm())
+            .on_click(move |_, _, _| {
+                terminal::reveal_in_file_manager(&reveal_path);
+            })
+            .into_any_element(),
+        Button::new("reader-copy-path")
+            .ghost()
+            .rounded(RADIUS_BUTTON)
+            .icon(icon("icons/copy.svg").with_size(zpx(16.)))
+            .tooltip(t("Copy path"))
+            .on_click(move |_, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
+            })
+            .into_any_element(),
+    ];
+    let meta_rows = vec![
+        h_flex()
+            .min_w_0()
+            .gap(ICON_TEXT_GAP)
+            .child(
+                icon("icons/file-text.svg")
+                    .with_size(zpx(12.))
+                    .flex_shrink_0(),
+            )
+            .child(div().min_w_0().truncate().child(tilde_path(path)))
+            .into_any_element(),
+        h_flex()
+            .min_w_0()
+            .gap(ICON_TEXT_GAP)
+            .items_center()
+            .child(
+                icon("icons/calendar.svg")
+                    .with_size(zpx(12.))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .id("reader-updated")
+                    .min_w_0()
+                    .truncate()
+                    .child(updated)
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(crate::tf!(
+                            "Updated {}",
+                            abs_date(updated_at)
+                        ))
+                        .build(window, cx)
+                    }),
+            )
+            .into_any_element(),
+    ];
+    (actions, meta_rows)
+}
+
+/// 记忆与 Skills 页右侧没有选中项时:列表还在读就转圈,读完是空的就给空态卡
+fn reader_placeholder(
+    loading: bool,
+    icon_path: &'static str,
+    title: &'static str,
+    caption: &'static str,
+    cx: &App,
+) -> AnyElement {
+    v_flex()
+        .flex_1()
+        .h_full()
+        .items_center()
+        .justify_center()
+        .bg(cx.theme().background)
+        .child(if loading {
+            Spinner::new().into_any_element()
+        } else {
+            empty_state_card(icon_path, zpx(58.), zpx(24.), title, caption, cx).into_any_element()
+        })
+        .into_any_element()
+}
+
+/// 阅读面正文读到之前的转圈(记忆与 Skills 共用)
+fn reader_loading() -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .justify_center()
+        .py(SPACE_XXL)
+        .child(Spinner::new())
+        .into_any_element()
+}
+
+/// 记忆与 Skills 的阅读面:详情页同款头部 + popover 底的正文,720 阅读宽居中,与详情正文
+/// 同一组数(24px 阅读轴,上留 16、下留 24)
+fn reader_pane(
+    id: &'static str,
+    header: impl IntoElement,
+    content: impl IntoElement,
+    theme: &gpui_component::Theme,
+) -> AnyElement {
+    v_flex()
+        .flex_1()
+        .min_w_0()
+        .h_full()
+        .bg(theme.background)
+        .child(header)
+        .child(
+            div()
+                .id(id)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .bg(theme.popover)
+                .px(SPACE_XXL)
+                .pt(SPACE_LG)
+                .pb(SPACE_XXL)
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .child(div().w_full().max_w(READER_MAX_WIDTH).child(content)),
+                ),
+        )
+        .into_any_element()
+}
+
 /// 列表流里的分组头(会话流的时间分割线、记忆流的项目组头共用):Label 11 medium
 /// muted 的标签 + 右侧低对比度 hairline,32px 高、px 12
 fn section_header_row(label: impl Into<SharedString>, theme: &gpui_component::Theme) -> Div {
@@ -9928,7 +10192,7 @@ const FOOTER_BTN: Zpx = Zpx(28.);
 /// 至少一个 SPACE_SM + 右内边距。100% 档约 177,侧栏 224 绰绰有余;放大后侧栏收窄时
 /// 以它为下限(`Workbench::columns`)
 fn sidebar_footer_width() -> Pixels {
-    FOOTER_LEAD_INSET + FOOTER_BTN * 5. + zpx(2.) * 3. + SPACE_SM + SIDEBAR_EDGE
+    FOOTER_LEAD_INSET + FOOTER_BTN * 6. + zpx(2.) * 4. + SPACE_SM + SIDEBAR_EDGE
 }
 /// 工具条左内边距 = 26.75(侧栏中轴,红绿灯红灯中心)− 14(按钮半宽),工具条贴着侧栏左缘、
 /// 没有容器边距:最左那颗图标的中心压在与导航行行首同一条轴上(用户 2026-09-21)
@@ -10178,6 +10442,7 @@ impl Render for Workbench {
                         }
                         match self.page {
                             Page::Memory => this.child(self.render_memory(cx)),
+                            Page::Skills => this.child(self.render_skills(cx)),
                             Page::Insights => this.child(self.render_insights(cx)),
                             Page::Sessions => this
                                 .child(self.render_session_list(cx))

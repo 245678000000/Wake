@@ -237,21 +237,13 @@ impl Workbench {
                     });
                     let pin_user = this.memory_pins_user();
                     let rows = memory_rows(&docs, Local::now().date_naive(), pin_user);
-                    // 重载来自每轮扫描,滚动位置要留住:splice 整段会把落在段内的
-                    // 滚动锚点归零(gpui 的 splice 只保段外的锚点),所以先记下再恢复;
-                    // 筛选刚换过则回到顶部
-                    let top = if this.memory.scope_changed {
-                        gpui::ListOffset {
-                            item_ix: 0,
-                            offset_in_item: px(0.),
-                        }
-                    } else {
-                        this.memory.list.logical_scroll_top()
-                    };
-                    this.memory.scope_changed = false;
-                    let old = this.memory.rows.len();
-                    this.memory.list.splice(0..old, rows.len());
-                    this.memory.list.scroll_to(top);
+                    // 重载来自每轮扫描,滚动位置要留住;筛选刚换过则回到顶部
+                    replace_list_rows(
+                        &this.memory.list,
+                        this.memory.rows.len(),
+                        rows.len(),
+                        std::mem::take(&mut this.memory.scope_changed),
+                    );
                     // 选中项:还在且没变就不动;正文被 agent 改过(时间或大小变了)
                     // 重读,否则新标题配旧正文;没了就落到第一份
                     let stamp = |docs: &[MemoryDoc], key: &str| {
@@ -354,26 +346,13 @@ impl Workbench {
             .and_then(|k| self.memory.docs.iter().find(|d| &d.key == k));
         let pane: AnyElement = match selected {
             Some(doc) => self.render_memory_reader(doc, cx),
-            None => v_flex()
-                .flex_1()
-                .h_full()
-                .items_center()
-                .justify_center()
-                .bg(theme.background)
-                .child(if self.memory.loading {
-                    Spinner::new().into_any_element()
-                } else {
-                    empty_state_card(
-                        "icons/file-text.svg",
-                        zpx(58.),
-                        zpx(24.),
-                        t("No memory files yet"),
-                        t("Agents write these as they work: Claude Code's auto-memory, Codex's memories, ZCode's project memory. They show up here once they exist."),
-                        cx,
-                    )
-                    .into_any_element()
-                })
-                .into_any_element(),
+            None => reader_placeholder(
+                self.memory.loading,
+                "icons/file-text.svg",
+                t("No memory files yet"),
+                t("Agents write these as they work: Claude Code's auto-memory, Codex's memories, ZCode's project memory. They show up here once they exist."),
+                cx,
+            ),
         };
         h_flex()
             .flex_1()
@@ -423,23 +402,7 @@ impl Workbench {
 
     /// 记忆流:gpui::list 虚拟化(行高不等:分组头与两行的文档行)
     fn render_memory_list(&self, cx: &Context<Self>) -> AnyElement {
-        let entity = cx.entity().downgrade();
-        div()
-            .flex_1()
-            .min_h_0()
-            .w_full()
-            .relative()
-            .child(
-                gpui::list(self.memory.list.clone(), move |ix, _window, cx| {
-                    entity
-                        .upgrade()
-                        .map(|e| e.update(cx, |this, cx| this.render_memory_row(ix, cx)))
-                        .unwrap_or_else(|| div().into_any_element())
-                })
-                .size_full(),
-            )
-            .vertical_scrollbar(&self.memory.list)
-            .into_any_element()
+        library_list(&self.memory.list, Self::render_memory_row, cx)
     }
 
     /// 一行:分组头(会话流的时间分割线同款),或两行的文档行(会话行同款:Body 14
@@ -468,85 +431,36 @@ impl Workbench {
                 };
                 let selected = self.memory.selected.as_deref() == Some(d.key.as_str());
                 let key = d.key.clone();
-                let title: SharedString = clip_display(&d.title, SESSION_TITLE_MAX_WIDTH).into();
-                let title_tooltip: SharedString = d.title.clone().into();
-                let shown_time: SharedString = smart_time(d.updated_at).into();
-                let shown_tooltip: SharedString = abs_date(d.updated_at).into();
-                // 盒模型逐项照会话行:ListItem 自带 px_3 / py_1(12 / 4)再套行内容的
-                // SPACE_XS / SPACE_SM(4 / 8),高亮面 mx = SPACE_SM——这里没有 ListItem,
-                // 把两层加成一层写死同样的数。不缩进、不画竖线(树的子行形制试过,用户
-                // 2026-09-21 定没必要)
-                div()
-                    .w_full()
-                    .px(SPACE_SM)
+                // 不缩进、不画竖线(树的子行形制试过,用户 2026-09-21 定没必要)
+                let meta = h_flex()
+                    .gap(ICON_TEXT_GAP)
+                    .text_size(FONT_LABEL)
+                    .text_color(theme.muted_foreground)
                     .child(
-                        v_flex()
-                            .id(("memory-row", ix))
-                            .w_full()
-                            .min_w_0()
-                            .rounded(theme.radius)
-                            .px(SPACE_MD + SPACE_XS)
-                            .py(SPACE_XS + SPACE_SM)
-                            .gap(SPACE_XS)
-                            .cursor_pointer()
-                            .when(selected, |row| row.bg(theme.list_active))
-                            .when(!selected, |row| {
-                                row.hover(|style| style.bg(theme.list_hover))
-                            })
-                            .on_click(cx.listener(move |this, _, _window, cx| {
-                                this.select_memory(key.clone(), cx)
-                            }))
-                            .child(
-                                div()
-                                    .id(("memory-title", ix))
-                                    .w_full()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .whitespace_nowrap()
-                                    .text_size(FONT_BODY)
-                                    .font_medium()
-                                    .text_color(theme.foreground)
-                                    .child(title)
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(title_tooltip.clone())
-                                            .build(window, cx)
-                                    }),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap(ICON_TEXT_GAP)
-                                    .text_size(FONT_LABEL)
-                                    .text_color(theme.muted_foreground)
-                                    .child(
-                                        img(d.agent.brand_icon(theme.mode.is_dark()))
-                                            .size(zpx(15.))
-                                            .flex_shrink_0(),
-                                    )
-                                    // 项目徽章与会话行同款(muted 胶囊;用户级 / 没归属的
-                                    // 也用组头同一套文案),用户 2026-09-21 定:组头说明了
-                                    // 也要挂,和会话列表看起来一致
-                                    .child(badge(
-                                        memory_group_label(d),
-                                        theme.muted,
-                                        theme.muted_foreground,
-                                    ))
-                                    .children(memory_badges(d, &theme))
-                                    .child(div().flex_1())
-                                    .child(
-                                        div()
-                                            .id(("memory-time", ix))
-                                            .flex_shrink_0()
-                                            .child(shown_time)
-                                            .tooltip(move |window, cx| {
-                                                gpui_component::tooltip::Tooltip::new(
-                                                    shown_tooltip.clone(),
-                                                )
-                                                .build(window, cx)
-                                            }),
-                                    ),
-                            ),
+                        img(d.agent.brand_icon(theme.mode.is_dark()))
+                            .size(zpx(15.))
+                            .flex_shrink_0(),
                     )
-                    .into_any_element()
+                    // 项目徽章与会话行同款(muted 胶囊;用户级 / 没归属的也用组头同一套
+                    // 文案),用户 2026-09-21 定:组头说明了也要挂,和会话列表看起来一致
+                    .child(badge(
+                        memory_group_label(d),
+                        theme.muted,
+                        theme.muted_foreground,
+                    ))
+                    .children(memory_badges(d, &theme))
+                    .child(div().flex_1())
+                    .child(library_row_time(("memory-time", ix), d.updated_at));
+                library_row(
+                    ("memory-row", ix),
+                    selected,
+                    cx.listener(move |this, _, _window, cx| this.select_memory(key.clone(), cx)),
+                    [
+                        library_row_title(("memory-title", ix), &d.title, &theme),
+                        meta.into_any_element(),
+                    ],
+                    &theme,
+                )
             }
         }
     }
@@ -565,8 +479,6 @@ impl Workbench {
             .as_ref()
             .map(|l| l.source_path.clone())
             .unwrap_or_else(|| memory_display_path(doc));
-        let reveal_path = source_path.clone();
-        let copy_path = source_path.clone();
         // 相对链接按记忆文件所在目录解析(MEMORY.md 链接的是同目录的主题文件),
         // 不是项目根;SQLite 型没有目录,退项目路径
         let link_base = if source_path == doc.path {
@@ -577,9 +489,6 @@ impl Workbench {
         } else {
             doc.project_path.clone()
         };
-        let updated: SharedString = crate::tf!("Updated {}", smart_time(doc.updated_at)).into();
-        let updated_tooltip: SharedString =
-            crate::tf!("Updated {}", abs_date(doc.updated_at)).into();
         let mut lead: Vec<AnyElement> = vec![
             img(doc.agent.brand_icon(dark))
                 .size(zpx(15.))
@@ -597,59 +506,7 @@ impl Workbench {
             ),
         ];
         lead.extend(memory_badges(doc, &theme));
-        let actions: Vec<AnyElement> = vec![
-            Button::new("memory-reveal")
-                .ghost()
-                .rounded(RADIUS_BUTTON)
-                .icon(icon("icons/folder.svg").with_size(zpx(16.)))
-                .tooltip(reveal_in_fm())
-                .on_click(move |_, _, _| {
-                    terminal::reveal_in_file_manager(&reveal_path);
-                })
-                .into_any_element(),
-            Button::new("memory-copy-path")
-                .ghost()
-                .rounded(RADIUS_BUTTON)
-                .icon(icon("icons/copy.svg").with_size(zpx(16.)))
-                .tooltip(t("Copy path"))
-                .on_click(move |_, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(copy_path.clone()));
-                })
-                .into_any_element(),
-        ];
-        let meta_rows: Vec<AnyElement> = vec![
-            h_flex()
-                .min_w_0()
-                .gap(ICON_TEXT_GAP)
-                .child(
-                    icon("icons/file-text.svg")
-                        .with_size(zpx(12.))
-                        .flex_shrink_0(),
-                )
-                .child(div().min_w_0().truncate().child(tilde_path(&source_path)))
-                .into_any_element(),
-            h_flex()
-                .min_w_0()
-                .gap(ICON_TEXT_GAP)
-                .items_center()
-                .child(
-                    icon("icons/calendar.svg")
-                        .with_size(zpx(12.))
-                        .flex_shrink_0(),
-                )
-                .child(
-                    div()
-                        .id("memory-updated")
-                        .min_w_0()
-                        .truncate()
-                        .child(updated)
-                        .tooltip(move |window, cx| {
-                            gpui_component::tooltip::Tooltip::new(updated_tooltip.clone())
-                                .build(window, cx)
-                        }),
-                )
-                .into_any_element(),
-        ];
+        let (actions, meta_rows) = file_reader_parts(&source_path, doc.updated_at);
         let header = detail_header_frame(
             "memory-detail-header",
             lead,
@@ -670,40 +527,9 @@ impl Workbench {
                 cx,
             )
             .into_any_element(),
-            None => div()
-                .w_full()
-                .flex()
-                .justify_center()
-                .py(SPACE_XXL)
-                .child(Spinner::new())
-                .into_any_element(),
+            None => reader_loading(),
         };
-        v_flex()
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .bg(theme.background)
-            .child(header)
-            .child(
-                div()
-                    .id("memory-reader")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .bg(theme.popover)
-                    // 与详情正文同一组数:24px 阅读轴,首条上留 16、末条下留 24
-                    .px(SPACE_XXL)
-                    .pt(SPACE_LG)
-                    .pb(SPACE_XXL)
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .child(div().w_full().max_w(READER_MAX_WIDTH).child(content)),
-                    ),
-            )
-            .into_any_element()
+        reader_pane("memory-reader", header, content, &theme)
     }
 
     /// Memory 页的侧栏导航,替换会话导航(搜索框、All Sessions / Starred、Agents /
@@ -757,6 +583,7 @@ impl Workbench {
             )
             .child(self.sidebar_groups(
                 "memory-sidebar-scroll",
+                None,
                 counts.agents.iter().map(|(agent, count)| {
                     (
                         *agent,

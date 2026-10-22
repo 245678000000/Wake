@@ -88,6 +88,9 @@ icons!(
     "messages-square",
     // Memory 页(侧栏模式标题与底部工具条入口)
     "brain",
+    // Skills 页(底部工具条入口与 All Skills 行);列表上方"读不出来"的提示行
+    "puzzle",
+    "triangle-alert",
     "star",
     "pin",
     "download",

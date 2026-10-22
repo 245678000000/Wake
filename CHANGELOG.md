@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: A Skills page lists the skills your agents have installed, which agents share each one, and where copies of the same skill have drifted apart (#62, thanks @ICEY4040727)
+
 ## [0.9.4] — 2026-10-15
 
 - Fix: Refresh picks up sessions you deleted in OpenCode while it was still running, instead of listing them until Wake restarts (#70, thanks @lin-code-world)

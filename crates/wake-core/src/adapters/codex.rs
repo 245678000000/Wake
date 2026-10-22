@@ -1302,6 +1302,10 @@ impl AgentAdapter for CodexAdapter {
         Some(self.session_paths(meta))
     }
 
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
+    }
+
     fn memory_sources(&self) -> Vec<MemorySource> {
         // memories/ 与 memories_1.sqlite(agent 记的)、AGENTS.md 与 rules/*.rules(用户
         // 写的指令)都是 CODEX_HOME 直属;只选了 sessions 目录或裸 rollout 拷贝的自定义

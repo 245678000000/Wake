@@ -39,6 +39,8 @@ use std::path::{Path, PathBuf};
 pub struct CodebuddyAdapter {
     agent: AgentId,
     root: PathBuf,
+    /// 配置目录(`~/.codebuddy` / `*_CONFIG_DIR`);直接选中 projects 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl CodebuddyAdapter {
@@ -52,17 +54,17 @@ impl CodebuddyAdapter {
     }
 
     fn twin(agent: AgentId, home_dir_name: &str, env_key: &str) -> Self {
-        let default = super::home_dir()
-            .unwrap_or_default()
-            .join(home_dir_name)
-            .join("projects");
-        let root = super::env_dir(env_key)
-            .map(|dir| dir.join("projects"))
+        let default = super::home_dir().unwrap_or_default().join(home_dir_name);
+        let home = super::env_dir(env_key)
             // 与其他 env override 一致:存在但没有任何会话的候选不能遮掉默认根
             // (Dock 启动与 shell 启动看到的环境经常不同)
-            .filter(|dir| project_tree_has_session(dir, agent))
+            .filter(|dir| project_tree_has_session(&dir.join("projects"), agent))
             .unwrap_or(default);
-        Self { agent, root }
+        Self {
+            agent,
+            root: home.join("projects"),
+            home: Some(home),
+        }
     }
 }
 
@@ -503,18 +505,23 @@ impl AgentAdapter for CodebuddyAdapter {
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
-        let root = if dir.join("projects").is_dir() {
-            dir.join("projects")
+        let (root, home) = if dir.join("projects").is_dir() {
+            (dir.join("projects"), Some(dir))
         } else {
-            dir
+            (dir, None)
         };
         Box::new(Self {
             agent: self.agent,
             root,
+            home,
         })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

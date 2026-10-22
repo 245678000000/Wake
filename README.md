@@ -26,6 +26,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 - **Manage** — star, pin, export to Markdown, hand a session to another agent, delete to the Trash
 - **Clean up** — find the sessions eating your disk and clear them out in one go
 - **Memory** — the notes and instruction files your agents keep (`CLAUDE.md`, `AGENTS.md`, auto-memory, Cursor rules, …), by agent and project
+- **Skills** — every skill your agents have installed, which agents share each one, and which copies have drifted apart
 - **Insights** — activity heatmap, streaks, weekly trends, and your top agents, projects and models
 - **Remote hosts** — mirror the sessions on your other machines over SSH
 - **MCP and CLI** — `wake-mcp` and `wake-cli` let any agent search your history and read transcripts
@@ -215,6 +216,7 @@ crates/
 │   ├── remote.rs    #   remote hosts: ssh probe + rsync whitelist mirror into <data dir>/remotes/<host>/
 │   ├── scanner.rs   #   single-pass scan: meta + FTS in one go, mtime incremental
 │   ├── watcher.rs   #   notify-based file watching → per-file incremental updates
+│   ├── skills.rs    #   read-only skills overview: each agent's skill folders, grouped by skill
 │   ├── db.rs        #   rusqlite (WAL): sessions, the full-text index, memories, stars/pins, tombstones, settings
 │   ├── mcp/         #   wake-mcp: read-only MCP server over stdio (hand-written JSON-RPC, five tools)
 │   ├── cli.rs       #   wake-cli: argv → the same five tools, same text out as MCP

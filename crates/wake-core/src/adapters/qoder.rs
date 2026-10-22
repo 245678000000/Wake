@@ -16,21 +16,22 @@ use std::path::{Path, PathBuf};
 /// 子代理(整份都是 `isSidechain: true` 的行),作为子会话挂在派它的会话下面。
 pub struct QoderAdapter {
     root: PathBuf,
+    /// 配置目录(`~/.qoder` / QODER_CONFIG_DIR);直接选中 projects 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl QoderAdapter {
     pub fn new() -> Self {
-        let default = super::home_dir()
-            .unwrap_or_default()
-            .join(".qoder")
-            .join("projects");
-        let root = super::env_dir("QODER_CONFIG_DIR")
-            .map(|dir| dir.join("projects"))
+        let default = super::home_dir().unwrap_or_default().join(".qoder");
+        let home = super::env_dir("QODER_CONFIG_DIR")
             // 与其他 env override 一致：存在但没有任何会话的候选不能遮掉
             // 默认根（Dock 启动与 shell 启动看到的环境经常不同）。
-            .filter(|dir| project_tree_has_session(dir, AgentId::Qoder))
+            .filter(|dir| project_tree_has_session(&dir.join("projects"), AgentId::Qoder))
             .unwrap_or(default);
-        Self { root }
+        Self {
+            root: home.join("projects"),
+            home: Some(home),
+        }
     }
 }
 
@@ -697,15 +698,19 @@ impl AgentAdapter for QoderAdapter {
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
-        let root = if dir.join("projects").is_dir() {
-            dir.join("projects")
+        let (root, home) = if dir.join("projects").is_dir() {
+            (dir.join("projects"), Some(dir))
         } else {
-            dir
+            (dir, None)
         };
-        Box::new(Self { root })
+        Box::new(Self { root, home })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

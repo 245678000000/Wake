@@ -7,5 +7,6 @@ pub mod models;
 pub mod remote;
 pub mod scanner;
 pub mod services;
+pub mod skills;
 pub mod text;
 pub mod watcher;

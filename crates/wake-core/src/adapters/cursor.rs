@@ -24,17 +24,18 @@ pub struct CursorAdapter {
     metadata_db: Option<PathBuf>,
     /// 指令文件(项目根下的 .cursor/rules、.cursorrules)与自定义来源按指纹缓存,每轮扫描只 stat
     memories: super::MemoryCache,
+    /// `~/.cursor`;直接选中 projects 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl CursorAdapter {
     pub fn new() -> Self {
+        let home = super::home_dir().unwrap_or_default().join(".cursor");
         Self {
-            root: super::home_dir()
-                .unwrap_or_default()
-                .join(".cursor")
-                .join("projects"),
+            root: home.join("projects"),
             metadata_db: Some(cursor_ide::default_db_path()),
             memories: super::MemoryCache::new(),
+            home: Some(home),
         }
     }
 
@@ -703,17 +704,22 @@ impl AgentAdapter for CursorAdapter {
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 选中 `~/.cursor` 形态(含 projects/)或直接选中 projects 目录都认
-        let root = if dir.join("projects").is_dir() {
-            dir.join("projects")
+        let (root, home) = if dir.join("projects").is_dir() {
+            (dir.join("projects"), Some(dir))
         } else {
-            dir
+            (dir, None)
         };
         Box::new(Self {
             root,
             // 自定义目录也用于远程缓存,不能混用本机 IDE 元数据。
             metadata_db: None,
             memories: super::MemoryCache::new(),
+            home,
         })
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
@@ -767,6 +773,7 @@ impl AgentAdapter for CursorAdapter {
                 root: PathBuf::new(),
                 metadata_db: None,
                 memories: super::MemoryCache::new(),
+                home: None,
             }))
         } else {
             None
@@ -809,6 +816,7 @@ mod tests {
             root,
             metadata_db: Some(db),
             memories: crate::adapters::MemoryCache::new(),
+            home: None,
         };
         let r = adapter.file_ref(&file).unwrap();
         (dir, adapter, r)
@@ -1012,6 +1020,7 @@ mod tests {
             root,
             metadata_db: Some(metadata_db),
             memories: crate::adapters::MemoryCache::new(),
+            home: None,
         })];
         let events = Events::default();
         run_scan(&adapters, &store, &events, false).unwrap();

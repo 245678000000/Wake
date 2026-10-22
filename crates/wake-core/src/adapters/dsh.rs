@@ -30,22 +30,24 @@ pub struct DshAdapter {
     /// 之后只 stat 选代;换了一代、换了压缩格式才再读一次。目录一时列不出、新的那份一时打不开
     /// (权限、锁)交回上次读到的
     logs: Mutex<HashMap<PathBuf, (SessionFileRef, Option<String>)>>,
+    /// `~/.dsh`;直接选中 sessions 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl DshAdapter {
     pub fn new() -> Self {
-        Self::at(
-            super::home_dir()
-                .unwrap_or_default()
-                .join(".dsh")
-                .join("sessions"),
-        )
+        let home = super::home_dir().unwrap_or_default().join(".dsh");
+        Self {
+            home: Some(home.clone()),
+            ..Self::at(home.join("sessions"))
+        }
     }
 
     fn at(root: PathBuf) -> Self {
         Self {
             root,
             logs: Mutex::new(HashMap::new()),
+            home: None,
         }
     }
 
@@ -764,16 +766,21 @@ impl AgentAdapter for DshAdapter {
     }
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
-        let root = if dir.join("sessions").is_dir() {
-            dir.join("sessions")
-        } else {
-            dir
-        };
-        Box::new(Self::at(root))
+        if dir.join("sessions").is_dir() {
+            return Box::new(Self {
+                home: Some(dir.clone()),
+                ..Self::at(dir.join("sessions"))
+            });
+        }
+        Box::new(Self::at(dir))
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }
 

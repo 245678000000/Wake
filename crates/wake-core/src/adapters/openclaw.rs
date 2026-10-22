@@ -42,6 +42,8 @@ pub struct OpenclawAdapter {
     rows_cache: Mutex<HashMap<PathBuf, Arc<MtimeCache<Arc<Vec<ClawRow>>>>>>,
     /// 旧版 sessions.json 索引,每个 sessions 目录一份,按文件 mtime 失效
     index_cache: Mutex<HashMap<PathBuf, Arc<MtimeCache<LegacyIndex>>>>,
+    /// 状态目录(`~/.openclaw` / OPENCLAW_STATE_DIR);直接选中 agents 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 /// sessions.json 解析结果:sessionId → (会话键, 条目)
@@ -74,7 +76,10 @@ impl OpenclawAdapter {
                     new
                 }
             });
-        Self::with_root(state.join("agents"))
+        Self {
+            home: Some(state.clone()),
+            ..Self::with_root(state.join("agents"))
+        }
     }
 
     fn with_root(root: PathBuf) -> Self {
@@ -82,6 +87,7 @@ impl OpenclawAdapter {
             root,
             rows_cache: Mutex::new(HashMap::new()),
             index_cache: Mutex::new(HashMap::new()),
+            home: None,
         }
     }
 
@@ -876,12 +882,21 @@ impl AgentAdapter for OpenclawAdapter {
         // 同步前就落在正确形态)
         let is_agents = dir.file_name().and_then(|n| n.to_str()) == Some("agents")
             || (!dir.join("agents").is_dir() && looks_like_agents(&dir));
-        let root = if is_agents { dir } else { dir.join("agents") };
-        Box::new(Self::with_root(root))
+        if is_agents {
+            return Box::new(Self::with_root(dir));
+        }
+        Box::new(Self {
+            home: Some(dir.clone()),
+            ..Self::with_root(dir.join("agents"))
+        })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }
 

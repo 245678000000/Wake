@@ -81,6 +81,13 @@ pub const MODEL_BADGE_BG: u32 = CLAUDE_ORANGE;
 /// 收藏星选中色——macOS systemYellow(Finder/Mail 星标惯例),两模式通用
 pub const STAR_YELLOW: u32 = 0xFFCC00;
 
+/// Skills 页 "plugin" 徽章色(淡底 + 同色字):紫——界面里别处没用过,与 primary 蓝(`@host`)、
+/// Claude 橙(model)、成功绿、危险红、收藏黄都分得开(用户 2026-10-23 要"跟其他不一样");
+/// 字色对列表底的对比度浅色 6.1:1、深色 6.6:1
+pub fn plugin_badge_color(dark: bool) -> Hsla {
+    c(if dark { 0xB794F6 } else { 0x7C3AED })
+}
+
 /// Insights 趋势图的 agent 序列色:有彩色品牌的家取品牌色(从内嵌 PNG 取主色,
 /// 与侧栏图标同调),单色字形的家(Copilot/Cursor/OpenCode/Pi/Grok/Kimi)
 /// 给固定备选色——同一家在任何机器上颜色都不变,相邻常见组合(Claude/Codex/
