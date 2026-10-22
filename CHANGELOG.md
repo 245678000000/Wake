@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.9.6] — 2026-10-22
 
 - Fix: Claude Code sessions take the title Claude Code gave them instead of their first message (#74, thanks @hoixding)
 - Fix: Codex sessions that Codex has compressed show up again, with their titles and archived status (#72, thanks @suiyun08)
