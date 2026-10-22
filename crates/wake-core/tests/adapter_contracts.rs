@@ -506,7 +506,7 @@ fn claude_parse_contract() {
         .parse_transcript(&r)
         .expect("claude parse_transcript");
 
-    // 标题=最后一条 custom-title,压过首条用户消息推导
+    // 标题=最后一条 custom-title,压过首条用户消息推导(agent-name 的会话名不当标题)
     assert_eq!(s.meta.title, "QR login revamp");
     assert_eq!(s.meta.project_path, "/Users/tester/Github/wakefx");
     assert_eq!(s.meta.project_name, "wakefx");
@@ -516,7 +516,8 @@ fn claude_parse_contract() {
     assert_eq!(s.meta.message_count, 3);
     assert_eq!(s.meta.created_at, ms("2026-08-01T09:59:00Z"));
     assert_eq!(s.meta.updated_at, ms("2026-08-01T10:02:00Z"));
-    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 不计
+    // "wibble-experimental" 计 unknown;summary / atis-latch / bridge-session 与 2.1 起的 agent-name /
+    // cost-state / api-request* / relocated / worktree-state 不计——项目也不随 relocated 去 worktree
     assert_eq!(s.unknown_line_count, 1);
     assert_eq!(t.unknown_line_count, 1);
 
@@ -978,6 +979,113 @@ fn claude_branches_fold_the_copied_history_and_nest_under_the_original() {
     assert_eq!(sb.meta.title, "修复登录超时");
     assert_eq!(sb.meta.tokens_used, Some(460));
     assert_eq!(adapter.parent_links(), Some(Vec::new()));
+}
+
+/// Claude Code 2.1 起命令行自己给会话起名(`ai-title`,#74):没有 custom-title 时它就是标题,
+/// 不算未知行;分支照抄原件的 AI 标题与 custom-title 一样不用;用户改过的名字照旧压过它
+#[test]
+fn claude_ai_titles_name_sessions() {
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let (dir, a, b) = common::stage_claude_branch(&projects);
+    // 两份文件里的自定义标题都换成 AI 标题:命令行起的名字,分支照抄了原件那一条
+    let path = |id: &str| dir.join(format!("{id}.jsonl"));
+    for id in [&a, &b] {
+        let text = fs::read_to_string(path(id))
+            .unwrap()
+            .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+            .replace(r#""customTitle":"#, r#""aiTitle":"#);
+        fs::write(path(id), text).unwrap();
+    }
+    let adapter = ClaudeAdapter::new().with_custom_root(projects);
+    let parse = |id: &str| {
+        adapter
+            .parse_session(&adapter.file_ref(&path(id)).unwrap())
+            .unwrap()
+    };
+
+    let sa = parse(&a);
+    assert_eq!(sa.meta.title, "修复登录超时");
+    assert_eq!(sa.unknown_line_count, 0);
+    assert_eq!(
+        parse(&b).meta.title,
+        "换个思路:登录改成异步队列",
+        "照抄的 AI 标题不用"
+    );
+
+    let renamed =
+        serde_json::json!({"type": "custom-title", "customTitle": "登录超时排查", "sessionId": a});
+    let text = fs::read_to_string(path(&a)).unwrap() + &format!("{renamed}\n");
+    fs::write(path(&a), text).unwrap();
+    assert_eq!(
+        parse(&a).meta.title,
+        "登录超时排查",
+        "改过的名字压过 AI 标题"
+    );
+}
+
+/// 分支的分支:A 分出 B、B 改了名再分出 C,C 开头照抄的是 B 的名字——只和原件 A 比去不掉,
+/// C 就和 B 同名。要与每一份更早的同根文件比。自定义标题与 AI 标题同一条规则,各搭一遍
+/// (Codex review 2026-10-21)
+#[test]
+fn claude_branch_of_a_branch_drops_the_title_it_copied() {
+    for (kind, field) in [("custom-title", "customTitle"), ("ai-title", "aiTitle")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let (dir, a, b) = common::stage_claude_branch(&projects);
+        let path = |id: &str| dir.join(format!("{id}.jsonl"));
+        let renamed = |session: &str| serde_json::json!({ "type": kind, field: "登录改成异步队列", "sessionId": session });
+        if kind == "ai-title" {
+            for id in [&a, &b] {
+                let text = fs::read_to_string(path(id))
+                    .unwrap()
+                    .replace(r#""type":"custom-title""#, r#""type":"ai-title""#)
+                    .replace(r#""customTitle":"#, r#""aiTitle":"#);
+                fs::write(path(id), text).unwrap();
+            }
+        }
+        let text = fs::read_to_string(path(&b)).unwrap() + &format!("{}\n", renamed(&b));
+        fs::write(path(&b), text).unwrap();
+
+        // C 从 B 分出:开头照抄 B 的名字与 B 的消息行,之后问了自己的一句;照抄来的名字在分叉点
+        // 之后还会再写(本机的分支文件里就是这样)
+        let c = "c1a0de00-0000-4000-8000-0000000000c3";
+        let mut rows = vec![
+            renamed(c),
+            serde_json::json!({ "type": "queue-operation", "operation": "enqueue", "timestamp": "2026-09-03T10:00:00.000Z", "sessionId": c }),
+        ];
+        for line in fs::read_to_string(path(&b)).unwrap().lines() {
+            let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+            if row.get("uuid").is_some() {
+                row["sessionId"] = c.into();
+                rows.push(row);
+            }
+        }
+        rows.push(serde_json::json!({
+            "parentUuid": "c1a0de00-2222-4000-8000-000000000004",
+            "isSidechain": false,
+            "cwd": "/Users/tester/Github/branchfx",
+            "sessionId": c,
+            "type": "user",
+            "message": { "role": "user", "content": "队列满了怎么办" },
+            "uuid": "c1a0de00-3333-4000-8000-000000000005",
+            "timestamp": "2026-09-03T10:00:10.000Z",
+        }));
+        rows.push(renamed(c));
+        let text: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        fs::write(path(c), text).unwrap();
+
+        let adapter = ClaudeAdapter::new().with_custom_root(projects);
+        let title = |id: &str| {
+            adapter
+                .parse_session(&adapter.file_ref(&path(id)).unwrap())
+                .unwrap()
+                .meta
+                .title
+        };
+        assert_eq!(title(&b), "登录改成异步队列", "{kind}: B 自己改的名字照用");
+        assert_eq!(title(c), "队列满了怎么办", "{kind}: C 照抄 B 的名字不用");
+    }
 }
 
 #[test]
@@ -1481,6 +1589,175 @@ fn codex_review_output_is_readable_and_not_duplicated() {
     assert_eq!(session.meta.title, UNTITLED);
     assert_eq!(session.units.len(), 1);
     assert!(session.units[0].text.contains("Keep the selected row"));
+}
+
+/// 0.156 起的两种记录:`token_usage_record` 每次模型调用一行,`realtime_item` 的起止
+/// 标记是语音会话的元数据,都不算未知行(Clean Up 移动前要求整份读懂,否则拒清)。
+/// token 以 event_msg 的 token_count 为准,用量记录里整个线程的累计只在文件里没有
+/// token_count 时才用;带内容的语音子类型(transcript_segment 等)还没见过样本,照旧计未知行
+#[test]
+fn codex_usage_and_realtime_records_are_known() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2026/10/19");
+    fs::create_dir_all(&day).unwrap();
+    let id = "01a12345-0000-7000-8000-000000000156";
+    let usage = |input: i64| {
+        serde_json::json!({
+            "input_tokens": input, "cached_input_tokens": 0, "cache_write_input_tokens": 0,
+            "output_tokens": 10, "reasoning_output_tokens": 0, "total_tokens": input + 10
+        })
+    };
+    let realtime = |kind: &str| {
+        serde_json::json!({"timestamp": "2026-10-19T00:00:05.000Z", "type": "realtime_item",
+            "payload": {"realtime_session_id": "rs-1", "type": kind}})
+    };
+    let token_count = serde_json::json!({"timestamp": "2026-10-19T00:00:04.000Z", "type": "event_msg",
+        "payload": {"type": "token_count", "info": {"total_token_usage": usage(3000),
+            "last_token_usage": usage(100), "model_context_window": 272000}}});
+    let lines = vec![
+        serde_json::json!({"timestamp": "2026-10-19T00:00:00.000Z", "type": "session_meta",
+            "payload": {"id": id, "timestamp": "2026-10-19T00:00:00.000Z", "cwd": "/work/wake",
+                "originator": "codex_cli_rs", "source": "cli", "cli_version": "0.156.0"}}),
+        realtime("realtime_session_started"),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:02.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "Count the tokens"}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.000Z", "type": "response_item",
+            "payload": {"type": "message", "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}]}}),
+        serde_json::json!({"timestamp": "2026-10-19T00:00:03.500Z", "type": "token_usage_record",
+            "payload": {"thread_id": id, "turn_id": "t-1", "session_id": id, "root_turn_id": "t-1",
+                "response_id": "resp_1", "usage": usage(100), "turn_token_usage": usage(100),
+                "thread_token_usage": usage(4000)}}),
+        token_count.clone(),
+        realtime("realtime_session_closed"),
+        realtime("transcript_segment"),
+    ];
+    let path = day.join(format!("rollout-2026-10-19T00-00-00-{id}.jsonl"));
+    let write = |lines: &[serde_json::Value]| {
+        let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+        fs::write(&path, body).unwrap();
+    };
+    write(&lines);
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("用户线程照常列出");
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(
+        transcript.unknown_line_count, 1,
+        "只有 transcript_segment 计未知行"
+    );
+    let texts: Vec<&str> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .map(|m| m.text.as_str())
+        .collect();
+    assert_eq!(texts, ["Count the tokens", "Done."]);
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(
+        session.meta.tokens_used,
+        Some(3010),
+        "token 以 token_count 的累计为准"
+    );
+
+    // 哪天 Codex 不写 token_count 了:退回用量记录里整个线程的累计,不至于没有 token
+    let without: Vec<serde_json::Value> = lines.into_iter().filter(|l| *l != token_count).collect();
+    write(&without);
+    let r = adapter.file_ref(&path).unwrap();
+    assert_eq!(
+        adapter.parse_session(&r).unwrap().meta.tokens_used,
+        Some(4010)
+    );
+}
+
+/// 2025 年 9 月前后的老格式:首行 `{id, timestamp, instructions, git}` 没有信封,每轮之间夹着
+/// `{"record_type":"state"}`,条目是不带信封的 response item、也不带时间。原先整份落进未知行、
+/// 入库成 0 条消息的 Untitled(本机 17 条);工作目录只在 `<environment_context>` 里。这些会话
+/// 在 state DB 里没有行,标题全靠首条提问——IDE 扩展把编辑器上下文包在提问外面,标题只取
+/// 提问,正文原样保留(选中的代码是用户特意附上的)
+#[test]
+fn codex_legacy_rollouts_are_read() {
+    setup();
+    let home = tempfile::tempdir().unwrap();
+    let day = home.path().join("sessions/2025/09/05");
+    fs::create_dir_all(&day).unwrap();
+    let id = "5aa9ab7a-0000-4000-8000-000000002025";
+    let lines = [
+        serde_json::json!({"id": id, "timestamp": "2025-09-05T02:54:37.123Z", "instructions": null,
+            "git": {"commit_hash": "abc123", "branch": "main", "repository_url": "git@example.com:me/legacy.git"}}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "<environment_context>\n  <cwd>/work/legacy-proj</cwd>\n  <approval_policy>on-request</approval_policy>\n</environment_context>"}]}),
+        serde_json::json!({"type": "message", "id": null, "role": "user", "content": [{"type": "input_text",
+            "text": "# Context from my IDE setup:\n\n## Active file: src/login.rs\n\n## Active selection of the file:\nfn login() {}\n\n## My request for Codex:\nFix the login button\n"}]}),
+        serde_json::json!({"record_type": "state"}),
+        serde_json::json!({"type": "reasoning", "id": "rs_1", "content": null, "encrypted_content": "gAAA",
+            "summary": [{"type": "summary_text", "text": "Looking at the click handler"}]}),
+        serde_json::json!({"type": "function_call", "id": "fc_1", "name": "shell",
+            "arguments": "{\"command\":[\"rg\",\"login\"]}", "call_id": "call_1"}),
+        serde_json::json!({"type": "function_call_output", "call_id": "call_1",
+            "output": "{\"output\":\"src/login.rs:12\",\"metadata\":{\"exit_code\":0}}"}),
+        serde_json::json!({"type": "message", "id": "msg_1", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Fixed the handler in src/login.rs."}]}),
+        serde_json::json!({"record_type": "state"}),
+    ];
+    let path = day.join(format!("rollout-2025-09-05T10-54-37-{id}.jsonl"));
+    let body: String = lines.iter().map(|l| format!("{l}\n")).collect();
+    fs::write(&path, body).unwrap();
+
+    let adapter = CodexAdapter::new().with_custom_root(home.path().to_path_buf());
+    let r = adapter.file_ref(&path).expect("老格式照常列出");
+    assert_eq!(r.native_id, id);
+    let transcript = adapter.parse_transcript(&r).unwrap();
+    assert_eq!(transcript.unknown_line_count, 0);
+    let visible: Vec<&TranscriptMessage> = transcript
+        .mainline
+        .iter()
+        .filter(|m| m.kind != MessageKind::Meta)
+        .collect();
+    let texts: Vec<&str> = visible
+        .iter()
+        .map(|m| m.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect();
+    assert!(
+        texts[0].starts_with("# Context from my IDE setup:") && texts[0].contains("fn login() {}"),
+        "正文原样保留:{}",
+        texts[0]
+    );
+    assert_eq!(texts[1..], ["Fixed the handler in src/login.rs."]);
+    let tools: Vec<&ToolCallView> = visible.iter().flat_map(|m| &m.tool_calls).collect();
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "shell");
+    assert!(
+        tools[0]
+            .output
+            .as_deref()
+            .unwrap_or("")
+            .contains("src/login.rs:12"),
+        "{:?}",
+        tools[0].output
+    );
+    assert!(visible
+        .iter()
+        .any(|m| m.thinking.as_deref() == Some("Looking at the click handler")));
+
+    let session = adapter.parse_session(&r).unwrap();
+    assert_eq!(session.meta.title, "Fix the login button");
+    assert_eq!(session.meta.project_path, "/work/legacy-proj");
+    assert_eq!(session.meta.git_branch.as_deref(), Some("main"));
+    assert_eq!(
+        session.meta.created_at,
+        ms("2025-09-05T02:54:37.123Z"),
+        "创建时间取首行"
+    );
+    assert_eq!(
+        session.meta.updated_at, r.mtime_ms,
+        "条目不带时间,活动时间退回文件 mtime"
+    );
+    assert_seq_contract(adapter.as_ref(), &r);
 }
 
 #[test]
@@ -3036,7 +3313,12 @@ fn antigravity_transcripts_replace_index_cards() {
     let adapter = AntigravityAdapter::new().with_custom_root(gemini.clone());
     assert_eq!(
         adapter.data_roots(),
-        vec![db.clone(), desktop.clone(), ide.clone()]
+        vec![
+            db.clone(),
+            desktop.clone(),
+            ide.clone(),
+            gemini.join("antigravity-cli").join("brain")
+        ]
     );
     let mut refs = adapter.list_session_files().expect("antigravity list");
     refs.sort_by(|a, b| (&a.native_id, &a.file_path).cmp(&(&b.native_id, &b.file_path)));
@@ -3180,11 +3462,14 @@ fn antigravity_transcripts_replace_index_cards() {
         "{after:?}"
     );
 
-    // 自定义 location 的其余形状:单个 brain、app 数据目录、索引所在目录
+    // 自定义 location 的其余形状:单个 brain、app 数据目录、索引所在目录(连同 CLI 的 brain)
     let roots = |dir: PathBuf| AntigravityAdapter::new().with_custom_root(dir).data_roots();
     assert_eq!(roots(ide.clone()), vec![ide.clone()]);
     assert_eq!(roots(gemini.join("antigravity-ide")), vec![ide.clone()]);
-    assert_eq!(roots(gemini.join("antigravity-cli")), vec![db.clone()]);
+    assert_eq!(
+        roots(gemini.join("antigravity-cli")),
+        vec![db.clone(), gemini.join("antigravity-cli").join("brain")]
+    );
 }
 
 // ---------------------------------------------------------------- seq 契约
@@ -3240,7 +3525,9 @@ fn watch_paths_derive_from_data_roots() {
         let tag = a.agent().as_str();
         let watched = a.watch_paths();
         // 唯一的例外:Kilo 旧版扩展的任务目录不进监听(每个任务里一整份 checkpoints 影子
-        // git 仓库,见 adapters::kilo);它的新版实例是库文件,本来就没有监听目录
+        // git 仓库,见 adapters::kilo);它的新版实例是库文件,本来就没有监听目录。
+        // Claude Code 的默认实例另听桌面端的会话记录(见 adapters::claude_desktop),假 HOME
+        // 里没有那个目录,所以这里照常相等;它由 claude.rs 的单测卡着
         let expect: Vec<std::path::PathBuf> = if a.agent() == AgentId::Kilo {
             Vec::new()
         } else {

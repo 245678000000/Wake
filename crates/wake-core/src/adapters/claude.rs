@@ -1,3 +1,4 @@
+use super::claude_desktop::{DesktopIndex, Owned, PLACEHOLDER_TITLE};
 use super::parse_utils::*;
 use super::AgentAdapter;
 use crate::models::*;
@@ -25,6 +26,17 @@ const KNOWN_SKIP_TYPES: &[&str] = &[
     "atis-latch",
     // Bridge connection bookkeeping, not transcript content.
     "bridge-session",
+    // 2.1 起的记账记录:会话名(改名或自动起名时与 custom-title / ai-title 一起写、同值,
+    // 不另当标题)、累计费用、请求元数据与按哈希去重存放的请求内容
+    "agent-name",
+    "cost-state",
+    "api-request",
+    "api-request-blob",
+    "api-request-shape",
+    // EnterWorktree 进出 worktree 时记下的工作目录。项目仍按会话起始的目录归:worktree
+    // 用完就删,恢复时 Claude Code 自己按 worktree-state 回到 worktree
+    "relocated",
+    "worktree-state",
 ];
 
 pub struct ClaudeAdapter {
@@ -44,6 +56,9 @@ pub struct ClaudeAdapter {
     decoded: Mutex<HashMap<String, Option<String>>>,
     /// 分支识别的缓存(见 `BranchCache`)
     branches: Mutex<BranchCache>,
+    /// Claude 桌面端的会话记录(归档位在那里,见 `claude_desktop`)。只给默认根:记录里的
+    /// CLI 会话 id 指的是本机 ~/.claude 里的转录
+    desktop: Option<DesktopIndex>,
 }
 
 // ---------------- 分支(续接)识别 ----------------
@@ -74,12 +89,13 @@ struct Branch {
     original: PathBuf,
 }
 
-/// 整份文件的 uuid 集合与最后一条自定义标题。只给分支之前的那几份读(绝大多数会话没有
-/// 分支,一份都不用读)
+/// 整份文件的 uuid 集合与最后一条自定义标题、AI 标题。只给分支之前的那几份读(绝大多数
+/// 会话没有分支,一份都不用读)
 #[derive(Clone)]
 struct Lineage {
     uuids: Arc<HashSet<String>>,
     custom_title: Option<String>,
+    ai_title: Option<String>,
 }
 
 /// 一个项目目录的分支分组,按目录 mtime 校验:文件进出、改名都会改它;文件追加不会,也
@@ -106,13 +122,12 @@ struct BranchCache {
     lineages: HashMap<PathBuf, ((i64, i64), Lineage)>,
 }
 
-/// 一份分支会话的继承段:比它早写下的同根文件里出现过的 uuid。文件开头连续落在这些集合
-/// 里的行是从原件复制来的
+/// 一份分支会话的继承段:比它早写下的同根文件(原件在其中)。文件开头连续落在它们 uuid 集合
+/// 里的行是复制来的;分支的自定义标题、AI 标题跟其中哪一份的一样(分支时照抄过来)也不当标题
+/// 用,往下退——否则父子两行标题一模一样,看不出分支在问什么。每一份都比、不只比原件:A 分出
+/// B、B 改了名再分出 C,C 抄来的是 B 的名字
 struct Inherited {
     earlier: Vec<Lineage>,
-    /// 原件最后一条自定义标题:分支的自定义标题跟它一样(分支时照抄过来)就不当标题用,
-    /// 改用分支自己的第一句话——否则父子两行标题一模一样,看不出分支在问什么
-    parent_title: Option<String>,
 }
 
 impl Inherited {
@@ -203,8 +218,20 @@ fn read_head(path: &Path, born: Option<i64>) -> Head {
     head
 }
 
-/// 读整份文件的 uuid 集合与最后一条自定义标题。逐行只反序列化这三个字段;坏行跳过,
-/// 读错误整份失败(读不全就宁可不折)
+/// `custom-title` 行里的名字。桌面端的占位名不算名字:它写在会话刚建好的时候,之后起的名字
+/// 只写进当时那一条 CLI 会话,/clear、resume 之前的那几条就一直顶着它
+fn custom_title_of(v: Option<&Value>) -> Option<String> {
+    optional_string(v).filter(|t| t != PLACEHOLDER_TITLE)
+}
+
+/// `ai-title` 行里命令行自己起的名字(2.1 起,#74)。解析与 read_lineage 都经这里取,分支的
+/// 标题与原件的才比得上
+fn ai_title_of(v: Option<&Value>) -> Option<String> {
+    optional_string(v)
+}
+
+/// 读整份文件的 uuid 集合与最后一条自定义标题、AI 标题。逐行只反序列化这几个字段;坏行
+/// 跳过,读错误整份失败(读不全就宁可不折)
 fn read_lineage(path: &Path) -> Result<Lineage> {
     #[derive(Deserialize)]
     struct Row {
@@ -213,29 +240,38 @@ fn read_lineage(path: &Path) -> Result<Lineage> {
         typ: Option<String>,
         #[serde(rename = "customTitle")]
         custom_title: Option<Value>,
+        #[serde(rename = "aiTitle")]
+        ai_title: Option<Value>,
     }
     let mut uuids = HashSet::new();
     let mut title = None;
+    let mut ai_title = None;
     for row in jsonl_rows::<Row, _>(BufReader::with_capacity(1 << 20, fs::File::open(path)?)) {
         let Some(row) = row? else { continue };
         if let Some(uuid) = row.uuid.filter(|u| !u.is_empty()) {
             uuids.insert(uuid);
         }
-        // 与解析同一个取法(optional_string),分支标题与原件标题才比得上
-        if row.typ.as_deref() == Some("custom-title") {
-            title = optional_string(row.custom_title.as_ref()).or(title);
+        // 与解析同一个取法,分支标题与原件标题才比得上
+        match row.typ.as_deref() {
+            Some("custom-title") => title = custom_title_of(row.custom_title.as_ref()).or(title),
+            Some("ai-title") => ai_title = ai_title_of(row.ai_title.as_ref()).or(ai_title),
+            _ => {}
         }
     }
     Ok(Lineage {
         uuids: Arc::new(uuids),
         custom_title: title,
+        ai_title,
     })
 }
 
 impl ClaudeAdapter {
     pub fn new() -> Self {
         let home = super::home_dir().unwrap_or_default().join(".claude");
-        Self::at(home.join("projects"), Some(home), true)
+        Self {
+            desktop: Some(DesktopIndex::new(super::claude_desktop::sessions_root())),
+            ..Self::at(home.join("projects"), Some(home), true)
+        }
     }
 
     fn at(root: PathBuf, home: Option<PathBuf>, local: bool) -> Self {
@@ -246,7 +282,25 @@ impl ClaudeAdapter {
             memories: super::MemoryCache::new(),
             decoded: Mutex::new(HashMap::new()),
             branches: Mutex::new(BranchCache::default()),
+            desktop: None,
         }
+    }
+
+    /// 测试用:桌面端记录放在给定目录
+    #[cfg(test)]
+    pub(crate) fn with_desktop(root: PathBuf, desktop: PathBuf) -> Self {
+        Self {
+            desktop: Some(DesktopIndex::new(desktop)),
+            ..Self::at(root, None, false)
+        }
+    }
+
+    /// Claude 桌面端记着的 CLI 会话:归档位与标题(没有桌面端记录的实例恒空)
+    fn desktop_owned(&self) -> HashMap<String, Owned> {
+        self.desktop
+            .as_ref()
+            .map(DesktopIndex::owned)
+            .unwrap_or_default()
     }
 
     /// 一个项目目录里的分支(见 `DirBranches`)。目录没变就直接用上次的分组,一次 stat;
@@ -315,6 +369,43 @@ impl ClaudeAdapter {
         Some(r)
     }
 
+    /// `file_ref` 去掉桌面端那几位:子代理转录(及边车)或会话主文件
+    fn own_ref(&self, path: &Path) -> Option<SessionFileRef> {
+        // 子代理转录与它的边车。会话目录得在数据根下的项目目录里
+        let in_project =
+            |session: &Path| session.parent().and_then(Path::parent) == Some(self.root.as_path());
+        if let Some(r) = subagent_event_ref(AgentId::ClaudeCode, path, in_project) {
+            return Some(r);
+        }
+        // 会话主文件只在 `<projects>/<项目目录>/` 这一层:更深的(memory 边车、Workflow 的
+        // 运行日志 journal.jsonl)都不是。按路径分段比,Windows 的反斜杠路径一样认
+        let dir = path.parent()?;
+        if dir.parent() != Some(self.root.as_path()) {
+            return None;
+        }
+        self.session_ref(path, &self.branches_in(dir))
+    }
+
+    /// 桌面端一份会话记录名下的转录(连同子代理的):watcher 看到记录变了,交它们按引用重比
+    fn transcripts_of(&self, ids: &[String]) -> Vec<PathBuf> {
+        let Ok(projects) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        let mut transcripts = Vec::new();
+        for project in projects.flatten() {
+            let dir = project.path();
+            for id in ids {
+                let transcript = dir.join(format!("{id}.jsonl"));
+                if transcript.is_file() {
+                    transcripts.push(transcript);
+                }
+                // 主转录被清掉、会话目录还在时,里面的子代理照样在索引里
+                transcripts.extend(subagent_transcripts(&dir.join(id)));
+            }
+        }
+        transcripts
+    }
+
     /// 一份文件的 uuid 集合(按 mtime + size 缓存;读文件不持锁)
     fn lineage(&self, path: &Path) -> Result<Lineage> {
         let meta = fs::metadata(path)?;
@@ -333,7 +424,7 @@ impl ClaudeAdapter {
         Ok(lineage)
     }
 
-    /// `file` 是分支的话,它的继承段与原件的标题;不是分支给 None。更早的文件读不出来就报错,
+    /// `file` 是分支的话,它的继承段;不是分支给 None。更早的文件读不出来就报错,
     /// 不能当成"不是分支"照常入库:等它读得出来,分支的引用没变、扫描不会重来,索引停在没
     /// 折叠的那份,现场解析却折叠了,两边的 seq 对不上(不变量 1)。解析失败时库里的旧行
     /// 留着,下一轮再试
@@ -354,11 +445,7 @@ impl ClaudeAdapter {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let parent_title = self.lineage(&branch.original)?.custom_title;
-        Ok(Some(Inherited {
-            earlier,
-            parent_title,
-        }))
+        Ok(Some(Inherited { earlier }))
     }
 
     /// 会话的解析(parse_session 与 parse_transcript 共用):分支先拿继承段;子代理的转录整份
@@ -374,6 +461,15 @@ impl ClaudeAdapter {
         let parsed = parse_claude_jsonl(path, subagent, decode_images, inherited.as_ref())?;
         let mut meta = build_meta(r, &parsed);
         mark_subagent(&mut meta, path);
+        let desktop = self.desktop_owned();
+        meta.archived = archived_in(&desktop, r);
+        // 转录里没起过名字(或只有桌面端的占位名):用桌面会话的名字(用户在桌面端看到的
+        // 就是它),再退回 AI 标题、首条提问
+        if !parsed.titled {
+            if let Some(title) = desktop_title(&desktop, r) {
+                meta.title = title.to_string();
+            }
+        }
         Ok((meta, parsed))
     }
 
@@ -454,6 +550,8 @@ fn decode_project_dir(name: &str) -> Option<String> {
 struct ParseResult {
     messages: Vec<TranscriptMessage>,
     title: String,
+    /// 标题是转录里起的名字(`custom-title`),不是 AI 标题或退回来的首条提问
+    titled: bool,
     cwd: String,
     git_branch: Option<String>,
     model: Option<String>,
@@ -537,6 +635,8 @@ fn parse_claude_jsonl(
     // tool_use id → (消息占位:回填时按 id 在已 flush 消息与 pending 中查)
     let mut tool_index: HashMap<String, (usize, usize)> = HashMap::new();
     let mut custom_title = String::new();
+    // 2.1 起命令行自己起的标题;只用命令行、没有桌面端写 custom-title 的会话全靠它(#74)
+    let mut ai_title = String::new();
     let mut fallback_title = String::new();
     let mut cwd = String::new();
     let mut git_branch: Option<String> = None;
@@ -577,8 +677,14 @@ fn parse_claude_jsonl(
         }
 
         if typ == "custom-title" {
-            if let Some(t) = optional_string(row.get("customTitle")) {
+            if let Some(t) = custom_title_of(row.get("customTitle")) {
                 custom_title = t;
+            }
+            continue;
+        }
+        if typ == "ai-title" {
+            if let Some(t) = ai_title_of(row.get("aiTitle")) {
+                ai_title = t;
             }
             continue;
         }
@@ -812,20 +918,30 @@ fn parse_claude_jsonl(
         if own_created_at > 0 {
             created_at = own_created_at;
         }
-        if inh.parent_title.as_deref() == Some(custom_title.as_str()) {
+        let earlier = &inh.earlier;
+        if earlier
+            .iter()
+            .any(|l| l.custom_title.as_deref() == Some(&custom_title))
+        {
             custom_title.clear();
+        }
+        if earlier
+            .iter()
+            .any(|l| l.ai_title.as_deref() == Some(&ai_title))
+        {
+            ai_title.clear();
         }
     }
     assign_seq(&mut messages);
 
+    let titled = !custom_title.is_empty();
+    let title = [custom_title, ai_title, fallback_title]
+        .into_iter()
+        .find(|t| !t.is_empty())
+        .unwrap_or_else(|| UNTITLED.to_string());
     Ok(ParseResult {
-        title: if !custom_title.is_empty() {
-            custom_title
-        } else if !fallback_title.is_empty() {
-            fallback_title
-        } else {
-            UNTITLED.to_string()
-        },
+        titled,
+        title,
         messages,
         cwd,
         git_branch,
@@ -858,6 +974,37 @@ fn mk_msg(role: Role, kind: MessageKind, text: &str, ts: i64) -> TranscriptMessa
         model: None,
         images: Vec::new(),
     }
+}
+
+/// 这份转录在 Claude 桌面端归档了没有。子代理跟着派它的会话:父会话归档了、子代理还开着,
+/// 列表会把子代理当成没有父会话的顶层会话列出来
+fn archived_in(desktop: &HashMap<String, Owned>, r: &SessionFileRef) -> bool {
+    let parent = subagent_parent(Path::new(&r.file_path));
+    desktop
+        .get(parent.as_deref().unwrap_or(&r.native_id))
+        .is_some_and(|owned| owned.archived)
+}
+
+/// 桌面会话的名字(子代理不用它,它的标题是派活时的任务说明)
+fn desktop_title<'a>(desktop: &'a HashMap<String, Owned>, r: &SessionFileRef) -> Option<&'a str> {
+    if is_subagent_transcript(&r.file_path) {
+        return None;
+    }
+    desktop.get(&r.native_id)?.title.as_deref()
+}
+
+/// 桌面端记的归档位与标题合起来取指纹,并进引用的 size:在桌面端归档、取消归档、改名时转录
+/// 未必动,全量扫描按引用认出它变了、重解析。不是 +1:分支的引用也往 size 里加着更早的同根
+/// 文件数,两样同时变(删掉中间那份分支、又归档了它的分支)会正好抵消。列表与 file_ref 各在
+/// 出口盖一次
+fn stamp_desktop(mut r: SessionFileRef, desktop: &HashMap<String, Owned>) -> SessionFileRef {
+    let archived = archived_in(desktop, &r);
+    let title = desktop_title(desktop, &r);
+    if archived || title.is_some() {
+        let archived = if archived { "archived" } else { "" };
+        r.size += sidecar_fingerprint(&[archived, title.unwrap_or("")]);
+    }
+    r
 }
 
 fn build_meta(r: &SessionFileRef, p: &ParseResult) -> SessionMeta {
@@ -947,7 +1094,11 @@ impl AgentAdapter for ClaudeAdapter {
                 }
             }
         }
-        Ok(refs)
+        let desktop = self.desktop_owned();
+        Ok(refs
+            .into_iter()
+            .map(|r| stamp_desktop(r, &desktop))
+            .collect())
     }
 
     fn parse_session(&self, r: &SessionFileRef) -> Result<ParsedSession> {
@@ -980,8 +1131,13 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     /// 项目目录里的会话文件进出(原件被删、被放回)会改变同目录分支的引用(`session_ref`
-    /// 数着更早的同根文件):交出同目录的其余会话文件,watcher 按引用重比、变了的重解析
+    /// 数着更早的同根文件):交出同目录的其余会话文件,watcher 按引用重比、变了的重解析。
+    /// 桌面端的会话记录变了(在桌面端归档、改名)同理:交出它名下的转录。记录从不入库,它的
+    /// 每次改动 watcher 都会来问,而桌面端每次聚焦都重写它——Wake 用得上的内容没变就不交
     fn ref_dependents(&self, path: &Path) -> Vec<PathBuf> {
+        if let Some(ids) = self.desktop.as_ref().and_then(|d| d.take_change(path)) {
+            return self.transcripts_of(&ids);
+        }
         let Some(dir) = path
             .parent()
             .filter(|dir| dir.parent() == Some(self.root.as_path()))
@@ -1003,24 +1159,14 @@ impl AgentAdapter for ClaudeAdapter {
     }
 
     fn file_ref(&self, path: &Path) -> Option<SessionFileRef> {
-        // 子代理转录与它的边车。会话目录得在数据根下的项目目录里
-        let in_project =
-            |session: &Path| session.parent().and_then(Path::parent) == Some(self.root.as_path());
-        if let Some(r) = subagent_event_ref(AgentId::ClaudeCode, path, in_project) {
-            return Some(r);
-        }
-        // 会话主文件只在 `<projects>/<项目目录>/` 这一层:更深的(memory 边车、Workflow 的
-        // 运行日志 journal.jsonl)都不是。按路径分段比,Windows 的反斜杠路径一样认
-        let dir = path.parent()?;
-        if dir.parent() != Some(self.root.as_path()) {
-            return None;
-        }
-        self.session_ref(path, &self.branches_in(dir))
+        let r = self.own_ref(path)?;
+        Some(stamp_desktop(r, &self.desktop_owned()))
     }
 
-    /// 分支挂到原件下面(见本文件「分支识别」),子代理挂到派它的会话下面(`parent_in_path`)。
-    /// 分支的关系由它自己的文件头与同目录里更早的同根文件推出,所以算"写在子会话里"(多
-    /// location 下按子会话的胜出副本认边)
+    /// 分支挂到原件下面(见本文件「分支识别」),子代理挂到派它的会话下面(`parent_in_path`),
+    /// 桌面端派出去的会话挂到派它的会话下面(`claude_desktop`)。分支的关系由它自己的文件头与
+    /// 同目录里更早的同根文件推出,派生关系记在子会话自己的桌面端记录里,所以都算"写在子会话
+    /// 里"(多 location 下按子会话的胜出副本认边)
     fn manages_parent_links(&self) -> bool {
         true
     }
@@ -1037,8 +1183,8 @@ impl AgentAdapter for ClaudeAdapter {
 
     /// 全量快照只用文件头(不读 uuid 集合):每个分支 → 它所在同根组里最早的那份。分支
     /// 的分支也直接挂到原件上——scanner 本来就把链压平到根。目录没变的,分组直接复用
-    /// (每批 watcher 事件都会问一遍,每个目录一次 stat)。projects 目录不在 = 确定没有
-    /// 关系;在却列不出来是"不知道",交 None 让 scanner 保留库里的关系
+    /// (每批 watcher 事件都会问一遍,每个目录一次 stat)。再加上桌面端侧栏的嵌套。projects
+    /// 目录不在 = 确定没有关系;在却列不出来是"不知道",交 None 让 scanner 保留库里的关系
     fn parent_links(&self) -> Option<Vec<(String, String)>> {
         let projects = match fs::read_dir(&self.root) {
             Ok(projects) => projects,
@@ -1057,7 +1203,31 @@ impl AgentAdapter for ClaudeAdapter {
                 }
             }
         }
+        // 桌面端侧栏的嵌套:同一个会话既是分支又是派出去的(fork 了上下文的侧会话)时,以转录里
+        // 看得见的分支关系为准
+        let spawned = self
+            .desktop
+            .as_ref()
+            .map(DesktopIndex::spawn_links)
+            .unwrap_or_default();
+        let branched: HashSet<String> = links.iter().map(|(child, _)| child.clone()).collect();
+        links.extend(
+            super::link_keys(
+                AgentId::ClaudeCode,
+                spawned
+                    .iter()
+                    .map(|(child, parent)| (child.as_str(), parent.as_str())),
+            )
+            .into_iter()
+            .filter(|(child, _)| !branched.contains(child)),
+        );
         Some(links)
+    }
+
+    /// 桌面端的会话记录变了(新派出一个会话、派它的会话 /clear 换了当前那条):父子关系跟着
+    /// 刷新。记录里的转录没动,收不到别的事件;只是聚焦一下重写了记录不算
+    fn is_snapshot_event(&self, path: &Path) -> bool {
+        self.desktop.as_ref().is_some_and(|d| d.changed(path))
     }
 
     /// 子代理挂到派它的会话:所在会话目录的名字就是那个会话的 id
@@ -1134,11 +1304,24 @@ impl AgentAdapter for ClaudeAdapter {
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
     }
+
+    /// 数据根之外再听桌面端的会话记录:在桌面端归档、取消归档只改那份记录,转录不动,
+    /// 不听它就要等下一轮全量扫描(`ref_dependents` 把记录换成它名下的转录)。记录不是会话
+    /// 文件,不进 data_roots
+    fn watch_paths(&self) -> Vec<PathBuf> {
+        let desktop = self.desktop.as_ref().map(|d| d.root().to_path_buf());
+        self.data_roots()
+            .into_iter()
+            .chain(desktop)
+            .filter(|p| p.is_dir())
+            .collect()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::claude_desktop::write_test_record;
 
     fn head(root: &str, first_ts: i64, born: Option<i64>) -> Head {
         Head {
@@ -1248,6 +1431,148 @@ mod tests {
             adapter.branches_in(&dir).contains_key(&branch),
             "写下第一行以后要认出分支"
         );
+    }
+
+    /// 在 Claude 桌面端归档:归档位并进引用(列表与 file_ref 一致)、解析出来的会话标成归档,
+    /// 子代理跟着派它的会话;记录变了交出名下的转录让 watcher 重比;取消归档原样退回
+    #[test]
+    fn archiving_in_the_desktop_app_reaches_refs_and_meta() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let dir = projects.join("-w");
+        let subagents = dir.join("sess-a").join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let line = |id: &str, sidechain: bool| {
+            format!(
+                r#"{{"type":"user","uuid":"u-{id}","isSidechain":{sidechain},"timestamp":"2026-09-01T08:00:01.000Z","sessionId":"{id}","message":{{"role":"user","content":"hello"}}}}"#
+            ) + "\n"
+        };
+        let main = dir.join("sess-a.jsonl");
+        let agent = subagents.join("agent-a1.jsonl");
+        let other = dir.join("sess-b.jsonl");
+        fs::write(&main, line("sess-a", false)).unwrap();
+        fs::write(&agent, line("sess-a", true)).unwrap();
+        fs::write(&other, line("sess-b", false)).unwrap();
+
+        let desktop = tmp.path().join("desktop");
+        let write_record = |archived: bool| {
+            let fields = serde_json::json!({ "cliSessionId": "sess-a", "isArchived": archived });
+            write_test_record(&desktop, "d", fields)
+        };
+        let record = write_record(true);
+
+        let adapter = ClaudeAdapter::with_desktop(projects.clone(), desktop.clone());
+        assert!(adapter.watch_paths().contains(&desktop));
+
+        let state = |adapter: &ClaudeAdapter| {
+            let listed = adapter.list_session_files().unwrap();
+            [&main, &agent, &other].map(|path| {
+                let r = adapter.file_ref(path).unwrap();
+                let from_list = listed.iter().find(|l| l.file_path == r.file_path).unwrap();
+                assert_eq!((from_list.mtime_ms, from_list.size), (r.mtime_ms, r.size));
+                let stamped = r.size != fs::metadata(path).unwrap().len() as i64;
+                (stamped, adapter.parse_session(&r).unwrap().meta.archived)
+            })
+        };
+        assert_eq!(
+            state(&adapter),
+            [(true, true), (true, true), (false, false)]
+        );
+
+        let mut dependents = adapter.ref_dependents(&record);
+        dependents.sort();
+        assert_eq!(dependents, vec![agent.clone(), main.clone()]);
+
+        write_record(false);
+        assert_eq!(
+            state(&adapter),
+            [(false, false), (false, false), (false, false)]
+        );
+
+        fs::remove_file(&main).unwrap();
+        assert_eq!(
+            adapter.ref_dependents(&record),
+            vec![agent.clone()],
+            "主转录没了,会话目录里的子代理照样交出去"
+        );
+    }
+
+    /// 归档位不能被分支计数抵消:分支的引用往 size 里加着更早的同根文件数,删掉中间那份分支
+    /// 让它减 1,同时归档就不能正好加 1
+    #[test]
+    fn the_archive_stamp_is_not_a_unit_step() {
+        let r = SessionFileRef {
+            agent: AgentId::ClaudeCode,
+            native_id: "s".to_string(),
+            file_path: "/p/-w/s.jsonl".to_string(),
+            mtime_ms: 1,
+            size: 100,
+        };
+        let owned = |archived: bool, title: Option<&str>| {
+            let facts = Owned {
+                archived,
+                title: title.map(str::to_string),
+            };
+            HashMap::from([("s".to_string(), facts)])
+        };
+        for title in [None, Some("图片下载")] {
+            let open = stamp_desktop(r.clone(), &owned(false, title)).size;
+            let archived = stamp_desktop(r.clone(), &owned(true, title)).size;
+            assert!(
+                (archived - open).abs() > 1_000,
+                "{title:?}: {open} → {archived}"
+            );
+        }
+    }
+
+    /// 标题:转录里起过的名字照用;桌面端的占位名 "New session" 不算名字——有桌面会话的名字
+    /// 用它(改名并进引用),没有就退回首条提问
+    #[test]
+    fn desktop_titles_replace_the_placeholder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let projects = tmp.path().join("projects");
+        let dir = projects.join("-w");
+        fs::create_dir_all(&dir).unwrap();
+        let write = |id: &str, title: &str| {
+            let lines = [
+                format!(r#"{{"type":"custom-title","customTitle":"{title}","sessionId":"{id}"}}"#),
+                format!(
+                    r#"{{"type":"user","uuid":"u-{id}","timestamp":"2026-09-01T08:00:01.000Z","sessionId":"{id}","message":{{"role":"user","content":"why does login time out"}}}}"#
+                ),
+            ];
+            let path = dir.join(format!("{id}.jsonl"));
+            fs::write(&path, lines.join("\n") + "\n").unwrap();
+            path
+        };
+        let renamed_later = write("prior", PLACEHOLDER_TITLE);
+        let no_record = write("lone", PLACEHOLDER_TITLE);
+        let named = write("named", "Real name");
+
+        let desktop = tmp.path().join("desktop");
+        let write_record = |title: &str| {
+            let fields = serde_json::json!({
+                "cliSessionId": "current", "priorCliSessionIds": ["prior", "named"], "title": title,
+            });
+            write_test_record(&desktop, "d", fields);
+        };
+        write_record("图片下载");
+        let adapter = ClaudeAdapter::with_desktop(projects, desktop.clone());
+        let title = |path: &Path| {
+            let r = adapter.file_ref(path).unwrap();
+            let listed = adapter.list_session_files().unwrap();
+            let from_list = listed.iter().find(|l| l.file_path == r.file_path).unwrap();
+            assert_eq!(from_list.size, r.size, "列表与 file_ref 一致");
+            (r.size, adapter.parse_session(&r).unwrap().meta.title)
+        };
+        let (before, renamed) = title(&renamed_later);
+        assert_eq!(renamed, "图片下载");
+        assert_eq!(title(&no_record).1, "why does login time out");
+        assert_eq!(title(&named).1, "Real name", "转录里起过的名字照用");
+
+        write_record("Image downloads");
+        let (after, renamed) = title(&renamed_later);
+        assert_eq!(renamed, "Image downloads");
+        assert_ne!(before, after, "桌面端改名,引用跟着变");
     }
 
     /// 把目录的 mtime 定在给定时刻(只在 unix 上能对目录开文件句柄)

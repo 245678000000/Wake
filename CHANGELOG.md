@@ -4,6 +4,21 @@
 
 - New: A Skills page lists the skills your agents have installed, which agents share each one, and where copies of the same skill have drifted apart (#62, thanks @ICEY4040727)
 
+## [0.9.6] — 2026-10-22
+
+- Fix: Claude Code sessions take the title Claude Code gave them instead of their first message (#74, thanks @hoixding)
+- Fix: Codex sessions that Codex has compressed show up again, with their titles and archived status (#72, thanks @suiyun08)
+- Fix: Sessions recorded by older Codex versions show their messages and titles instead of appearing empty
+- Fix: Clean Up no longer refuses Codex and Claude Code sessions written by recent versions
+- Fix: Open In → iTerm resumes the session in a new iTerm window instead of failing with an AppleScript error (#73, thanks @quintus-lab)
+- Fix: Conversations from the Antigravity CLI show their full messages, not just a summary (#71, thanks @dingtwo)
+
+## [0.9.5] — 2026-10-16
+
+- New: Sessions you start from another session in the Claude desktop app are listed under that session, as they are in the app
+- Fix: Claude Code sessions you archive in the Claude desktop app are archived in Wake too
+- Fix: Claude Code sessions left as "New session" take the name you gave them in the Claude desktop app, or else their first message
+
 ## [0.9.4] — 2026-10-15
 
 - Fix: Refresh picks up sessions you deleted in OpenCode while it was still running, instead of listing them until Wake restarts (#70, thanks @lin-code-world)

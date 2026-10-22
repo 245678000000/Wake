@@ -38,7 +38,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 | Agent | Data source | Model | Via |
 |---|---|---|---|
 | Claude Code | `~/.claude/projects/**/*.jsonl` | ✅ | — |
-| Codex CLI | `~/.codex/sessions` + `state_5.sqlite` | ✅ | ✅ |
+| Codex CLI | `~/.codex/sessions/**/*.jsonl[.zst]` + `state_5.sqlite` | ✅ | ✅ |
 | Qoder CLI | `~/.qoder/projects/*/*.jsonl` | ✅ | — |
 | Copilot CLI | `~/.copilot/session-store.db` | — | — |
 | Cursor | `~/.cursor/projects/**/agent-transcripts` + Cursor's `state.vscdb` (IDE chats) | ✅ | — |
@@ -50,7 +50,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 | Oh My Pi | `~/.omp/agent/sessions/**/*.jsonl` | ✅ | — |
 | Grok Build | `~/.grok/sessions/**/updates.jsonl` | ✅ | — |
 | Kimi Code | `~/.kimi-code/sessions/**/wire.jsonl` | — | — |
-| Antigravity | `~/.gemini/antigravity/brain`, `~/.gemini/antigravity-ide/brain` + `~/.gemini/antigravity-cli/conversation_summaries.db` | ✅ | ✅ |
+| Antigravity | `~/.gemini/antigravity/brain`, `~/.gemini/antigravity-ide/brain`, `~/.gemini/antigravity-cli/brain` + `~/.gemini/antigravity-cli/conversation_summaries.db` | ✅ | ✅ |
 | DeepSeek Harness (`dsh`) | `~/.dsh/sessions/**/session*.jsonl[.zstd]` | ✅ | — |
 | Hermes Agent | `~/.hermes/state.db` + `profiles/*/state.db` | ✅ | ✅ |
 | OpenClaw | `~/.openclaw/agents/*/agent/openclaw-agent.sqlite` + `agents/*/sessions/*.jsonl` | ✅ | ✅ |
