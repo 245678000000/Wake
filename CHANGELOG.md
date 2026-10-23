@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.0] — 2026-10-23
 
 - New: A Skills page lists the skills your agents have installed, which agents share each one, and where copies of the same skill have drifted apart (#62, thanks @ICEY4040727)
 
