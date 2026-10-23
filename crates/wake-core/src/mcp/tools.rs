@@ -177,7 +177,7 @@ pub fn definitions_for(usage: Usage) -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "query": { "type": "string", "description": "Search terms. Terms shorter than 3 characters fall back to a slower substring scan." },
+                    "query": { "type": "string", "description": "Search terms. Words of three or more characters and two-character Chinese, Japanese or Korean words use the index; a query made only of shorter terms (single characters, two-letter words like `js`) falls back to a slower substring scan." },
                     "project": project_param(),
                     "agents": agents_param(),
                     "since": since_param(),
@@ -810,7 +810,7 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
     if order.is_empty() {
         out.push_str(&format!("No session matches `{query}`{scope}.\n"));
         if degraded {
-            out.push_str("Note: terms shorter than 3 characters use a substring scan; try a longer or more specific term.\n");
+            out.push_str("Note: none of these terms can use the index (single characters, two-letter words), so this was a substring scan; try a longer or more specific term.\n");
         }
         if memory.is_empty() {
             out.push_str("Try fewer or different terms, drop the project/agent/since filters, or list sessions with wake_list_sessions.\n\n");
@@ -831,7 +831,7 @@ fn search(ctx: &ToolContext, args: &Value) -> ToolResult {
         }
     ));
     if degraded {
-        out.push_str("Note: terms shorter than 3 characters use a slower substring scan.\n");
+        out.push_str("Note: none of these terms can use the index (single characters, two-letter words), so this was a slower substring scan, newest first.\n");
     }
     out.push('\n');
     for (ix, key) in order.iter().take(shown).enumerate() {

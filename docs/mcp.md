@@ -180,7 +180,7 @@ All five tools are read-only and return Markdown text (`content[0].text`). Param
 
 ### `wake_search`
 
-Full-text search across every indexed session: titles, user prompts, assistant replies, tool names and tool inputs (tool outputs are not indexed). A title match is reported as `title` and its reference points at the start of the session. Terms are ANDed. CJK text and code substrings such as `useEffect(` both work; terms shorter than three characters fall back to a slower substring scan.
+Full-text search across every indexed session: titles, user prompts, assistant replies, tool names and tool inputs (tool outputs are not indexed). A title match is reported as `title` and its reference points at the start of the session. Terms are ANDed. CJK text and code substrings such as `useEffect(` both work. Words of three or more characters and two-character Chinese, Japanese or Korean words use the index; a query made only of shorter terms (single characters, two-letter words like `js`) falls back to a slower substring scan, newest first.
 
 | Parameter | Type | Default | Notes |
 |---|---|---|---|

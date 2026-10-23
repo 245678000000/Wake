@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 - New: MiMo Code sessions are indexed from its local database (`~/.local/share/mimocode/mimocode.db`, read-only) — titles, models, thinking, tool calls and token counts included. Sub-agents are listed under the session that started them, and the tool call that started one opens it. A session you imported into MiMo Code from Claude Code, Codex or OpenCode is listed only once you continue it there, and only the new part is indexed. Open In continues a session with `mimo --session` in its project directory. Not mirrored from remote hosts, since the database also holds MiMo Code's sign-in tokens (#77, thanks @lin-code-world)
+- Update: Two-character Chinese, Japanese and Korean words such as 部署 now search fast and rank by relevance, alone or mixed with other words like `部署 docker` (#79, thanks @yifengingit)
 
 ## [0.10.0] — 2026-10-23
 
