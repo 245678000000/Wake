@@ -168,11 +168,7 @@ fn build_meta(
     messages: &[TranscriptMessage],
     tokens: i64,
 ) -> SessionMeta {
-    let title = Some(row.title.as_str())
-        .map(clean_title_candidate)
-        .filter(|t| !t.is_empty())
-        .or_else(|| title_from_messages(messages))
-        .unwrap_or_else(|| UNTITLED.to_string());
+    let title = session_title(&row.title, false, messages);
     SessionMeta {
         key: format!("devin:{}", row.id),
         host: String::new(),

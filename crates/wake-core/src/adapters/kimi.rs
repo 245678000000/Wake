@@ -695,10 +695,7 @@ fn build_meta(
     cwd: &str,
     messages: &[TranscriptMessage],
 ) -> SessionMeta {
-    let title = Some(clean_title_candidate(&state.title))
-        .filter(|t| !t.is_empty())
-        .or_else(|| title_from_messages(messages))
-        .unwrap_or_else(|| UNTITLED.to_string());
+    let title = session_title(&state.title, false, messages);
     // Kimi 在 Windows 上把 workDir 记成 `C:/…`,别家记 `C:\…`:换成同一种写法才归到同一个项目
     let project = canonical_project_path(cwd);
     SessionMeta {

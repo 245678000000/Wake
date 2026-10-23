@@ -282,6 +282,9 @@ pub const NOT_SYNCED: &[AgentId] = &[
     // 本机那份是云端对话的缓存:另一台机器上的 app 缓存着同一批对话,同步过来同一个对话会按 host
     // 各列一遍(副本去重的域含 host)。缓存目录名带空格是次要的,白名单补上引号也不该同步
     AgentId::GrokBot,
+    // 会话只在 mimocode.db 里,同一个库还有存 access / refresh token 的 account 表;SQLite 是
+    // 整文件,拉会话就得连凭证一起拷到本机(Kilo 新版的 kilo.db 与 OpenClaw 的库同样因此不拉)
+    AgentId::MimoCode,
 ];
 
 /// host 名合法性:进 session key 作中段(不能有 ':')、直接作为 ssh/rsync

@@ -113,10 +113,7 @@ fn parse_kiro_jsonl(path: &Path, decode_images: bool) -> Result<(Vec<TranscriptM
 }
 
 fn build_meta(r: &SessionFileRef, side: &Sidecar, messages: &[TranscriptMessage]) -> SessionMeta {
-    let title = Some(clean_title_candidate(&side.title))
-        .filter(|t| !t.is_empty())
-        .or_else(|| title_from_messages(messages))
-        .unwrap_or_else(|| UNTITLED.to_string());
+    let title = session_title(&side.title, false, messages);
     let msg_ts_max = messages
         .iter()
         .filter_map(|m| m.timestamp)

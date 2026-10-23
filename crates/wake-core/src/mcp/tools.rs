@@ -538,6 +538,7 @@ fn parse_agent(s: &str) -> Option<AgentId> {
             "deepseek" => Some(AgentId::Dsh),
             "opencode2" | "opencodenext" => Some(AgentId::Opencode),
             "craft" => Some(AgentId::CraftAgents),
+            "mimo" => Some(AgentId::MimoCode),
             _ => None,
         })
 }
@@ -1561,6 +1562,10 @@ mod tests {
         assert_eq!(parse_agent("oh-my-pi"), Some(AgentId::Omp));
         assert_eq!(parse_agent("DeepSeek"), Some(AgentId::Dsh));
         assert_eq!(parse_agent("opencode2"), Some(AgentId::Opencode));
+        // 命令名、正名、连写的产品名都认
+        assert_eq!(parse_agent("mimo"), Some(AgentId::MimoCode));
+        assert_eq!(parse_agent("MiMo Code"), Some(AgentId::MimoCode));
+        assert_eq!(parse_agent("MiMoCode"), Some(AgentId::MimoCode));
         assert_eq!(parse_agent("chatgpt"), None);
     }
 

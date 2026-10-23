@@ -126,6 +126,9 @@ pub fn agent_series_color(agent: wake_core::models::AgentId) -> u32 {
         // 品牌是黑白的,色板里已有两档灰(Grok Build、ZCode),再加一档分不出来;给离全部现有
         // 颜色最远的一档深莓红(最近的 Kimi 粉 ΔE00 19.9)
         GrokBot => 0xAC396D,
+        // 标志是单色字标,MiMo Code 的横幅把 "MIMO" 涂成橙色:取小米标准橙,离 Claude 橙 ΔE00
+        // 11.7(Kilo 那档离 Hermes 11.9),比横幅原色(离 Claude 8.7)分得开
+        MimoCode => 0xFF6900,
     }
 }
 

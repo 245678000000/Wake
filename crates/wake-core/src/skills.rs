@@ -288,6 +288,9 @@ fn user_dirs(agent: AgentId) -> Option<UserDirs> {
         // 新版与旧版扩展
         AgentId::Kilo => Fixed(Base::Home, &[".kilo/skills", ".kilocode/skills"]),
         AgentId::Opencode => Fixed(Base::Config, &["opencode/skills"]),
+        // OpenCode 分支,同一套 xdg-basedir(MIMOCODE_HOME 改道不跟,OpenCode 的 OPENCODE_CONFIG_DIR
+        // 同样);它还读 `skill/` 单数与 `~/.mimocode`,常用的是这一处
+        AgentId::MimoCode => Fixed(Base::Config, &["mimocode/skills"]),
         AgentId::Devin => Fixed(Base::AppConfig, &["devin/skills"]),
         AgentId::Kimi | AgentId::GrokBot | AgentId::Workbuddy => return None,
     })
@@ -315,6 +318,7 @@ fn project_dirs(agent: AgentId) -> &'static [&'static str] {
         AgentId::Zcode => &[".zcode/skills"],
         AgentId::Devin => &[".devin/skills"],
         AgentId::Kilo => &[".kilo/skills"],
+        AgentId::MimoCode => &[".mimocode/skills"],
         AgentId::Openclaw
         | AgentId::CraftAgents
         | AgentId::Kimi

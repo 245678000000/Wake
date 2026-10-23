@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: MiMo Code sessions are indexed from its local database (`~/.local/share/mimocode/mimocode.db`, read-only) — titles, models, thinking, tool calls and token counts included. Sub-agents are listed under the session that started them, and the tool call that started one opens it. A session you imported into MiMo Code from Claude Code, Codex or OpenCode is listed only once you continue it there, and only the new part is indexed. Open In continues a session with `mimo --session` in its project directory. Not mirrored from remote hosts, since the database also holds MiMo Code's sign-in tokens (#77, thanks @lin-code-world)
+
 ## [0.10.0] — 2026-10-23
 
 - New: A Skills page lists the skills your agents have installed, which agents share each one, and where copies of the same skill have drifted apart (#62, thanks @ICEY4040727)

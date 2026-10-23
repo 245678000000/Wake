@@ -29,13 +29,14 @@ pub enum AgentId {
     CraftAgents,
     Devin,
     Kilo,
+    MimoCode,
 }
 
 impl AgentId {
     /// 全部 agent,**枚举声明序**(= Ord = 用户钉的侧栏展示序;面板成组、
     /// 表单下拉共用同一顺序)。曾误抄 create_adapters 的构造序,下拉与侧栏
     /// 排序当场对不上——契约测试现在卡它与 Ord 一致
-    pub const ALL: [AgentId; 23] = [
+    pub const ALL: [AgentId; 24] = [
         AgentId::ClaudeCode,
         AgentId::Codex,
         AgentId::Grok,
@@ -59,6 +60,7 @@ impl AgentId {
         AgentId::CraftAgents,
         AgentId::Devin,
         AgentId::Kilo,
+        AgentId::MimoCode,
     ];
 
     pub fn as_str(&self) -> &'static str {
@@ -86,6 +88,7 @@ impl AgentId {
             AgentId::Devin => "devin",
             AgentId::Kilo => "kilo",
             AgentId::GrokBot => "grok-bot",
+            AgentId::MimoCode => "mimo-code",
         }
     }
 
@@ -114,6 +117,7 @@ impl AgentId {
             "devin" => Some(AgentId::Devin),
             "kilo" => Some(AgentId::Kilo),
             "grok-bot" => Some(AgentId::GrokBot),
+            "mimo-code" => Some(AgentId::MimoCode),
             _ => None,
         }
     }
@@ -143,6 +147,7 @@ impl AgentId {
             AgentId::Devin => "Devin",
             AgentId::Kilo => "Kilo Code",
             AgentId::GrokBot => "Grok Bot",
+            AgentId::MimoCode => "MiMo Code",
         }
     }
 
@@ -248,6 +253,15 @@ impl AgentId {
             // 官方 app 图标(黑底圆角方块里一张带两只眼睛的白脸),两模式通用,ZCode 同款。图标里只有
             // 256px 的位图,侧栏尺寸下够用
             AgentId::GrokBot => "brands/grok-bot.png",
+            // 官网 favicon 与 lobe-icons 的 xiaomimimo 是同一个单色字标(上 "Xiaomi"、下 "MIMO"),
+            // 同 Kilo / Devin 按模式取白版或深墨版
+            AgentId::MimoCode => {
+                if dark {
+                    "brands/mimo-code.png"
+                } else {
+                    "brands/mimo-code-light.png"
+                }
+            }
         }
     }
 }

@@ -61,6 +61,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 | Devin | `~/.local/share/devin/cli/sessions.db` | ✅ | — |
 | Kilo Code | `~/.local/share/kilo/kilo.db` + the legacy extension's `globalStorage/kilocode.kilo-code/tasks` | ✅ | ✅ |
 | Grok Bot | the desktop app's cache (`Grok Bot/sand-client-persistence`) | — | — |
+| MiMo Code | `~/.local/share/mimocode/mimocode.db` | ✅ | — |
 
 Agents' own environment variables (`CODEX_HOME`, `XDG_DATA_HOME`, …) are respected, and Settings → Session locations adds folders anywhere else.
 
@@ -71,6 +72,7 @@ Agents' own environment variables (`CODEX_HOME`, `XDG_DATA_HOME`, …) are respe
 - **Craft Agents** — on a Claude connection, Wake shows the Craft session and hides the duplicate Claude Code copy
 - **Kilo Code** — the new extension, CLI and JetBrains plugin share `kilo.db`; tasks from the legacy extension are listed too
 - **Grok Bot** — conversations live in Grok Bot's cloud; Wake reads the latest messages the desktop app keeps on this computer, a conversation it no longer keeps stays listed with its last message, and deleting one in Wake only hides it
+- **MiMo Code** — a session imported from Claude Code, Codex or OpenCode is listed once you continue it in MiMo Code, without the imported part
 
 Not supported: Windsurf and Trae (encrypted), Amp, Factory and Warp (cloud only).
 

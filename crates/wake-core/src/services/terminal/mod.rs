@@ -157,6 +157,8 @@ pub fn agent_bin(agent: AgentId) -> Option<&'static str> {
         AgentId::Kilo => Some("kilo"),
         // Grok Bot 是桌面 app,bot 跑在云端电脑上,没有命令行
         AgentId::GrokBot => None,
+        // 官方安装脚本装进 ~/.mimocode/bin 并写进 shell 的 PATH;npm 包同名
+        AgentId::MimoCode => Some("mimo"),
     }
 }
 
@@ -234,6 +236,8 @@ fn resume_args(meta: &SessionMeta) -> Option<(Vec<String>, bool)> {
         AgentId::Kilo => Some((vec!["--session".into(), id.into()], true)),
         // Grok Bot:对话在云端、只有桌面 app,没有能接着聊的命令——不画 Open In
         AgentId::GrokBot => None,
+        // MiMo Code(OpenCode 分支)与 OpenCode 同形制;会话按项目目录记,在原目录启动
+        AgentId::MimoCode => Some((vec!["--session".into(), id.into()], true)),
         // Kiro / Gemini CLI 没有按会话 id 续会话的形制
         AgentId::Kiro | AgentId::Gemini => None,
     }
@@ -714,6 +718,7 @@ mod tests {
             (AgentId::Codebuddy, vec!["--resume", id], true),
             (AgentId::Devin, vec!["--resume", id], true),
             (AgentId::Kilo, vec!["--session", id], true),
+            (AgentId::MimoCode, vec!["--session", id], true),
         ] {
             let meta = remote_meta(agent, id, "");
             let (args, cwd) = super::resume_args(&meta).unwrap();

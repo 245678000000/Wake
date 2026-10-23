@@ -15,6 +15,7 @@ pub mod hermes;
 pub mod kilo;
 pub mod kimi;
 pub mod kiro;
+pub mod mimo;
 pub mod openclaw;
 pub mod opencode;
 pub mod pi;
@@ -416,6 +417,7 @@ pub fn create_adapters() -> Vec<Box<dyn AgentAdapter>> {
         Box::new(opencode::OpencodeAdapter::kilo()),
         Box::new(kilo::KiloLegacyAdapter::new()),
         Box::new(grok_bot::GrokBotAdapter::new()),
+        Box::new(mimo::MimoAdapter::new()),
     ]
 }
 

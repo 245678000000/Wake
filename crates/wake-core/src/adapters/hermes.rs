@@ -137,10 +137,7 @@ impl HermesAdapter {
         row: &HermesRow,
         messages: &[TranscriptMessage],
     ) -> SessionMeta {
-        let title = Some(clean_title_candidate(&row.title))
-            .filter(|t| !t.is_empty())
-            .or_else(|| title_from_messages(messages))
-            .unwrap_or_else(|| UNTITLED.to_string());
+        let title = session_title(&row.title, false, messages);
         SessionMeta {
             key: format!("hermes:{}", row.id),
             host: String::new(),
