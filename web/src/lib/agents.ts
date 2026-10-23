@@ -34,6 +34,7 @@ export const AGENTS: Agent[] = [
   { id: 'craft-agents', name: 'Craft Agents', icon: 'craft-agents', color: '#9570BE', where: '~/.craft-agent/workspaces' },
   { id: 'devin', name: 'Devin', icon: 'devin', color: '#3BB3F1', where: '~/.local/share/devin' },
   { id: 'kilo', name: 'Kilo Code', icon: 'kilo', color: '#C8C035', where: '~/.local/share/kilo + globalStorage' },
+  { id: 'mimo-code', name: 'MiMo Code', icon: 'mimo-code', color: '#FF6900', where: '~/.local/share/mimocode' },
 ];
 
 export const AGENT_BY_ID = Object.fromEntries(AGENTS.map((a) => [a.id, a])) as Record<string, Agent>;
