@@ -485,7 +485,9 @@ fn edits_are_picked_up_and_the_scan_writes_nothing() {
             .into_iter()
             .map(|e| {
                 let e = e.unwrap();
-                let m = e.metadata().unwrap();
+                // 按路径现取:Windows 上目录项自带的元数据是父目录索引里缓存的那份,NTFS 延后更新,
+                // 两次快照之间目录的修改时间会自己变(CI 上偶发,像是扫描写了东西)
+                let m = std::fs::symlink_metadata(e.path()).unwrap();
                 (e.path().to_path_buf(), m.len(), m.modified().ok())
             })
             .collect();
