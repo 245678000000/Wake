@@ -153,6 +153,11 @@ impl AgentAdapter for RemoteAdapter {
         self.inner.session_paths(meta)
     }
 
+    fn homes(&self) -> Vec<std::path::PathBuf> {
+        // 镜像白名单不含 skill 目录,远程实例没有可看的 home
+        Vec::new()
+    }
+
     fn memory_sources(&self) -> Vec<MemorySource> {
         // inner 按缓存挂载点构造,它报的路径已经是缓存内的
         self.inner.memory_sources()

@@ -18,17 +18,18 @@ pub struct CopilotAdapter {
     rows_cache: Mutex<Option<(i64, Vec<CopilotRow>)>>,
     /// 指令文件(项目根下的)与自定义来源按指纹缓存,每轮扫描只 stat
     memories: super::MemoryCache,
+    /// `~/.copilot`;自定义根直接给了库文件的没有
+    home: Option<PathBuf>,
 }
 
 impl CopilotAdapter {
     pub fn new() -> Self {
+        let home = super::home_dir().unwrap_or_default().join(".copilot");
         Self {
-            db: super::home_dir()
-                .unwrap_or_default()
-                .join(".copilot")
-                .join("session-store.db"),
+            db: home.join("session-store.db"),
             rows_cache: Mutex::new(None),
             memories: super::MemoryCache::new(),
+            home: Some(home),
         }
     }
 
@@ -263,19 +264,24 @@ impl AgentAdapter for CopilotAdapter {
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 手输/预填的就是库文件路径时直接认,不再往下拼(Codex review)
-        let db = if dir.is_file() {
-            dir
+        let (db, home) = if dir.is_file() {
+            (dir, None)
         } else {
-            dir.join("session-store.db")
+            (dir.join("session-store.db"), Some(dir))
         };
         Box::new(Self {
             db,
             rows_cache: Mutex::new(None),
             memories: super::MemoryCache::new(),
+            home,
         })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.db.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

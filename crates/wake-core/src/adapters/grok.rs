@@ -20,6 +20,10 @@ pub struct GrokAdapter {
     root: PathBuf,
     grok_home: PathBuf,
     group: Mutex<Option<Arc<GroupCtx>>>,
+    /// 确认过的 home(`homes()`):默认实例与选中 home 形态(里面有 sessions/)的自定义根才有。
+    /// 与 `grok_home` 不同——直接选了名叫 sessions 的目录时,读边车会按名字去父目录找,
+    /// 但那不是用户选的范围,skill 不往那里看(Codex review 2026-10-15)
+    home: Option<PathBuf>,
 }
 
 impl GrokAdapter {
@@ -27,26 +31,28 @@ impl GrokAdapter {
         let grok_home = super::home_dir().unwrap_or_default().join(".grok");
         Self {
             root: grok_home.join("sessions"),
+            home: Some(grok_home.clone()),
             grok_home,
             group: Mutex::new(None),
         }
     }
 
     fn from_custom_dir(dir: PathBuf) -> Self {
-        let (root, grok_home) = if dir.join("sessions").is_dir() {
-            (dir.join("sessions"), dir)
+        let (root, grok_home, home) = if dir.join("sessions").is_dir() {
+            (dir.join("sessions"), dir.clone(), Some(dir))
         } else if dir.file_name().is_some_and(|name| name == "sessions") {
-            let home = dir.parent().unwrap_or(&dir).to_path_buf();
-            (dir, home)
+            let parent = dir.parent().unwrap_or(&dir).to_path_buf();
+            (dir, parent, None)
         } else {
             // 保留旧行为：自定义目录也可以直接就是 sessions root。
             // 此时没有结构证据允许越过用户选择的边界去父目录读 sidecar。
-            (dir.clone(), dir)
+            (dir.clone(), dir, None)
         };
         Self {
             root,
             grok_home,
             group: Mutex::new(None),
+            home,
         }
     }
 
@@ -537,5 +543,9 @@ impl AgentAdapter for GrokAdapter {
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

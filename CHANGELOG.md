@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: A Skills page lists the skills your agents have installed, which agents share each one, and where copies of the same skill have drifted apart (#62, thanks @ICEY4040727)
+
 ## [0.9.6] — 2026-10-22
 
 - Fix: Claude Code sessions take the title Claude Code gave them instead of their first message (#74, thanks @hoixding)

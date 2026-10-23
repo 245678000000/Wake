@@ -572,10 +572,15 @@ mod tests {
     #[test]
     fn bare_pixel_sizes_do_not_creep_back() {
         const FILES: &[(&str, &str, usize)] = &[
-            ("workbench.rs", include_str!("workbench.rs"), 17),
+            ("workbench.rs", include_str!("workbench.rs"), 18),
             (
                 "workbench/memory.rs",
                 include_str!("workbench/memory.rs"),
+                0,
+            ),
+            (
+                "workbench/skills.rs",
+                include_str!("workbench/skills.rs"),
                 1,
             ),
             (

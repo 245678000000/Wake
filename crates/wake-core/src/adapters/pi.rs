@@ -16,29 +16,29 @@ use std::path::{Path, PathBuf};
 pub struct PiAdapter {
     agent: AgentId,
     root: PathBuf,
+    /// `~/.pi/agent`(`~/.omp/agent`);直接选中 sessions 目录的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl PiAdapter {
     pub fn new() -> Self {
-        Self {
-            agent: AgentId::Pi,
-            root: super::home_dir()
-                .unwrap_or_default()
-                .join(".pi")
-                .join("agent")
-                .join("sessions"),
-        }
+        Self::at_home(AgentId::Pi, ".pi")
     }
 
     /// Oh My Pi 变体:`~/.omp/agent/sessions`,解析核心完全共用
     pub fn omp() -> Self {
+        Self::at_home(AgentId::Omp, ".omp")
+    }
+
+    fn at_home(agent: AgentId, dir_name: &str) -> Self {
+        let home = super::home_dir()
+            .unwrap_or_default()
+            .join(dir_name)
+            .join("agent");
         Self {
-            agent: AgentId::Omp,
-            root: super::home_dir()
-                .unwrap_or_default()
-                .join(".omp")
-                .join("agent")
-                .join("sessions"),
+            agent,
+            root: home.join("sessions"),
+            home: Some(home),
         }
     }
 }
@@ -203,14 +203,26 @@ impl AgentAdapter for PiAdapter {
         // pi 与 omp 布局全同:实例保持自己的 agent,探测时两家都会命中同一目录,
         // 取舍交 UI(用户知道自己装的是哪个 CLI)
         let nested = dir.join("agent").join("sessions");
-        let root = if nested.is_dir() { nested } else { dir };
+        let (root, home) = if nested.is_dir() {
+            (nested, Some(dir.join("agent")))
+        } else {
+            // 直接选了 agent 那一层(`~/.pi/agent`,里面有 sessions/):它自己就是 home,会话照旧
+            // 从选中的目录往下找(Codex review 2026-10-23)
+            let home = dir.join("sessions").is_dir().then(|| dir.clone());
+            (dir, home)
+        };
         Box::new(Self {
             agent: self.agent,
             root,
+            home,
         })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

@@ -14,17 +14,17 @@ pub struct KiroAdapter {
     root: PathBuf,
     /// 指令文件(项目根下的)与自定义来源按指纹缓存,每轮扫描只 stat
     memories: super::MemoryCache,
+    /// `~/.kiro`;选中 sessions 或 sessions/cli 的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl KiroAdapter {
     pub fn new() -> Self {
+        let home = super::home_dir().unwrap_or_default().join(".kiro");
         Self {
-            root: super::home_dir()
-                .unwrap_or_default()
-                .join(".kiro")
-                .join("sessions")
-                .join("cli"),
+            root: home.join("sessions").join("cli"),
             memories: super::MemoryCache::new(),
+            home: Some(home),
         }
     }
 }
@@ -194,20 +194,25 @@ impl AgentAdapter for KiroAdapter {
 
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // `~/.kiro`/`~/.kiro/sessions`/`~/.kiro/sessions/cli` 三层都认
-        let root = if dir.join("sessions").join("cli").is_dir() {
-            dir.join("sessions").join("cli")
+        let (root, home) = if dir.join("sessions").join("cli").is_dir() {
+            (dir.join("sessions").join("cli"), Some(dir))
         } else if dir.join("cli").is_dir() {
-            dir.join("cli")
+            (dir.join("cli"), None)
         } else {
-            dir
+            (dir, None)
         };
         Box::new(Self {
             root,
             memories: super::MemoryCache::new(),
+            home,
         })
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

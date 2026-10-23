@@ -38,16 +38,17 @@ pub struct CraftAdapter {
     root: PathBuf,
     heads: HeadCache,
     workspaces: WorkspaceIds,
+    /// `~/.craft-agent`;直接选中工作区集合或单个工作区的自定义根没有
+    home: Option<PathBuf>,
 }
 
 impl CraftAdapter {
     pub fn new() -> Self {
-        Self::at(
-            super::home_dir()
-                .unwrap_or_default()
-                .join(".craft-agent")
-                .join("workspaces"),
-        )
+        let home = super::home_dir().unwrap_or_default().join(".craft-agent");
+        Self {
+            home: Some(home.clone()),
+            ..Self::at(home.join("workspaces"))
+        }
     }
 
     fn at(root: PathBuf) -> Self {
@@ -55,6 +56,7 @@ impl CraftAdapter {
             root,
             heads: HeadCache::default(),
             workspaces: WorkspaceIds::default(),
+            home: None,
         }
     }
 
@@ -696,15 +698,20 @@ impl AgentAdapter for CraftAdapter {
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 选中的是 `.craft-agent` 本身就下到它的 workspaces/;工作区集合与单个工作区
         // 两种形态 session_files 都认
-        let root = if dir.join("workspaces").is_dir() {
-            dir.join("workspaces")
-        } else {
-            dir
-        };
-        Box::new(Self::at(root))
+        if dir.join("workspaces").is_dir() {
+            return Box::new(Self {
+                home: Some(dir.clone()),
+                ..Self::at(dir.join("workspaces"))
+            });
+        }
+        Box::new(Self::at(dir))
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         vec![self.root.clone()]
+    }
+
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
     }
 }

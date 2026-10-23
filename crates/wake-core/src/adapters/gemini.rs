@@ -302,6 +302,10 @@ impl AgentAdapter for GeminiAdapter {
         vec![self.root.clone()]
     }
 
+    fn homes(&self) -> Vec<PathBuf> {
+        self.home.iter().cloned().collect()
+    }
+
     fn memory_sources(&self) -> Vec<MemorySource> {
         // Gemini 没有 agent 自己记的记忆目录;`save_memory` 工具追加的 "Gemini Added
         // Memories" 段就在全局 GEMINI.md 里,整个文件按用户写的指令列。项目根下的

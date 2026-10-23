@@ -166,6 +166,13 @@ pub trait AgentAdapter: Send + Sync {
     fn memory_sources(&self) -> Vec<MemorySource> {
         Vec::new()
     }
+    /// 本实例确认过的 home(装着这家配置与会话的目录:`~/.claude`、`$CODEX_HOME`……)。
+    /// 只在构造时有结构证据才给——默认实例,或自定义根选的是 home 形态(里面有这家的数据
+    /// 子目录);直接选了数据目录本身的给空,不越界摸父目录(不变量 8⑨)。Hermes 每个档案
+    /// 一个。Skills 总览按它找各家的 skill 文件夹(`skills::scan`)。默认空;远程实例给空
+    fn homes(&self) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
     /// 一轮扫描开始前刷新 adapter 的跨会话快照。默认 adapter 没有这类状态。
     fn begin_scan(&self) {}
     /// 此 adapter 是否负责维护会话父子关系。单独的能力位用于区分“当前没有
@@ -1251,9 +1258,22 @@ pub fn memory_body(doc: &MemoryDoc) -> String {
 }
 
 /// YAML frontmatter(文件开头 `---` 围起的几行)里一个顶层 `key: 值`。不做完整
-/// YAML:只认顶格的 `key:`,值去首尾引号;块标量(`key: >` / `|`,值在下面缩进的几行)
-/// 把那几行折成一行——否则标题就是一个字面的 ">"。没有 frontmatter 或没这个键给 None
+/// YAML:只认顶格的 `key:`;引号值取到配对的引号;块标量(`key: >` / `|`,值在下面缩进的
+/// 几行)把那几行折成一行——否则标题就是一个字面的 ">"。普通值**原样**:`description` 一类
+/// 自由文本里的 ` #`(`(PR #17)`)是正文,记忆标题就从它来;要按名字归组的用
+/// `frontmatter_ident`。没有 frontmatter 或没这个键给 None
 pub(crate) fn frontmatter_field(body: &str, key: &str) -> Option<String> {
+    frontmatter_value(body, key, false)
+}
+
+/// `frontmatter_field` 的标识符版(skill 的 `name`):普通值在行尾注释(` #`)处截断——
+/// `name: review # 备注` 是 review,带上注释 Skills 就把它和别处的 review 分成两组(Codex
+/// review 2026-10-15);只截标识符,自由文本截了会把记忆标题砍成 "…(PR"(/simplify 同月)
+pub(crate) fn frontmatter_ident(body: &str, key: &str) -> Option<String> {
+    frontmatter_value(body, key, true)
+}
+
+fn frontmatter_value(body: &str, key: &str, comments: bool) -> Option<String> {
     let mut lines = body.lines();
     if lines.next()?.trim() != "---" {
         return None;
@@ -1270,7 +1290,14 @@ pub(crate) fn frontmatter_field(body: &str, key: &str) -> Option<String> {
             continue;
         };
         let value = value.trim();
-        let value = if matches!(value, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
+        // 标识符:`key: # 注释` 是空值
+        let value = if comments && value.starts_with('#') {
+            ""
+        } else {
+            value
+        };
+        let indicator = value.split(" #").next().unwrap_or_default().trim();
+        let value = if matches!(indicator, ">" | "|" | ">-" | "|-" | ">+" | "|+") {
             let mut folded = Vec::new();
             while let Some(next) = lines.peek() {
                 if !next.starts_with([' ', '\t']) || next.trim() == "---" {
@@ -1281,11 +1308,67 @@ pub(crate) fn frontmatter_field(body: &str, key: &str) -> Option<String> {
             }
             folded.join(" ")
         } else {
-            value.trim_matches('"').trim_matches('\'').to_string()
+            yaml_scalar(value, comments)
         };
         return (!value.is_empty()).then_some(value);
     }
     None
+}
+
+/// 一行里的 YAML 标量:双引号取到下一个未转义的 `"`(`\x` 取 x),单引号取到配对的 `'`(`''` 是
+/// 转义的单引号);普通值 `comments` 时在行尾注释(` #`)处截断,否则原样
+fn yaml_scalar(value: &str, comments: bool) -> String {
+    let mut out = String::new();
+    if let Some(rest) = value.strip_prefix('"') {
+        let mut chars = rest.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '"' => break,
+                '\\' => out.extend(chars.next()),
+                c => out.push(c),
+            }
+        }
+        return out;
+    }
+    if let Some(rest) = value.strip_prefix('\'') {
+        let mut chars = rest.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\'' {
+                out.push(c);
+            } else if chars.next_if_eq(&'\'').is_some() {
+                out.push('\'');
+            } else {
+                break;
+            }
+        }
+        return out;
+    }
+    if !comments {
+        return value.to_string();
+    }
+    value
+        .split(" #")
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .to_string()
+}
+
+/// 去掉开头的 YAML frontmatter,给阅读面渲染正文(Skills 页);认法与 `frontmatter_field`
+/// 同一套——首行、收尾行都按 trim 后等于 `---` 算。没有或没收尾就原样
+pub fn strip_frontmatter(body: &str) -> &str {
+    let mut lines = body.split_inclusive('\n');
+    let Some(first) = lines.next().filter(|l| l.trim() == "---") else {
+        return body;
+    };
+    let mut offset = first.len();
+    for line in lines {
+        offset += line.len();
+        if line.trim() == "---" {
+            return body[offset..].trim_start_matches(['\r', '\n']);
+        }
+    }
+    body
 }
 
 /// 手输路径的 `~` 前缀展开(仅前缀;边界落在分隔符上,Windows 用户手输
@@ -1368,6 +1451,46 @@ fn names_binary(preview: &str, bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frontmatter_values_follow_yaml_quoting_and_comments() {
+        let fm = |line: &str| frontmatter_ident(&format!("---\n{line}\n---\nbody"), "name");
+        assert_eq!(fm("name: review # 本地备注").as_deref(), Some("review"));
+        assert_eq!(fm("name: a#b").as_deref(), Some("a#b"));
+        assert_eq!(
+            fm(r#"name: "x # not a comment" # but this is"#).as_deref(),
+            Some("x # not a comment")
+        );
+        assert_eq!(fm(r#"name: "say \"hi\"""#).as_deref(), Some(r#"say "hi""#));
+        assert_eq!(fm("name: 'it''s' # c").as_deref(), Some("it's"));
+        assert_eq!(fm("name: # nothing"), None);
+        let folded = "---\nname: > # folded\n  one\n  two\n---\n";
+        assert_eq!(
+            frontmatter_field(folded, "name").as_deref(),
+            Some("one two")
+        );
+        // 自由文本不截:记忆标题从 description 来,`(PR #17)` 是正文
+        let free = "---\ndescription: removed moment.js (PR #17, see notes)\n---\n";
+        assert_eq!(
+            frontmatter_field(free, "description").as_deref(),
+            Some("removed moment.js (PR #17, see notes)")
+        );
+    }
+
+    #[test]
+    fn frontmatter_is_stripped_for_the_reader() {
+        let text = "---\nname: x\ndescription: >\n  folded\n---\n\n# Title\nbody\n";
+        assert_eq!(strip_frontmatter(text), "# Title\nbody\n");
+        assert_eq!(
+            strip_frontmatter("# No frontmatter\n"),
+            "# No frontmatter\n"
+        );
+        // 没收尾的不算 frontmatter,原样
+        assert_eq!(strip_frontmatter("---\nname: x\n"), "---\nname: x\n");
+        assert_eq!(strip_frontmatter("---\r\nname: x\r\n---\r\nbody"), "body");
+        // 分隔行带尾随空格:与 frontmatter_field 同一个认法(trim 后是 ---)
+        assert_eq!(strip_frontmatter("--- \nname: x\n---  \nbody"), "body");
+    }
 
     fn tc(name: &str, preview: &str, input: Option<&str>) -> ToolCallView {
         ToolCallView {

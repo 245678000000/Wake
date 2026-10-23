@@ -22,6 +22,9 @@ use std::sync::OnceLock;
 /// 无每会话文件,SessionFileRef 用虚拟路径 `<db>#<id>`;多库结构与 opencode 同款。
 pub struct HermesAdapter {
     dbs: Vec<HermesDb>,
+    /// 库是从一个目录(Hermes home 或档案目录)找出来的:各库所在目录就是确认过的 home。
+    /// 自定义根直接给了一份 state.db 文件的没有 home,不往它旁边看(Codex review 2026-10-15)
+    from_dir: bool,
 }
 
 struct HermesDb {
@@ -106,12 +109,13 @@ impl HermesAdapter {
         let root = super::env_dir("HERMES_HOME")
             .filter(|d| d.join("state.db").is_file())
             .unwrap_or_else(|| home.join(".hermes"));
-        Self::with_paths(dbs_under(&root))
+        Self::with_paths(dbs_under(&root), true)
     }
 
-    fn with_paths(paths: Vec<PathBuf>) -> Self {
+    fn with_paths(paths: Vec<PathBuf>, from_dir: bool) -> Self {
         Self {
             dbs: paths.into_iter().map(HermesDb::new).collect(),
+            from_dir,
         }
     }
 
@@ -517,16 +521,25 @@ impl AgentAdapter for HermesAdapter {
     fn with_custom_root(&self, dir: PathBuf) -> Box<dyn AgentAdapter> {
         // 选中库文件本身、Hermes home(连同其 profiles/*)或单个档案目录都认;
         // 整形判据只看 dir 内结构,目录不存在时也落到 <dir>/state.db(远程挂载点契约)
-        let paths = if dir.is_file() {
-            vec![dir]
-        } else {
-            dbs_under(&dir)
-        };
-        Box::new(Self::with_paths(paths))
+        if dir.is_file() {
+            return Box::new(Self::with_paths(vec![dir], false));
+        }
+        Box::new(Self::with_paths(dbs_under(&dir), true))
     }
 
     fn data_roots(&self) -> Vec<PathBuf> {
         self.dbs.iter().map(|db| db.path.clone()).collect()
+    }
+
+    /// 每个档案(HERMES_HOME 与 profiles/<名字>)各一个:state.db 所在的目录
+    fn homes(&self) -> Vec<PathBuf> {
+        if !self.from_dir {
+            return Vec::new();
+        }
+        self.dbs
+            .iter()
+            .filter_map(|db| db.path.parent().map(Path::to_path_buf))
+            .collect()
     }
 
     fn supports_individual_root_removal(&self) -> bool {
@@ -540,6 +553,6 @@ impl AgentAdapter for HermesAdapter {
             .filter(|db| !roots.contains(&db.path))
             .map(|db| db.path.clone())
             .collect();
-        Some(Box::new(Self::with_paths(kept)))
+        Some(Box::new(Self::with_paths(kept, self.from_dir)))
     }
 }
