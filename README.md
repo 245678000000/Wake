@@ -20,7 +20,7 @@ Your agent history is scattered across `~/.claude`, `~/.codex` and many other fo
 
 - **Pick up where any agent left off** — every new Claude Code or Codex session starts knowing where your agents left off in the project, and can read any earlier session. [Install the plugin](#claude-code-and-codex-plugins)
 - **One place for every session** — grouped by agent and project, sub-agents under their parent, updated live as your agents write
-- **Full-text search** (⌘K / Ctrl+K) — every title and transcript, CJK and code (`useEffect(`) included; jumps straight to the match
+- **Full-text search** (⌘K / Ctrl+K) — every title and transcript, CJK and code (`useEffect(`) included; jumps straight to the match. Memory files and skills are one Tab away
 - **Transcript view** — chat bubbles, inline images, collapsible tool calls, thinking, syntax highlighting
 - **One-click resume** — back in your terminal (Terminal, iTerm, Warp, Ghostty, Kooky…) or in Claude / Codex Desktop, in the right project folder
 - **Manage** — star, pin, export to Markdown, hand a session to another agent, delete to the Trash

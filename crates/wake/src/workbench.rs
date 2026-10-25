@@ -56,6 +56,7 @@ use wake_core::models::Role as MessageRole;
 use wake_core::models::*;
 use wake_core::scanner::{run_scan, ScanEvents, ScanProgress};
 use wake_core::services::{exporter, terminal};
+use wake_core::skills::{SkillHit, SkillScan};
 use wake_core::watcher::{start_watcher, SessionWatcher};
 
 use crate::format::{
@@ -76,7 +77,9 @@ actions!(
         OpenUpdates,
         OpenAbout,
         PaletteUp,
-        PaletteDown
+        PaletteDown,
+        PaletteNextTab,
+        PalettePrevTab
     ]
 );
 
@@ -877,11 +880,7 @@ impl ListDelegate for SessionsDelegate {
                                 .gap(ICON_TEXT_GAP)
                                 .text_size(FONT_LABEL)
                                 .text_color(theme.muted_foreground)
-                                .child(
-                                    img(s.agent.brand_icon(theme.mode.is_dark()))
-                                        .size(zpx(15.))
-                                        .flex_shrink_0(),
-                                )
+                                .child(brand_img(s.agent, zpx(15.), theme.mode.is_dark()))
                                 .child(badge(
                                     s.project_name.clone(),
                                     theme.muted,
@@ -1424,21 +1423,329 @@ mod session_group_tests {
 
 // ---------------- 搜索面板 delegate ----------------
 
+/// ⌘K 面板的三栏:一个面板搜会话、记忆与 skill,在面板里按类分(用户 2026-10-24 定,不在
+/// 每页各放一个搜索框)。每次输入三栏同时搜,栏头带命中数;打开时停在当前页对应的那一栏
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchTab {
+    Sessions,
+    Memory,
+    Skills,
+}
+
+impl SearchTab {
+    /// 按声明序排,下标就是 `as usize`
+    const ALL: [SearchTab; 3] = [SearchTab::Sessions, SearchTab::Memory, SearchTab::Skills];
+
+    /// 当前页对应的那一栏:打开面板时停在这里,侧栏搜索框也照它点名(Insights 的数字都是会话派生的)
+    fn for_page(page: Page) -> Self {
+        match page {
+            Page::Memory => SearchTab::Memory,
+            Page::Skills => SearchTab::Skills,
+            Page::Sessions | Page::Insights => SearchTab::Sessions,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SearchTab::Sessions => t("Sessions"),
+            SearchTab::Memory => t("Memory"),
+            SearchTab::Skills => t("Skills"),
+        }
+    }
+
+    /// 侧栏搜索框的文案
+    fn prompt(self) -> &'static str {
+        match self {
+            SearchTab::Sessions => t("Search sessions"),
+            SearchTab::Memory => t("Search memory"),
+            SearchTab::Skills => t("Search skills"),
+        }
+    }
+
+    /// 页脚左侧的范围说明:三栏都搜全部,不受侧栏筛选影响
+    fn scope(self) -> &'static str {
+        match self {
+            SearchTab::Sessions => t("Scope: all sessions"),
+            SearchTab::Memory => t("Scope: all memory files"),
+            SearchTab::Skills => t("Scope: all skills"),
+        }
+    }
+
+    /// Tab / Shift-Tab:后一栏 / 前一栏,两头循环
+    fn step(self, forward: bool) -> Self {
+        let n = Self::ALL.len();
+        Self::ALL[(self as usize + if forward { 1 } else { n - 1 }) % n]
+    }
+}
+
+/// 会话栏(消息级命中)与记忆栏各取多少条;取满了栏头写成 "60+"
+const PALETTE_SESSION_LIMIT: i64 = 60;
+const PALETTE_MEMORY_LIMIT: i64 = 30;
+
+/// skill 栏的命中,连同它们按下标指着的那一份扫描:命中在后台对某一份扫描算,算完之前
+/// Workbench 可能已经换了新的,拿旧下标去读新扫描会对不上
+#[derive(Default)]
+struct SkillResults {
+    scan: Arc<SkillScan>,
+    hits: Vec<SkillHit>,
+}
+
+impl SkillResults {
+    fn search(scan: Arc<SkillScan>, q: &str) -> Self {
+        Self {
+            hits: scan.search(q),
+            scan,
+        }
+    }
+}
+
+/// 打开一条命中要去哪
+enum PaletteTarget {
+    Session {
+        key: String,
+        seq: i64,
+    },
+    Memory(String),
+    /// skill 按名字找回(重扫后下标会变),`dir` 是命中的那一处安装
+    Skill {
+        name: String,
+        dir: PathBuf,
+    },
+}
+
 pub struct SearchDelegate {
-    pub hits: Vec<SearchHit>,
-    pub degraded: bool,
-    /// 查询本身失败(库读不出、FTS 表达式报错)。与"没有结果"分开显示,
-    /// 否则用户会以为真的没讨论过
-    error: Option<String>,
+    tab: SearchTab,
+    /// 后台搜回来的原样存:命中(会话的另带 degraded:一个能走索引的词都没有),或查询本身失败的
+    /// 错误(库读不出、FTS 表达式报错)——与"没有结果"分开显示,否则用户会以为真的没讨论过
+    sessions: Result<(Vec<SearchHit>, bool), String>,
+    memory: Result<Vec<MemoryHit>, String>,
+    /// skill 不进索引库:每次查询对 Workbench 最近一次扫到的那份(与 Skills 页同一份)现搜,与
+    /// 会话、记忆一起在后台(多半几十微秒,一个字母的查询半毫秒);新的扫描经 `set_skill_scan`
+    /// 换进来
+    skills: SkillResults,
     store: Arc<Store>,
     last_query: String,
+}
+
+impl SearchDelegate {
+    fn new(store: Arc<Store>) -> Self {
+        Self {
+            tab: SearchTab::Sessions,
+            sessions: Ok(Default::default()),
+            memory: Ok(Vec::new()),
+            skills: SkillResults::default(),
+            store,
+            last_query: String::new(),
+        }
+    }
+
+    fn session_hits(&self) -> &[SearchHit] {
+        match &self.sessions {
+            Ok((hits, _)) => hits,
+            Err(_) => &[],
+        }
+    }
+
+    fn memory_hits(&self) -> &[MemoryHit] {
+        self.memory.as_deref().unwrap_or_default()
+    }
+
+    fn count(&self, tab: SearchTab) -> usize {
+        match tab {
+            SearchTab::Sessions => self.session_hits().len(),
+            SearchTab::Memory => self.memory_hits().len(),
+            SearchTab::Skills => self.skills.hits.len(),
+        }
+    }
+
+    /// 栏头的命中数:取满上限的写成 "60+"(后面可能还有)
+    fn count_label(&self, tab: SearchTab) -> String {
+        let n = self.count(tab);
+        let limit = match tab {
+            SearchTab::Sessions => Some(PALETTE_SESSION_LIMIT),
+            SearchTab::Memory => Some(PALETTE_MEMORY_LIMIT),
+            SearchTab::Skills => None,
+        };
+        if limit.is_some_and(|limit| n as i64 >= limit) {
+            format!("{n}+")
+        } else {
+            n.to_string()
+        }
+    }
+
+    /// 查询清空(点清除钮 / 删光):结果已知,不必走一趟后台
+    fn clear(&mut self) {
+        self.sessions = Ok(Default::default());
+        self.memory = Ok(Vec::new());
+        self.skills.hits.clear();
+        self.last_query.clear();
+    }
+
+    /// 换了一份 skill 扫描(⌘K 补的第一次扫描、Skills 页的重扫):按新的那份重搜当前的查询
+    fn set_skill_scan(&mut self, scan: Arc<SkillScan>) {
+        self.skills = SkillResults::search(scan, &self.last_query);
+    }
+
+    fn target(&self, row: usize) -> Option<PaletteTarget> {
+        match self.tab {
+            SearchTab::Sessions => self
+                .session_hits()
+                .get(row)
+                .map(|h| PaletteTarget::Session {
+                    key: h.session.key.clone(),
+                    seq: h.seq,
+                }),
+            SearchTab::Memory => self
+                .memory_hits()
+                .get(row)
+                .map(|h| PaletteTarget::Memory(h.doc.key.clone())),
+            SearchTab::Skills => {
+                let hit = self.skills.hits.get(row)?;
+                let skill = self.skills.scan.skills.get(hit.skill)?;
+                Some(PaletteTarget::Skill {
+                    name: skill.name.clone(),
+                    dir: skill.installs.get(hit.install)?.path.clone(),
+                })
+            }
+        }
+    }
+
+    /// 这一栏第 `row` 条命中画成一行
+    fn row(&self, row: usize, dark: bool) -> Option<PaletteRow> {
+        Some(match self.tab {
+            SearchTab::Sessions => {
+                let h = self.session_hits().get(row)?;
+                PaletteRow {
+                    lead: brand_img(h.session.agent, zpx(15.), dark).into_any_element(),
+                    title: h.session.title.clone().into(),
+                    host: h.session.host.clone(),
+                    place: h.session.project_name.clone(),
+                    time: h.timestamp.unwrap_or(0),
+                    snippet: h.snippet.clone(),
+                }
+            }
+            SearchTab::Memory => {
+                let h = self.memory_hits().get(row)?;
+                PaletteRow {
+                    lead: brand_img(h.doc.agent, zpx(15.), dark).into_any_element(),
+                    title: h.doc.title.clone().into(),
+                    host: h.doc.host.clone(),
+                    place: memory::memory_group_label(&h.doc).to_string(),
+                    time: h.doc.updated_at,
+                    snippet: h.snippet.clone(),
+                }
+            }
+            SearchTab::Skills => {
+                let h = self.skills.hits.get(row)?;
+                let skill = self.skills.scan.skills.get(h.skill)?;
+                let install = skill.installs.get(h.install)?;
+                // 命中的那一处归谁,另有几方装着它写 +N
+                let others = skill.owners.len().saturating_sub(1);
+                let owner = skills::owner_label(install.owner);
+                PaletteRow {
+                    lead: skills::owner_icon(install.owner, zpx(15.), dark),
+                    title: skill.name.clone().into(),
+                    host: String::new(),
+                    place: if others > 0 {
+                        format!("{owner} +{others}")
+                    } else {
+                        owner.to_string()
+                    },
+                    time: install.updated_at,
+                    // 没有说明的 skill,第二行写它装在哪,比空着一行有用
+                    snippet: if h.snippet.is_empty() {
+                        tilde_path(&install.path.to_string_lossy())
+                    } else {
+                        h.snippet.clone()
+                    },
+                }
+            }
+        })
+    }
+}
+
+/// agent 的品牌图(原色 PNG),不随行收缩
+fn brand_img(agent: AgentId, size: impl Into<Pixels>, dark: bool) -> Img {
+    img(agent.brand_icon(dark))
+        .size(size.into())
+        .flex_shrink_0()
+}
+
+/// ⌘K 面板的一行,三栏同一个形制:品牌图 + 标题,右端 @host 与"归属 · 时间"(悬停看完整
+/// 日期);第二行是带高亮的片段
+struct PaletteRow {
+    lead: AnyElement,
+    title: SharedString,
+    host: String,
+    /// 会话与记忆是项目,skill 是装在哪
+    place: String,
+    time: i64,
+    snippet: String,
+}
+
+impl PaletteRow {
+    fn render(self, ix: usize, theme: &gpui_component::Theme) -> ListItem {
+        let time: SharedString = smart_time(self.time).into();
+        let time_tooltip: SharedString = abs_date(self.time).into();
+        let snippet = self
+            .snippet
+            .replace(HL_OPEN, "「")
+            .replace(HL_CLOSE, "」")
+            .replace('\n', " ");
+        // ListItem 无默认 margin,行块与内容区同宽(胶囊边对齐 Scope 行/
+        // 输入行);块内文字缩进保持组件默认(px_3)+ 内容 px_2
+        ListItem::new(ix).rounded(theme.radius).child(
+            v_flex()
+                .w_full()
+                .px(SPACE_SM)
+                .py(SPACE_SM)
+                .gap(zpx(6.))
+                .child(
+                    h_flex()
+                        .gap(ICON_TEXT_GAP)
+                        .text_size(FONT_CAPTION)
+                        .child(self.lead)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .font_medium()
+                                .text_color(theme.foreground)
+                                .truncate()
+                                .child(self.title),
+                        )
+                        .child(div().flex_1())
+                        .when(!self.host.is_empty(), |this| {
+                            this.child(host_badge(&self.host, theme))
+                        })
+                        .child(
+                            div()
+                                .id(("search-hit-time", ix))
+                                .flex_shrink_0()
+                                .text_size(FONT_CAPTION)
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} · {}", self.place, time))
+                                .tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(time_tooltip.clone())
+                                        .build(window, cx)
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(FONT_CAPTION)
+                        .text_color(theme.muted_foreground)
+                        .truncate()
+                        .child(snippet),
+                ),
+        )
+    }
 }
 
 impl ListDelegate for SearchDelegate {
     type Item = ListItem;
 
     fn items_count(&self, _section: usize, _cx: &App) -> usize {
-        self.hits.len()
+        self.count(self.tab)
     }
 
     fn render_item(
@@ -1447,69 +1754,10 @@ impl ListDelegate for SearchDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<Self::Item> {
-        let h = self.hits.get(ix.row)?;
         let theme = cx.theme();
-        let timestamp = h.timestamp.unwrap_or(0);
-        let hit_time: SharedString = smart_time(timestamp).into();
-        let hit_time_tooltip: SharedString = abs_date(timestamp).into();
-        let snippet = h
-            .snippet
-            .replace(HL_OPEN, "「")
-            .replace(HL_CLOSE, "」")
-            .replace('\n', " ");
         Some(
-            // ListItem 无默认 margin,行块与内容区同宽(胶囊边对齐 Scope 行/
-            // 输入行);块内文字缩进保持组件默认(px_3)+ 内容 px_2
-            ListItem::new(ix.row).rounded(theme.radius).child(
-                v_flex()
-                    .w_full()
-                    .px(SPACE_SM)
-                    .py(SPACE_SM)
-                    .gap(zpx(6.))
-                    .child(
-                        h_flex()
-                            .gap(ICON_TEXT_GAP)
-                            .text_size(FONT_CAPTION)
-                            .child(
-                                img(h.session.agent.brand_icon(theme.mode.is_dark()))
-                                    .size(zpx(15.))
-                                    .flex_shrink_0(),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .font_medium()
-                                    .text_color(theme.foreground)
-                                    .truncate()
-                                    .child(h.session.title.clone()),
-                            )
-                            .child(div().flex_1())
-                            .when(!h.session.host.is_empty(), |this| {
-                                this.child(host_badge(&h.session.host, &theme))
-                            })
-                            .child(
-                                div()
-                                    .id(("search-hit-time", ix.row))
-                                    .flex_shrink_0()
-                                    .text_size(FONT_CAPTION)
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{} · {}", h.session.project_name, hit_time))
-                                    .tooltip(move |window, cx| {
-                                        gpui_component::tooltip::Tooltip::new(
-                                            hit_time_tooltip.clone(),
-                                        )
-                                        .build(window, cx)
-                                    }),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_size(FONT_CAPTION)
-                            .text_color(theme.muted_foreground)
-                            .truncate()
-                            .child(snippet),
-                    ),
-            ),
+            self.row(ix.row, theme.mode.is_dark())?
+                .render(ix.row, theme),
         )
     }
 
@@ -1521,6 +1769,7 @@ impl ListDelegate for SearchDelegate {
     ) {
     }
 
+    /// 三栏一起在后台搜,一起回填(栏头的数一起变)
     fn perform_search(
         &mut self,
         query: &str,
@@ -1530,21 +1779,34 @@ impl ListDelegate for SearchDelegate {
         let q = query.to_string();
         self.last_query = q.clone();
         let store = self.store.clone();
+        let skill_scan = self.skills.scan.clone();
         let bg = cx.background_spawn(async move {
-            if q.trim().is_empty() {
-                Ok((Vec::new(), false))
-            } else {
-                store
-                    .search(&q, &[], None, 60)
-                    .map_err(|e| format!("{e:#}"))
-            }
+            let error = |e: anyhow::Error| format!("{e:#}");
+            let sessions = store
+                .search(&q, &[], None, PALETTE_SESSION_LIMIT)
+                .map_err(error);
+            let memory = store
+                .search_memories(
+                    &q,
+                    &MemoryFilter {
+                        limit: PALETTE_MEMORY_LIMIT,
+                        ..Default::default()
+                    },
+                )
+                .map_err(error);
+            (sessions, memory, SkillResults::search(skill_scan, &q))
         });
         cx.spawn_in(window, async move |this, cx| {
-            let result = bg.await;
+            let (sessions, memory, skills) = bg.await;
             this.update(cx, |state, cx| {
                 let d = state.delegate_mut();
-                d.error = result.as_ref().err().cloned();
-                (d.hits, d.degraded) = result.unwrap_or_default();
+                d.sessions = sessions;
+                d.memory = memory;
+                // 搜的时候 skill 扫描换了代(⌘K 补的第一次扫描正好扫完):这份是按旧的算的,
+                // set_skill_scan 已按新的重搜过,别拿旧的盖回去
+                if Arc::ptr_eq(&skills.scan, &d.skills.scan) {
+                    d.skills = skills;
+                }
                 cx.notify();
             })
             .ok();
@@ -1559,17 +1821,33 @@ impl ListDelegate for SearchDelegate {
         cx: &mut Context<ListState<Self>>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        // 还没输入给提示,查询失败说失败(与"没有结果"分开,否则用户以为真的没讨论过)
-        let card = if self.last_query.trim().is_empty() {
-            Some((
-                "icons/search.svg",
-                t("Search full conversation text"),
-                SharedString::from(t("Matches natural language and code, like \"useEffect(\".")),
-            ))
+        // 还没输入给这一栏搜什么,查询失败说失败(与"没有结果"分开,否则用户以为真的没讨论过)
+        let error = match self.tab {
+            SearchTab::Sessions => self.sessions.as_ref().err(),
+            SearchTab::Memory => self.memory.as_ref().err(),
+            SearchTab::Skills => None,
+        };
+        let card = if self.last_query.is_empty() {
+            let (glyph, title, caption) = match self.tab {
+                SearchTab::Sessions => (
+                    "icons/search.svg",
+                    t("Search full conversation text"),
+                    t("Matches natural language and code, like \"useEffect(\"."),
+                ),
+                SearchTab::Memory => (
+                    "icons/file-text.svg",
+                    t("Search memory files"),
+                    t("Matches the titles and text of the notes your agents keep."),
+                ),
+                SearchTab::Skills => (
+                    "icons/puzzle.svg",
+                    t("Search installed skills"),
+                    t("Matches skill names and descriptions."),
+                ),
+            };
+            Some((glyph, title, SharedString::from(caption)))
         } else {
-            self.error
-                .as_ref()
-                .map(|error| ("icons/info.svg", t("Search failed"), error.clone().into()))
+            error.map(|error| ("icons/info.svg", t("Search failed"), error.clone().into()))
         };
         if let Some((glyph, title, caption)) = card {
             return v_flex()
@@ -1578,6 +1856,10 @@ impl ListDelegate for SearchDelegate {
                 .justify_center()
                 .child(empty_state(glyph, zpx(48.), zpx(22.), title, caption, cx));
         }
+        // 这一栏没有、别的栏有:说一声按 Tab 过去,别让人以为整个都没搜到
+        let elsewhere = SearchTab::ALL
+            .iter()
+            .any(|&tab| tab != self.tab && self.count(tab) > 0);
         v_flex()
             .h(zpx(250.))
             .w_full()
@@ -1592,11 +1874,11 @@ impl ListDelegate for SearchDelegate {
                     .font_medium()
                     .child(crate::tf!("No results for \"{}\"", self.last_query)),
             )
-            .child(
-                div()
-                    .text_size(FONT_CAPTION)
-                    .child(t("Try a different or shorter query.")),
-            )
+            .child(div().text_size(FONT_CAPTION).child(if elsewhere {
+                t("Other tabs have results. Press Tab to switch.")
+            } else {
+                t("Try a different or shorter query.")
+            }))
     }
 
     fn render_section_header(
@@ -1605,7 +1887,7 @@ impl ListDelegate for SearchDelegate {
         _window: &mut Window,
         cx: &mut Context<ListState<Self>>,
     ) -> Option<impl IntoElement> {
-        if !self.degraded {
+        if self.tab != SearchTab::Sessions || !matches!(self.sessions, Ok((_, true))) {
             return None;
         }
         Some(
@@ -1619,6 +1901,86 @@ impl ListDelegate for SearchDelegate {
                 )),
         )
     }
+}
+
+/// 选中当前栏的第一条、回到顶部:换栏与搜完回填都这样
+fn select_first_hit(
+    state: &mut ListState<SearchDelegate>,
+    window: &mut Window,
+    cx: &mut Context<ListState<SearchDelegate>>,
+) {
+    let d = state.delegate();
+    let has_hits = d.count(d.tab) > 0;
+    state.set_selected_index(has_hits.then(IndexPath::default), window, cx);
+    // scroll_to_item 自带 notify,列表随之重绘
+    state.scroll_to_item(IndexPath::default(), ScrollStrategy::Top, window, cx);
+}
+
+/// 换到 ⌘K 面板的某一栏。打开面板、点栏头与 Tab 键共用
+fn select_palette_tab(
+    list: &Entity<ListState<SearchDelegate>>,
+    tab: SearchTab,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    list.update(cx, |state, cx| {
+        state.delegate_mut().tab = tab;
+        select_first_hit(state, window, cx);
+    });
+}
+
+/// ⌘K 面板输入行下的栏头:Sessions / Memory / Skills,有查询时各带命中数。纯文字:当前栏前景色、
+/// 底下一条 2px 的线,其余 muted、悬停变前景色——不用带框的分段控件(侧栏底部工具条那次用户
+/// 否过带框的)。点了栏头焦点回到输入框:点过结果行的话焦点在列表上,换了栏要能接着打字
+fn palette_tabs(
+    list: &Entity<ListState<SearchDelegate>>,
+    input: &Entity<InputState>,
+    cx: &App,
+) -> impl IntoElement {
+    let theme = cx.theme();
+    let delegate = list.read(cx).delegate();
+    let has_query = !delegate.last_query.is_empty();
+    h_flex().gap(SPACE_LG).children(SearchTab::ALL.map(|tab| {
+        let active = tab == delegate.tab;
+        let list = list.clone();
+        let input = input.clone();
+        v_flex()
+            .id(("palette-tab", tab as usize))
+            .cursor_pointer()
+            .on_click(move |_, window, cx| {
+                select_palette_tab(&list, tab, window, cx);
+                input.update(cx, |st, cx| st.focus(window, cx));
+            })
+            .child(
+                h_flex()
+                    .h(zpx(28.))
+                    .gap(SPACE_XS)
+                    .text_size(FONT_CAPTION)
+                    .font_medium()
+                    .text_color(if active {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .when(!active, |label| {
+                        label.hover(|s| s.text_colored(theme.foreground, FONT_CAPTION))
+                    })
+                    .child(tab.label())
+                    .when(has_query, |label| {
+                        label.child(
+                            div()
+                                .text_color(theme.muted_foreground)
+                                .child(delegate.count_label(tab)),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .h(zpx(2.))
+                    .w_full()
+                    .when(active, |bar| bar.bg(theme.foreground)),
+            )
+    }))
 }
 
 // ---------------- 详情状态 ----------------
@@ -2625,18 +2987,7 @@ impl Workbench {
             .searchable(false)
         });
         let palette_list = cx.new(|cx| {
-            ListState::new(
-                SearchDelegate {
-                    hits: Vec::new(),
-                    degraded: false,
-                    error: None,
-                    store: store.clone(),
-                    last_query: String::new(),
-                },
-                window,
-                cx,
-            )
-            .searchable(false)
+            ListState::new(SearchDelegate::new(store.clone()), window, cx).searchable(false)
         });
         let palette_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder(t("Search everything — prose or code"))
@@ -4802,12 +5153,21 @@ impl Workbench {
             window.close_dialog(cx);
             return;
         }
+        // 停在当前页对应的那一栏;skill 在后台重扫一次(扫完命中自己补上)
+        select_palette_tab(
+            &self.palette_list,
+            SearchTab::for_page(self.page),
+            window,
+            cx,
+        );
+        self.rescan_skills_for_search(cx);
         let list = self.palette_list.clone();
         let input = self.palette_input.clone();
         let this = cx.entity();
         open_closable_dialog(window, cx, 680., move |dialog, window, cx| {
             let theme = cx.theme();
             let has_query = input.read(cx).text().len() > 0;
+            let tab = list.read(cx).delegate().tab;
             // 输入框尺寸;清除钮的 suffix 补偿 margin 从它派生,改档自动跟随
             let input_size = gpui_component::Size::Large;
             dialog
@@ -4817,7 +5177,7 @@ impl Workbench {
                 .close_button(false)
                 .child(
                     v_flex()
-                        // ↑↓ 在 Input 内不被消费,冒泡到这里走 main.rs 的
+                        // ↑↓ 与 Tab 在 Input 内不被消费,冒泡到这里走 main.rs 的
                         // PALETTE_CONTEXT 键位(Input 拆出 List 后原生 List 绑定够不着)
                         .key_context(PALETTE_CONTEXT)
                         .relative()
@@ -4833,6 +5193,18 @@ impl Workbench {
                                 wb.palette_move(1, window, cx)
                             },
                         ))
+                        .on_action(window.listener_for(
+                            &this,
+                            |wb: &mut Self, _: &PaletteNextTab, window, cx| {
+                                wb.step_palette_tab(true, window, cx)
+                            },
+                        ))
+                        .on_action(window.listener_for(
+                            &this,
+                            |wb: &mut Self, _: &PalettePrevTab, window, cx| {
+                                wb.step_palette_tab(false, window, cx)
+                            },
+                        ))
                         // 定高 + 列表 flex_1:输入行/footer 尺寸变化时列表自适应,
                         // 不用手工重算列表高度
                         // 放大后不超出窗口:顶距与上下留白之外的高度都给它,列表跟着缩
@@ -4841,7 +5213,8 @@ impl Workbench {
                             .min(window.viewport_size().height - PALETTE_TOP - SPACE_XXL * 2.))
                         .gap(SPACE_MD)
                         .child(
-                            div()
+                            // 输入行与栏头同在一个头部里,底下一条 hairline 与结果隔开
+                            v_flex()
                                 .flex_shrink_0()
                                 .px(SPACE_SM)
                                 .border_b_1()
@@ -4895,7 +5268,8 @@ impl Workbench {
                                         })
                                         .p_0()
                                         .appearance(false),
-                                ),
+                                )
+                                .child(palette_tabs(&list, &input, cx)),
                         )
                         .child(
                             List::new(&list)
@@ -4914,10 +5288,11 @@ impl Workbench {
                                 .justify_between()
                                 .text_size(FONT_LABEL)
                                 .text_color(theme.muted_foreground)
-                                .child(t("Scope: all sessions"))
+                                .child(tab.scope())
                                 .child(
                                     h_flex()
                                         .gap(SPACE_MD)
+                                        .child(t("⇥ next tab"))
                                         .child(t("↑↓ navigate"))
                                         .child(t("↩ open"))
                                         .child(t("esc close")),
@@ -4950,10 +5325,7 @@ impl Workbench {
                 if q.is_empty() {
                     self._palette_search_task = None;
                     self.palette_list.update(cx, |state, cx| {
-                        let d = state.delegate_mut();
-                        d.hits = Vec::new();
-                        d.degraded = false;
-                        d.last_query = String::new();
+                        state.delegate_mut().clear();
                         state.set_selected_index(None, window, cx);
                         cx.notify();
                     });
@@ -4967,17 +5339,8 @@ impl Workbench {
                 self._palette_search_task = Some(cx.spawn_in(window, async move |this, cx| {
                     task.await;
                     this.update_in(cx, |this, window, cx| {
-                        this.palette_list.update(cx, |state, cx| {
-                            let has_hits = !state.delegate().hits.is_empty();
-                            state.set_selected_index(has_hits.then(IndexPath::default), window, cx);
-                            // scroll_to_item 自带 notify,列表随之重绘
-                            state.scroll_to_item(
-                                IndexPath::default(),
-                                ScrollStrategy::Top,
-                                window,
-                                cx,
-                            );
-                        });
+                        this.palette_list
+                            .update(cx, |state, cx| select_first_hit(state, window, cx));
                     })
                     .ok();
                 }));
@@ -4995,18 +5358,17 @@ impl Workbench {
         }
     }
 
-    /// 打开第 row 条搜索命中(回车与鼠标点击共用),定位到命中消息
+    /// 打开当前栏第 row 条搜索命中(回车与鼠标点击共用):会话定位到命中消息,记忆与 skill
+    /// 落到各自的页、选中它
     fn open_palette_hit(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let hit = self
-            .palette_list
-            .read(cx)
-            .delegate()
-            .hits
-            .get(row)
-            .map(|h| (h.session.key.clone(), h.seq));
-        if let Some((key, seq)) = hit {
-            window.close_dialog(cx);
-            self.open_detail(&key, Some(seq), window, cx);
+        let Some(target) = self.palette_list.read(cx).delegate().target(row) else {
+            return;
+        };
+        window.close_dialog(cx);
+        match target {
+            PaletteTarget::Session { key, seq } => self.open_detail(&key, Some(seq), window, cx),
+            PaletteTarget::Memory(key) => self.reveal_memory(key, cx),
+            PaletteTarget::Skill { name, dir } => self.reveal_skill(&name, dir, cx),
         }
     }
 
@@ -5014,7 +5376,8 @@ impl Workbench {
     /// 按 row 平移——SearchDelegate 单 section,section 恒 0
     fn palette_move(&mut self, delta: i64, window: &mut Window, cx: &mut Context<Self>) {
         self.palette_list.update(cx, |state, cx| {
-            let n = state.delegate().hits.len() as i64;
+            let d = state.delegate();
+            let n = d.count(d.tab) as i64;
             if n == 0 {
                 return;
             }
@@ -5024,6 +5387,12 @@ impl Workbench {
             // scroll_to_selected_item 内部 notify,选中高亮随之重绘
             state.scroll_to_selected_item(window, cx);
         });
+    }
+
+    /// ⌘K 面板 Tab / Shift-Tab:后一栏 / 前一栏
+    fn step_palette_tab(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let tab = self.palette_list.read(cx).delegate().tab.step(forward);
+        select_palette_tab(&self.palette_list, tab, window, cx);
     }
 
     // ---------- 详情 ----------
@@ -5164,10 +5533,7 @@ impl Workbench {
                             if let Some(seq) = detail.jump_seq {
                                 if let Some(ix) = messages.iter().position(|m| m.seq >= seq) {
                                     detail.jump_seq = Some(messages[ix].seq);
-                                    detail.msg_list.scroll_to(gpui::ListOffset {
-                                        item_ix: ix,
-                                        offset_in_item: px(0.),
-                                    });
+                                    pin_list_row(&detail.msg_list, ix);
                                 }
                             }
                             detail.transcript = Rc::new(messages);
@@ -5956,8 +6322,9 @@ impl Workbench {
                     .pr(SIDEBAR_EDGE * 2.)
                     .text_color(theme.foreground),
             )
-            // 导航按页切换:Memory 页是记忆的导航(All Memory / Agents / Projects,按记忆
-            // 计数),其余是会话的(搜索框 + All Sessions / Starred + Agents / Projects)
+            // 搜索框三页都有(⌘K 同一个面板),下面的导航按页切换:Memory / Skills 页是各自的
+            // 导航(按记忆文件 / skill 计数),其余是会话的
+            .child(self.render_sidebar_search(cx))
             .child(match self.page {
                 Page::Memory => self.render_memory_nav(cx),
                 Page::Skills => self.render_skills_nav(cx),
@@ -6008,47 +6375,45 @@ impl Workbench {
             )
     }
 
-    /// 会话导航(Insights 页也画它——点任何一行都回会话列表):搜索框(搜的是会话,
-    /// ⌘K 同一条路)、All Sessions / Starred 两行,再接 Agents / Projects 两组
-    fn render_sessions_nav(&self, all_active: bool, cx: &Context<Self>) -> AnyElement {
+    /// 侧栏顶部的搜索框,三页都画:点它与 ⌘K 是同一个面板,面板停在当前页那一栏,所以
+    /// 文案按页点名(用户 2026-10-24 定)
+    fn render_sidebar_search(&self, cx: &Context<Self>) -> Div {
         let theme = cx.theme();
+        let label = SearchTab::for_page(self.page).prompt();
+        div().flex_shrink_0().px(SIDEBAR_EDGE).pb(SPACE_MD).child(
+            h_flex().gap(SPACE_SM).child(
+                search_field_frame(cx)
+                    .id("sidebar-search")
+                    .flex_1()
+                    .min_w_0()
+                    .cursor_pointer()
+                    .active(|s| {
+                        s.bg(theme.secondary_active)
+                            .text_colored(theme.foreground, FONT_CAPTION)
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_search(&ToggleSearch, window, cx)
+                    }))
+                    .child(icon("icons/search.svg").with_size(zpx(13.)).flex_shrink_0())
+                    // flex_1 + min_w_0 + truncate:空间不足时压文案,右侧的 ⌘K
+                    // 提示不被挤出侧栏
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_size(FONT_LABEL)
+                            .child(search_key_hint()),
+                    ),
+            ),
+        )
+    }
+
+    /// 会话导航(Insights 页也画它——点任何一行都回会话列表):All Sessions / Starred 两行,再接
+    /// Agents / Projects 两组
+    fn render_sessions_nav(&self, all_active: bool, cx: &Context<Self>) -> AnyElement {
         v_flex()
             .flex_1()
             .min_h_0()
-            .child(
-                div().flex_shrink_0().px(SIDEBAR_EDGE).pb(SPACE_MD).child(
-                    h_flex().gap(SPACE_SM).child(
-                        search_field_frame(cx)
-                            .id("sidebar-search")
-                            .flex_1()
-                            .min_w_0()
-                            .cursor_pointer()
-                            .active(|s| {
-                                s.bg(theme.secondary_active)
-                                    .text_colored(theme.foreground, FONT_CAPTION)
-                            })
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_search(&ToggleSearch, window, cx)
-                            }))
-                            .child(icon("icons/search.svg").with_size(zpx(13.)).flex_shrink_0())
-                            // flex_1 + min_w_0 + truncate:空间不足时压文案,右侧的 ⌘K
-                            // 提示不被挤出侧栏
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(t("Search sessions")),
-                            )
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_size(FONT_LABEL)
-                                    .child(search_key_hint()),
-                            ),
-                    ),
-                ),
-            )
             .child(
                 v_flex()
                     .flex_shrink_0()
@@ -7502,12 +7867,7 @@ impl Workbench {
                     .into_any_element(),
             );
         }
-        lead.push(
-            img(meta.agent.brand_icon(theme.mode.is_dark()))
-                .size(zpx(15.))
-                .flex_shrink_0()
-                .into_any_element(),
-        );
+        lead.push(brand_img(meta.agent, zpx(15.), theme.mode.is_dark()).into_any_element());
         lead.push(
             div()
                 .flex_shrink_0()
@@ -9918,19 +10278,23 @@ fn library_list(
         .into_any_element()
 }
 
+/// 把第 `row` 行钉到列表顶上:搜索命中的跳转都这样(会话正文里的那条消息、记忆、skill)
+fn pin_list_row(state: &gpui::ListState, row: usize) {
+    state.scroll_to(gpui::ListOffset {
+        item_ix: row,
+        offset_in_item: Pixels::ZERO,
+    });
+}
+
 /// 列表整段换成 `new_len` 行:重载保滚动位置,`to_top` 回到顶部。splice 整段会把落在段内的
 /// 滚动锚点归零(gpui 只保段外的锚点),所以先记下再恢复
 fn replace_list_rows(state: &gpui::ListState, old_len: usize, new_len: usize, to_top: bool) {
-    let top = if to_top {
-        gpui::ListOffset {
-            item_ix: 0,
-            offset_in_item: px(0.),
-        }
-    } else {
-        state.logical_scroll_top()
-    };
+    let top = (!to_top).then(|| state.logical_scroll_top());
     state.splice(0..old_len, new_len);
-    state.scroll_to(top);
+    match top {
+        Some(top) => state.scroll_to(top),
+        None => pin_list_row(state, 0),
+    }
 }
 
 /// 阅读面头部右端的 Reveal / Copy path,与路径、更新时间两行元信息(记忆与 Skills 阅读面

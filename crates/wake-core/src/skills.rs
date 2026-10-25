@@ -24,6 +24,7 @@
 use crate::adapters::parse_utils::{mtime_ms, project_name_of};
 use crate::adapters::{self, AgentAdapter};
 use crate::models::AgentId;
+use crate::text;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::ErrorKind;
@@ -112,6 +113,15 @@ pub struct Skill {
     pub plugin: bool,
     /// 最近改过的那处(`installs` 下标,平局取靠前的);列表的说明与阅读面默认显示它
     pub newest: usize,
+    /// 折叠过大小写的名字与各处说明(`descriptions` 与 `installs` 一一对应):搜索拿它比,
+    /// 扫描时折一次,不必每次输入把几百份说明再折一遍
+    folded: FoldedSkill,
+}
+
+#[derive(Debug, Clone)]
+struct FoldedSkill {
+    name: String,
+    descriptions: Vec<String>,
 }
 
 impl Skill {
@@ -126,6 +136,13 @@ impl Skill {
         // installs 先按归属排,相邻去重就是各方
         let mut owners: Vec<SkillOwner> = installs.iter().map(|i| i.owner).collect();
         owners.dedup();
+        let folded = FoldedSkill {
+            name: text::fold_case(&name),
+            descriptions: installs
+                .iter()
+                .map(|i| text::fold_case(&i.description))
+                .collect(),
+        };
         Self {
             copies: installs
                 .iter()
@@ -141,6 +158,7 @@ impl Skill {
                 .any(|i| matches!(i.scope, SkillScope::Plugin { .. })),
             owners,
             newest,
+            folded,
             name,
             installs,
         }
@@ -222,6 +240,78 @@ impl SkillScan {
             projects,
         }
     }
+
+    /// 按名字找回一个 skill:重扫后下标会变,界面记的是名字
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.skills.iter().position(|s| s.name == name)
+    }
+
+    /// 按名字与说明找 skill(⌘K 面板的 Skills 栏;SKILL.md 正文不搜):与会话、记忆同一套分词,
+    /// 每个词都得出现在名字或某一处安装的说明里,大小写折叠与片段的高亮同一个取法。排序:词全在
+    /// 名字里的在前,其中名字越短越靠前(名字恰好就是查询的排第一);其余按名字里缺几个词;同档
+    /// 按名字
+    pub fn search(&self, q: &str) -> Vec<SkillHit> {
+        let terms = text::fts_terms(q);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let needles: Vec<String> = terms.iter().map(|t| text::fold_case(t)).collect();
+        let mut ranked: Vec<((usize, usize), SkillHit)> = Vec::new();
+        for (ix, skill) in self.skills.iter().enumerate() {
+            let folded = &skill.folded;
+            let described = |i: usize, needle: &str| folded.descriptions[i].contains(needle);
+            // 名字里没有的词,都得在某一处的说明里
+            let unnamed: Vec<&str> = needles
+                .iter()
+                .map(String::as_str)
+                .filter(|needle| !folded.name.contains(needle))
+                .collect();
+            if !unnamed
+                .iter()
+                .all(|needle| (0..skill.installs.len()).any(|i| described(i, needle)))
+            {
+                continue;
+            }
+            // 显示、打开哪一处(片段也取自它):名字里没有的那些词,说明里凑得最齐的那一处;一样齐的
+            // 取最近改过的那份,再按排序在前的。只看"有没有命中",搜 staging cluster 会落到只写着
+            // staging 的最新那份上(Codex review 2026-10-25)
+            let covered = |i: usize| unnamed.iter().filter(|needle| described(i, needle)).count();
+            let (mut install, mut best) = (skill.newest, covered(skill.newest));
+            for i in 0..skill.installs.len() {
+                let n = covered(i);
+                if n > best {
+                    (install, best) = (i, n);
+                }
+            }
+            let length = if unnamed.is_empty() {
+                skill.name.chars().count()
+            } else {
+                0
+            };
+            ranked.push((
+                (unnamed.len(), length),
+                SkillHit {
+                    skill: ix,
+                    install,
+                    snippet: text::make_snippet(&skill.installs[install].description, &terms),
+                },
+            ));
+        }
+        // 稳定排序:同档保持 skills 的顺序,即按名字
+        ranked.sort_by_key(|(rank, _)| *rank);
+        ranked.into_iter().map(|(_, hit)| hit).collect()
+    }
+}
+
+/// skill 搜索的一条命中(`SkillScan::search`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillHit {
+    /// `SkillScan::skills` 的下标
+    pub skill: usize,
+    /// 片段取自哪一处安装的说明(`Skill::installs` 的下标),打开时显示的也是它
+    pub install: usize,
+    /// 说明的片段,带 HL_OPEN / HL_CLOSE 高亮;没有说明是空串
+    pub snippet: String,
 }
 
 /// 项目根的显示名(与会话、记忆的项目名同一个取法)
@@ -864,6 +954,103 @@ pub fn scan_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{HL_CLOSE, HL_OPEN};
+
+    fn install(owner: SkillOwner, name: &str, description: &str, updated_at: i64) -> SkillInstall {
+        let path = PathBuf::from(format!("/skills/{owner:?}/{name}"));
+        SkillInstall {
+            owner,
+            scope: SkillScope::User,
+            real_path: path.clone(),
+            path,
+            linked: false,
+            content_hash: 0,
+            name: name.to_string(),
+            description: description.to_string(),
+            updated_at,
+        }
+    }
+
+    /// 与 `scan_in` 收尾一样按名字排
+    fn scan_of(skills: Vec<Vec<SkillInstall>>) -> SkillScan {
+        let mut skills: Vec<Skill> = skills
+            .into_iter()
+            .map(|installs| Skill::new(installs[0].name.clone(), installs))
+            .collect();
+        skills.sort_by_key(|s| s.name.to_lowercase());
+        SkillScan {
+            skills,
+            errors: Vec::new(),
+        }
+    }
+
+    fn names(scan: &SkillScan, q: &str) -> Vec<String> {
+        scan.search(q)
+            .iter()
+            .map(|h| scan.skills[h.skill].name.clone())
+            .collect()
+    }
+
+    #[test]
+    fn search_puts_name_matches_first_and_the_closest_name_on_top() {
+        let claude = SkillOwner::Agent(AgentId::ClaudeCode);
+        let scan = scan_of(vec![
+            vec![install(claude, "writer", "Use to Review drafts", 1)],
+            vec![install(claude, "plan-eng-review", "Engineering plan", 1)],
+            vec![install(claude, "review", "Pre-landing review", 1)],
+            vec![install(claude, "code-review:code-review", "", 1)],
+            vec![install(claude, "deploy", "Ship it", 1)],
+        ]);
+        assert_eq!(
+            names(&scan, "REVIEW"),
+            [
+                "review",
+                "plan-eng-review",
+                "code-review:code-review",
+                "writer"
+            ],
+            "词全在名字里的按名字长短,只在说明里的垫底;大小写不论"
+        );
+        // 每个词都得出现在名字或说明里
+        assert_eq!(names(&scan, "review drafts"), ["writer"]);
+        assert_eq!(names(&scan, "review plan"), ["plan-eng-review"]);
+        assert!(scan.search("  ").is_empty());
+        assert!(scan.search("kubernetes").is_empty());
+    }
+
+    #[test]
+    fn search_snippets_come_from_the_install_that_matched() {
+        let codex = SkillOwner::Agent(AgentId::Codex);
+        let scan = scan_of(vec![vec![
+            install(
+                SkillOwner::Shared,
+                "deploy",
+                "Ship to the staging cluster",
+                1,
+            ),
+            install(codex, "deploy", "Ship it", 2),
+        ]]);
+        let skill = &scan.skills[0];
+        // 最近改过的那份(Codex 的)说明里没有这个词:片段取自有命中的那份
+        let hit = &scan.search("staging")[0];
+        assert_eq!(skill.installs[hit.install].owner, SkillOwner::Shared);
+        assert!(hit.snippet.contains(&format!("{HL_OPEN}staging{HL_CLOSE}")));
+        // 只在名字里命中:片段是最近那份的说明,不标
+        let hit = &scan.search("deploy")[0];
+        assert_eq!(hit.install, skill.newest);
+        assert_eq!(hit.snippet, "Ship it");
+        // 两处都提到 staging,只有旧的那份还写着 cluster:两个词一起搜,落在旧的那份上
+        let scan = scan_of(vec![vec![
+            install(SkillOwner::Shared, "deploy", "Ship to staging cluster", 1),
+            install(codex, "deploy", "Deploy to staging", 2),
+        ]]);
+        let hit = &scan.search("staging cluster")[0];
+        assert_eq!(
+            scan.skills[0].installs[hit.install].owner,
+            SkillOwner::Shared
+        );
+        assert!(hit.snippet.contains(&format!("{HL_OPEN}cluster{HL_CLOSE}")));
+    }
 
     #[test]
     fn a_star_segment_expands_to_every_subdirectory() {

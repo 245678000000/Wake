@@ -26,8 +26,8 @@ use gpui_component::Root;
 use i18n::t;
 use main_window::MainWindow;
 use workbench::{
-    OpenAbout, OpenSettings, OpenUpdates, PaletteDown, PaletteUp, RefreshSessions, ToggleSearch,
-    Workbench, KEY_CONTEXT, PALETTE_CONTEXT,
+    OpenAbout, OpenSettings, OpenUpdates, PaletteDown, PaletteNextTab, PalettePrevTab, PaletteUp,
+    RefreshSessions, ToggleSearch, Workbench, KEY_CONTEXT, PALETTE_CONTEXT,
 };
 
 actions!(
@@ -214,6 +214,10 @@ fn key_bindings() -> Vec<KeyBinding> {
         // ⌘K 面板:焦点在搜索输入框,↑↓ 冒泡到面板容器挪选中
         KeyBinding::new("up", PaletteUp, Some(PALETTE_CONTEXT)),
         KeyBinding::new("down", PaletteDown, Some(PALETTE_CONTEXT)),
+        // Tab / Shift-Tab 换栏(Sessions / Memory / Skills)。比 gpui-component 的 Root 挪焦点
+        // 的 tab 绑定深一层,在面板里先到
+        KeyBinding::new("tab", PaletteNextTab, Some(PALETTE_CONTEXT)),
+        KeyBinding::new("shift-tab", PalettePrevTab, Some(PALETTE_CONTEXT)),
     ];
     // 界面缩放(全局,键位表在 ui_zoom,与设置页的提示同源)
     keys.extend(ui_zoom::key_bindings());

@@ -1,5 +1,9 @@
 # Changelog
 
+## [Unreleased]
+
+- New: ⌘K / Ctrl+K searches your memory files and skills too, each in its own tab next to sessions; press Tab to switch. The Memory and Skills pages get the same search box in the sidebar
+
 ## [0.10.1] — 2026-10-23
 
 - New: MiMo Code sessions are indexed from its local database (`~/.local/share/mimocode/mimocode.db`, read-only) — titles, models, thinking, tool calls and token counts included. Sub-agents are listed under the session that started them, and the tool call that started one opens it. A session you imported into MiMo Code from Claude Code, Codex or OpenCode is listed only once you continue it there, and only the new part is indexed. Open In continues a session with `mimo --session` in its project directory. Not mirrored from remote hosts, since the database also holds MiMo Code's sign-in tokens (#77, thanks @lin-code-world)

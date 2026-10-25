@@ -64,6 +64,8 @@ pub(super) struct MemoryState {
     /// 有 `syncing` 守着就不会重叠,不必再攥着句柄
     pub(super) syncing: bool,
     sync_pending: bool,
+    /// ⌘K 打开的那一份:下一次重载落定后选中它、滚到它那一行
+    reveal: Option<String>,
 }
 
 impl MemoryState {
@@ -89,6 +91,7 @@ impl Default for MemoryState {
             body_task: None,
             syncing: false,
             sync_pending: false,
+            reveal: None,
         }
     }
 }
@@ -103,6 +106,18 @@ impl Workbench {
     pub(super) fn reset_memory_scope(&mut self) {
         self.memory.nav = MemoryNav::All;
         self.memory.scope_changed = true;
+    }
+
+    /// ⌘K 打开一条记忆命中:落到 Memory 页的 All Memory(哪一份都列得出来),重载落定后选中它、
+    /// 把它那一行滚到顶上(会话命中也是钉顶)
+    pub(super) fn reveal_memory(&mut self, key: String, cx: &mut Context<Self>) {
+        self.memory.reveal = Some(key);
+        if self.page == Page::Memory {
+            self.set_memory_scope(MemoryNav::All, cx);
+        } else {
+            // 切页清筛选、重载(`show_page` → refresh → reload_memories)
+            self.show_page(Page::Memory, cx);
+        }
     }
 
     /// 侧栏导航行的唯一写入点(与会话侧栏的 set_scope 同形)
@@ -225,6 +240,8 @@ impl Workbench {
         self.memory.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = task.await;
             this.update(cx, |this, cx| {
+                // 读失败也收掉:留着的话,之后哪一次重载都会突然跳过去选中它
+                let reveal = this.memory.reveal.take();
                 if let Ok((mut docs, counts)) = loaded {
                     this.memory.counts = counts;
                     // 用户记忆对每个项目都成立、没有"发生时间"的意义,像会话列表的 Pinned
@@ -258,11 +275,17 @@ impl Workbench {
                     let after = selected.as_deref().and_then(|k| stamp(&docs, k));
                     this.memory.docs = docs;
                     this.memory.rows = rows;
-                    match (selected, after) {
-                        (Some(key), Some(now)) if before != Some(now) => {
+                    let revealed = reveal.and_then(|key| Some((this.memory_row_of(&key)?, key)));
+                    match (revealed, selected, after) {
+                        // ⌘K 打开的那一份:选中它,它那一行(连同上面的组头)滚到顶上
+                        (Some((row, key)), ..) => {
+                            pin_list_row(&this.memory.list, row);
                             this.select_memory(key, cx);
                         }
-                        (Some(_), Some(_)) => {}
+                        (None, Some(key), Some(now)) if before != Some(now) => {
+                            this.select_memory(key, cx);
+                        }
+                        (None, Some(_), Some(_)) => {}
                         _ => {
                             this.memory.selected = None;
                             this.memory.loaded = None;
@@ -277,6 +300,20 @@ impl Workbench {
             })
             .ok();
         }));
+    }
+
+    /// 一份记忆在列表里的行;紧挨着它的上一行是组头时给组头,滚到顶上时连组头一起露出来
+    fn memory_row_of(&self, key: &str) -> Option<usize> {
+        let rows = &self.memory.rows;
+        let docs = &self.memory.docs;
+        let row = rows
+            .iter()
+            .position(|r| matches!(r, MemoryRow::Doc(di) if docs[*di].key == key))?;
+        Some(if row > 0 && matches!(rows[row - 1], MemoryRow::Group(_)) {
+            row - 1
+        } else {
+            row
+        })
     }
 
     fn select_memory(&mut self, key: String, cx: &mut Context<Self>) {
@@ -436,11 +473,7 @@ impl Workbench {
                     .gap(ICON_TEXT_GAP)
                     .text_size(FONT_LABEL)
                     .text_color(theme.muted_foreground)
-                    .child(
-                        img(d.agent.brand_icon(theme.mode.is_dark()))
-                            .size(zpx(15.))
-                            .flex_shrink_0(),
-                    )
+                    .child(brand_img(d.agent, zpx(15.), theme.mode.is_dark()))
                     // 项目徽章与会话行同款(muted 胶囊;用户级 / 没归属的也用组头同一套
                     // 文案),用户 2026-09-21 定:组头说明了也要挂,和会话列表看起来一致
                     .child(badge(
@@ -490,10 +523,7 @@ impl Workbench {
             doc.project_path.clone()
         };
         let mut lead: Vec<AnyElement> = vec![
-            img(doc.agent.brand_icon(dark))
-                .size(zpx(15.))
-                .flex_shrink_0()
-                .into_any_element(),
+            brand_img(doc.agent, zpx(15.), dark).into_any_element(),
             div()
                 .flex_shrink_0()
                 .child(doc.agent.display_name())
@@ -532,9 +562,9 @@ impl Workbench {
         reader_pane("memory-reader", header, content, &theme)
     }
 
-    /// Memory 页的侧栏导航,替换会话导航(搜索框、All Sessions / Starred、Agents /
-    /// Projects):All Memory / User memory 两行,再接 Agents / Projects 两组
-    /// (`sidebar_groups`,与会话侧栏同一套组件、同一个单选模型)按记忆文件计数
+    /// Memory 页的侧栏导航,替换会话导航(All Sessions / Starred、Agents / Projects):
+    /// All Memory / User memory 两行,再接 Agents / Projects 两组(`sidebar_groups`,与会话
+    /// 侧栏同一套组件、同一个单选模型)按记忆文件计数
     pub(super) fn render_memory_nav(&self, cx: &Context<Self>) -> AnyElement {
         let counts = &self.memory.counts;
         let nav = &self.memory.nav;
@@ -657,8 +687,8 @@ fn memory_display_path(d: &MemoryDoc) -> String {
     }
 }
 
-/// 组头 / 归属徽章的文案:项目名;用户级记忆一组、没有项目的一组
-fn memory_group_label(d: &MemoryDoc) -> SharedString {
+/// 组头 / 归属徽章的文案:项目名;用户级记忆一组、没有项目的一组(⌘K 面板的记忆行也用它)
+pub(super) fn memory_group_label(d: &MemoryDoc) -> SharedString {
     match d.group() {
         MemoryGroup::User => t("User memory").into(),
         MemoryGroup::Unknown => t("Unknown project").into(),

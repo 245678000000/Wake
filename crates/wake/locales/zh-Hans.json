@@ -536,5 +536,15 @@
   "Couldn't read {} location": "{} 处位置读不出",
   "Couldn't read {} locations": "{} 处位置读不出",
   "and {} more": "还有 {} 处",
-  "plugin": "插件"
+  "plugin": "插件",
+  "Search memory": "搜索记忆",
+  "Search skills": "搜索技能",
+  "Scope: all memory files": "范围:全部记忆文件",
+  "Scope: all skills": "范围:全部技能",
+  "⇥ next tab": "⇥ 下一栏",
+  "Search memory files": "搜索记忆文件",
+  "Matches the titles and text of the notes your agents keep.": "匹配 agent 记下的笔记的标题与正文。",
+  "Search installed skills": "搜索已装的技能",
+  "Matches skill names and descriptions.": "匹配技能的名字与说明。",
+  "Other tabs have results. Press Tab to switch.": "别的栏有结果,按 Tab 切过去。"
 }

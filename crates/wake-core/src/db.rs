@@ -1,4 +1,5 @@
 use crate::models::*;
+use crate::text::{fts_terms, highlight_all, make_snippet};
 use anyhow::{Context as _, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
@@ -2559,7 +2560,8 @@ impl Store {
     }
 
     /// 记忆全文搜索(标题 + 正文),与会话搜索同一套分词(`Terms`,记忆没有两字组表);命中按
-    /// bm25 排、snippet 取自正文。筛选同 list_memories
+    /// bm25 排、snippet 取自正文。筛选同 list_memories;命中行与列表行一样不带正文(片段已经
+    /// 取好,要正文按 key 另取)
     pub fn search_memories(&self, q: &str, f: &MemoryFilter) -> Result<Vec<MemoryHit>> {
         let segs = fts_terms(q);
         if segs.is_empty() {
@@ -2593,18 +2595,22 @@ impl Store {
         all_args.extend(filter_args);
         all_args.push(Box::new(limit));
         let conn = self.read.lock().unwrap();
-        let hits = conn
+        let docs: Vec<MemoryDoc> = conn
             .prepare_cached(&sql)?
             .query_map(
                 rusqlite::params_from_iter(all_args.iter().map(|b| b.as_ref())),
-                |r| {
-                    let doc = row_to_memory(r)?;
-                    let snippet = make_snippet(&doc.body, &segs);
-                    Ok(MemoryHit { doc, snippet })
-                },
+                row_to_memory,
             )?
             .collect::<rusqlite::Result<_>>()?;
-        Ok(hits)
+        // 片段在放开读锁之后取:几十万字的 CLAUDE.md 开窗也要时间,UI 线程的查询别排在它后面
+        drop(conn);
+        Ok(docs
+            .into_iter()
+            .map(|mut doc| {
+                let snippet = make_snippet(&std::mem::take(&mut doc.body), &segs);
+                MemoryHit { doc, snippet }
+            })
+            .collect())
     }
 
     pub fn agent_counts(&self) -> Result<HashMap<String, i64>> {
@@ -3770,11 +3776,6 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-/// 搜索串按空白切成词项(会话搜索与记忆搜索同一套分词)
-fn fts_terms(q: &str) -> Vec<&str> {
-    q.split_whitespace().filter(|s| !s.is_empty()).collect()
-}
-
 /// 检索词按能走哪个索引分组(issue #79)。trigram 的 FTS 表对不到 3 个字符的词 MATCH 不出东西:
 /// 三字及以上的走它;恰好两个中日韩字符的走正文的两字组表(`messages_cjk`,`bigrams` 为假时——
 /// 标题、记忆没有这张表,或它眼下用不了——归进 `short`);剩下的单字、`js` 这类两个字符的词只能
@@ -3927,101 +3928,6 @@ fn like_filter(cols: &[&str], terms: &[&str]) -> (String, Vec<Box<dyn rusqlite::
     (sql, args)
 }
 
-/// 命中片段:以最早出现的检索词为锚,前 40 / 后 80 字符开窗,窗口里每个检索词的每次
-/// 出现都高亮(相邻、重叠的并成一段)。会话正文与记忆的 FTS / LIKE 两条路径共用这一个;
-/// 标题不开窗(`highlight_all`)。FTS5 的 snippet() 按词元数开窗,trigram 分词下一个词元是
-/// 三个字符的滑窗,16 个词元只露出十几个字,看不出命中在说什么
-fn make_snippet(text: &str, segs: &[&str]) -> String {
-    mark_terms(text, segs, Some((40, 80)))
-}
-
-/// 整段原样、每个检索词的每次出现都高亮,不开窗。标题命中用它:标题短,三条标题路径(只有三字
-/// 以上的词、另带短词、全是短词)同一个取法,同一个标题不因查询里有没有短词显示得不一样
-fn highlight_all(text: &str, segs: &[&str]) -> String {
-    mark_terms(text, segs, None)
-}
-
-/// `make_snippet` 与 `highlight_all` 的本体,`window` 是锚点前后各留多少字符。
-///
-/// 全程按**字符**下标走:逐字符小写并记下每个小写字符来自原文第几个字符——小写
-/// 不保长(Ω→ω、İ→i̇、K→k 字节数与字符数都会变),拿小写串里的字节偏移去切原文正是
-/// 2026-09-21 review 复现的 panic(⌘K 逐字键入 CJK 查询必经此路,后台线程 panic
-/// 直接 abort 整个 app)
-fn mark_terms(text: &str, segs: &[&str], window: Option<(usize, usize)>) -> String {
-    // 大小写按字符折叠,正文与词项同一个取法、对齐 FTS 的 trigram:它把 ΟΣΟΣ / οσος / οσοσ
-    // 当成同一个词。整串 to_lowercase 会把词尾的 Σ 变成 ς(希腊文词尾 sigma 规则),逐字符的
-    // 正文那边是 σ,两边就对不上;ς 也并成 σ
-    let fold = |c: char| c.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c });
-    let chars: Vec<char> = text.chars().collect();
-    let mut lower: Vec<char> = Vec::with_capacity(chars.len());
-    let mut origin: Vec<usize> = Vec::with_capacity(chars.len());
-    for (i, &c) in chars.iter().enumerate() {
-        for lc in fold(c) {
-            lower.push(lc);
-            origin.push(i);
-        }
-    }
-    // 每个词项的每次出现,换算成原文的字符区间 [start, end)
-    let mut spans: Vec<(usize, usize)> = Vec::new();
-    for seg in segs {
-        let needle: Vec<char> = seg.chars().flat_map(fold).collect();
-        if needle.is_empty() {
-            continue;
-        }
-        let mut i = 0;
-        while i + needle.len() <= lower.len() {
-            if lower[i..i + needle.len()] == needle[..] {
-                spans.push((origin[i], origin[i + needle.len() - 1] + 1));
-                i += needle.len();
-            } else {
-                i += 1;
-            }
-        }
-    }
-    spans.sort_unstable();
-    let Some(&(anchor_start, anchor_end)) = spans.first() else {
-        return match window {
-            Some((before, after)) => chars.iter().take(before + after).collect(),
-            None => text.to_string(),
-        };
-    };
-    let (start, end) = match window {
-        Some((before, after)) => (
-            anchor_start.saturating_sub(before),
-            (anchor_end + after).min(chars.len()),
-        ),
-        None => (0, chars.len()),
-    };
-    let mut marks: Vec<(usize, usize)> = Vec::new();
-    for &(s, e) in &spans {
-        if s >= end {
-            break;
-        }
-        let e = e.min(end);
-        match marks.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => marks.push((s, e)),
-        }
-    }
-    let mut out = String::new();
-    if start > 0 {
-        out.push('…');
-    }
-    let mut cursor = start;
-    for (s, e) in marks {
-        out.extend(&chars[cursor..s]);
-        out.push(HL_OPEN);
-        out.extend(&chars[s..e]);
-        out.push(HL_CLOSE);
-        cursor = e;
-    }
-    out.extend(&chars[cursor..end]);
-    if end < chars.len() {
-        out.push('…');
-    }
-    out
-}
-
 /// (current, longest) 连续活跃天数。`daily` 须按日期升序(insights 的
 /// SQL 保证)。current 从 today 往回数;今天尚无活动时允许从昨天起算
 /// (GitHub 惯例:一天没结束不清零),更早断档即为 0。
@@ -4125,67 +4031,5 @@ mod tests {
         let t = Terms::split(&["部署", "js"], false);
         assert!(t.unindexed());
         assert_eq!(t.short, ["部署", "js"]);
-    }
-
-    /// 把哨兵换成方括号,断言好写好读
-    fn shown(s: &str) -> String {
-        s.replace(HL_OPEN, "[").replace(HL_CLOSE, "]")
-    }
-
-    #[test]
-    fn snippet_windows_around_the_first_hit_and_marks_every_term() {
-        let text = format!(
-            "{}先说二维码,再说 useEffect( 的挂载,最后又提到二维码。{}",
-            "前文".repeat(40),
-            "后文".repeat(80)
-        );
-        let s = shown(&make_snippet(&text, &["二维码", "useeffect("]));
-        assert!(
-            s.starts_with('…') && s.ends_with('…'),
-            "长文两头都要省略:{s}"
-        );
-        assert!(
-            s.contains("先说[二维码],再说 [useEffect(] 的挂载,最后又提到[二维码]"),
-            "窗口里每个词的每次出现都标上,大小写按原文:{s}"
-        );
-        // 前 40 后 80 字符的窗口,再加两个省略号
-        assert!(s.chars().count() <= 40 + 80 + "二维码".chars().count() + 2 + 6);
-        // 标题那种不开窗的:整段原样,每次出现都标
-        let all = shown(&highlight_all(&text, &["二维码"]));
-        assert_eq!(all.replace(['[', ']'], ""), text);
-        assert_eq!(all.matches("[二维码]").count(), 2);
-    }
-
-    #[test]
-    fn snippet_merges_overlapping_terms_and_falls_back_to_the_start() {
-        assert_eq!(shown(&make_snippet("xabcdx", &["abc", "bcd"])), "x[abcd]x");
-        let plain = "没有命中的长文本".repeat(30);
-        let s = make_snippet(&plain, &["二维码"]);
-        assert_eq!(s.chars().count(), 120, "找不到词就给开头 120 字");
-        assert!(!s.contains(HL_OPEN));
-    }
-
-    #[test]
-    fn snippet_survives_case_mappings_that_change_length() {
-        // Ω/İ/K 小写后字符数或字节数会变,按原文字符下标切才不会 panic 或错位
-        let s = shown(&make_snippet(
-            "İstanbul Ωmega KELVIN 二维码",
-            &["ωmega", "kelvin"],
-        ));
-        assert_eq!(s, "İstanbul [Ωmega] [KELVIN] 二维码");
-        let s = shown(&make_snippet("İİİ二维码", &["二维码"]));
-        assert_eq!(s, "İİİ[二维码]");
-    }
-
-    /// 希腊文词尾的 sigma:FTS 的 trigram 把 ΟΣΟΣ / οσος / οσοσ 当成同一个词,片段也得认得出——
-    /// 整串小写会把查询词尾的 Σ 变成 ς,逐字符小写的正文那边却是 σ
-    #[test]
-    fn snippet_folds_greek_final_sigma_like_the_index() {
-        let text = format!("{} ΟΣΟΣ τέλος", "α".repeat(200));
-        for query in ["ΟΣΟΣ", "οσος", "οσοσ"] {
-            let s = shown(&make_snippet(&text, &[query]));
-            assert!(s.contains("[ΟΣΟΣ]"), "{query}: {s}");
-        }
-        assert!(shown(&make_snippet("τέλος οσος", &["ΟΣΟΣ"])).contains("[οσος]"));
     }
 }

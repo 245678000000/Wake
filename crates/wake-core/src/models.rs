@@ -1049,7 +1049,8 @@ impl MemoryFilter {
     }
 }
 
-/// 记忆搜索的一条命中(snippet 带 HL_OPEN/HL_CLOSE 高亮哨兵,与会话命中同款)
+/// 记忆搜索的一条命中(snippet 带 HL_OPEN/HL_CLOSE 高亮哨兵,与会话命中同款)。`doc` 与列表行
+/// 一样不带正文(`body` 是空串),要读正文按 key 另取
 #[derive(Debug, Clone)]
 pub struct MemoryHit {
     pub doc: MemoryDoc,

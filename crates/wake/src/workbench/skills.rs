@@ -35,7 +35,8 @@ struct LoadedSkill {
 }
 
 pub(super) struct SkillsState {
-    scan: SkillScan,
+    /// ⌘K 面板的 Skills 栏共用这一份(`SearchDelegate::set_skill_scan`)
+    scan: Arc<SkillScan>,
     counts: SkillCounts,
     /// 当前筛选下列表里的 skill(`scan.skills` 的下标),交 gpui::list 虚拟化
     rows: Vec<usize>,
@@ -55,7 +56,7 @@ pub(super) struct SkillsState {
 impl Default for SkillsState {
     fn default() -> Self {
         Self {
-            scan: SkillScan::default(),
+            scan: Arc::default(),
             counts: SkillCounts::default(),
             rows: Vec::new(),
             list: gpui::ListState::new(0, gpui::ListAlignment::Top, zpx(200.)),
@@ -112,25 +113,22 @@ fn default_install(skill: &Skill, nav: &SkillNav) -> usize {
         .unwrap_or(skill.newest)
 }
 
-/// 归属的显示名:共享目录叫 Shared(译),agent 是产品名(不译)
-fn owner_label(owner: SkillOwner) -> &'static str {
+/// 归属的显示名:共享目录叫 Shared(译),agent 是产品名(不译)。⌘K 面板的 skill 行也用
+pub(super) fn owner_label(owner: SkillOwner) -> &'static str {
     match owner {
         SkillOwner::Shared => t("Shared"),
         SkillOwner::Agent(agent) => agent.display_name(),
     }
 }
 
-/// 归属的图标:agent 是品牌图(原色),共享目录是 layers 线条图标
-fn owner_icon(owner: SkillOwner, size: Pixels, dark: bool) -> AnyElement {
+/// 归属的图标:agent 是品牌图(原色),共享目录是 layers 线条图标。⌘K 面板的 skill 行也用
+pub(super) fn owner_icon(owner: SkillOwner, size: Pixels, dark: bool) -> AnyElement {
     match owner {
         SkillOwner::Shared => icon("icons/layers.svg")
             .with_size(size)
             .flex_shrink_0()
             .into_any_element(),
-        SkillOwner::Agent(agent) => img(agent.brand_icon(dark))
-            .size(size)
-            .flex_shrink_0()
-            .into_any_element(),
+        SkillOwner::Agent(agent) => brand_img(agent, size, dark).into_any_element(),
     }
 }
 
@@ -148,8 +146,32 @@ impl Workbench {
     /// 一次——装了新 skill 进页就看得到。会话扫描的事件不触发重扫(skill 与会话无关)
     pub(super) fn enter_skills(&mut self, cx: &mut Context<Self>) {
         self.skills.nav = SkillNav::All;
-        self.apply_skill_rows(true, cx);
+        self.apply_skill_rows(true, None, cx);
         self.start_skill_scan(None, cx);
+    }
+
+    /// 打开 ⌘K 面板:后台重扫一次 skill,扫完命中自己补上。与进 Skills 页同一个规矩——要看的时候
+    /// 就扫(有缓存时几毫秒);只扫一次的话,装了新 skill、改了 location 之后面板一直搜旧的
+    /// (Codex review 2026-10-25)
+    pub(super) fn rescan_skills_for_search(&mut self, cx: &mut Context<Self>) {
+        self.start_skill_scan(None, cx);
+    }
+
+    /// ⌘K 打开一条 skill 命中:落到 Skills 页的 All Skills,选中它、显示命中的那一处(`dir`),
+    /// 把它那一行滚到顶上(会话命中也是钉顶)
+    pub(super) fn reveal_skill(&mut self, name: &str, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.page == Page::Skills {
+            self.set_skill_scope(SkillNav::All, cx);
+        } else {
+            self.show_page(Page::Skills, cx);
+        }
+        let Some(ix) = self.skills.scan.index_of(name) else {
+            return;
+        };
+        if let Some(row) = self.skills.rows.iter().position(|&r| r == ix) {
+            pin_list_row(&self.skills.list, row);
+        }
+        self.select_skill(ix, Some(dir), cx);
     }
 
     /// roster 换代(location 增删、停用):skill 目录从它推,页开着就重扫;没开着下次进页本来
@@ -163,7 +185,7 @@ impl Workbench {
     /// 侧栏导航行的唯一写入点:不重扫,按已有结果重新筛、回顶部
     fn set_skill_scope(&mut self, nav: SkillNav, cx: &mut Context<Self>) {
         self.skills.nav = nav;
-        self.apply_skill_rows(true, cx);
+        self.apply_skill_rows(true, None, cx);
     }
 
     /// 侧栏 Starred 式的行:点当前项回到 All,否则切到它
@@ -208,13 +230,22 @@ impl Workbench {
             let (scan, counts) = task.await;
             this.update(cx, |this, cx| {
                 let state = &mut this.skills;
-                let selected = state.selected_skill().map(|s| s.name.clone());
+                // 选中的那个与阅读面显示的那一处,换了扫描按名字与目录找回(在换之前记下:
+                // 下标指的是旧扫描)
+                let (selected, shown_dir) = state.selected_skill().map_or((None, None), |s| {
+                    let shown = s.installs.get(state.shown).map(|i| i.path.clone());
+                    (Some(s.name.clone()), shown)
+                });
                 state.scanning = false;
                 state.counts = counts;
-                state.scan = scan;
-                state.selected =
-                    selected.and_then(|name| state.scan.skills.iter().position(|s| s.name == name));
-                this.apply_skill_rows(false, cx);
+                state.scan = Arc::new(scan);
+                state.selected = selected.and_then(|name| state.scan.index_of(&name));
+                let scan = state.scan.clone();
+                this.palette_list.update(cx, |list, cx| {
+                    list.delegate_mut().set_skill_scan(scan);
+                    cx.notify();
+                });
+                this.apply_skill_rows(false, shown_dir, cx);
             })
             .ok();
             if let Some((window, note)) = done {
@@ -225,9 +256,15 @@ impl Workbench {
     }
 
     /// 按当前筛选重排列表;选中项还在就留着,否则落到第一个。重扫(`to_top` 为假)保滚动
-    /// 位置、显示的那处按路径找回(文件变了重读正文);换筛选回顶部,显示的那处按新筛选
+    /// 位置、显示的那处按 `shown_dir` 找回(文件变了重读正文;调用方在换扫描之前记下——正文
+    /// 还没读回来时 `loaded` 是空的,拿它找会退回默认那处);换筛选回顶部,显示的那处按新筛选
     /// 重新挑(点了 Codex 就换成 Codex 那份,Codex review 2026-10-15)
-    fn apply_skill_rows(&mut self, to_top: bool, cx: &mut Context<Self>) {
+    fn apply_skill_rows(
+        &mut self,
+        to_top: bool,
+        shown_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let state = &mut self.skills;
         let rows: Vec<usize> = state
             .scan
@@ -240,14 +277,7 @@ impl Workbench {
         replace_list_rows(&state.list, state.rows.len(), rows.len(), to_top);
         state.rows = rows;
         match state.selected.filter(|ix| state.rows.contains(ix)) {
-            Some(ix) => {
-                let shown_dir = state
-                    .loaded
-                    .as_ref()
-                    .filter(|_| !to_top)
-                    .map(|l| l.dir.clone());
-                self.select_skill(ix, shown_dir, cx);
-            }
+            Some(ix) => self.select_skill(ix, shown_dir, cx),
             None => {
                 state.selected = None;
                 state.loaded = None;
