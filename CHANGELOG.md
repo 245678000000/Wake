@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.10.2] — 2026-10-25
 
 - New: ⌘K / Ctrl+K searches your memory files and skills too, each in its own tab next to sessions; press Tab to switch. The Memory and Skills pages get the same search box in the sidebar
 
